@@ -283,3 +283,380 @@ Um **diretório leve e barato, compatível com AD**, baseado em **Samba 4.**
 - **Não suporta** trust com outros domínios, **MFA**, extensões de schema e várias integrações (RDS SQL Server e IAM Identity Center, por exemplo).
 
 **Quando usar:** um ambiente pequeno, **standalone** na AWS, que precisa de recursos básicos de AD e onde o **custo** é o principal critério.
+
+## AWS Organizations
+
+O AWS Organizations permite **gerenciar múltiplas contas AWS de forma centralizada**, a partir de uma única organização. Além de organizar as contas, ele oferece **faturamento consolidado** e **políticas centralizadas** (como as SCPs) para governar o que cada conta pode fazer.
+
+#### Estrutura
+
+- **Root:** o contêiner de nível mais alto da organização. Ele abriga todas as contas e OUs. Políticas aplicadas no Root valem para toda a organização.
+- **Organizational Units (OUs):** agrupamentos lógicos de contas, criados conforme a necessidade da empresa. Uma OU pode conter contas e outras OUs (até **5 níveis** de aninhamento abaixo do Root). As políticas aplicadas a uma OU são **herdadas** pelas contas e OUs abaixo dela.
+- **Management Account:** a conta que cria e administra a organização. É responsável por criar ou convidar contas, gerenciar OUs e políticas e pagar a fatura consolidada. Ela **não é afetada por SCPs**, por isso a boa prática é não executar workloads nela.
+- **Member Accounts:** as demais contas da organização. Cada conta pertence a **uma única organização** e fica no Root ou em **uma única OU** por vez.
+
+Exemplos de estratégias de agrupamento em OUs:
+
+- **Por ambiente:** dev, hom e prod
+- **Por domínio de negócio:** RH, Financeiro, Marketing etc.
+- **Por função:** Security (contas de log e auditoria), Infrastructure (rede compartilhada), Workloads, Sandbox
+
+![Diagrama AWS Organizations](./img/aws-organizations/aws-organizations-01.png)
+
+
+#### Organization Account Access Role
+
+Para que uma Management Account consiga ter o controle sobre as Members Accounts, ela realiza o processo de Assume Role nas contas a qual estão debaixo de sua hierarquia.
+
+Cada conta criada possui uma role chamada "OrganizationAccountAccessRole" que garante as permissões de admistrador à conta Management que realizou o assume dessa role.
+
+![Diagrama AWS Organization Account Access Role](./img/aws-organizations/aws-organizations-02.png)
+
+### Organizations Policies
+
+O AWS Organizations permite aplicar **políticas centralizadas** no **Root**, em **OUs** ou em **contas** específicas. Essas políticas são **herdadas** pelos níveis abaixo de onde foram anexadas.
+
+> **Obs:** Cada tipo de política precisa ser **habilitado no Root** antes do uso, e a organização precisa estar com **All features** habilitado (não apenas Consolidated Billing).
+
+Os tipos de política se dividem em dois grupos:
+
+| Grupo | Tipo | O que controla |
+|---|---|---|
+| **Authorization policies** | Service Control Policies (SCP) | Permissões máximas dos **principals** (users e roles) das contas |
+| | Resource Control Policies (RCP) | Permissões máximas sobre os **recursos** das contas |
+| **Management policies** | Declarative Policies | Configuração base obrigatória de serviços (ex: EC2, VPC, EBS) |
+| | Backup Policies | Planos do AWS Backup aplicados em todas as contas |
+| | Tag Policies | Padronização de tags |
+| | AI Services Opt-out Policies | Uso dos seus dados pelos serviços de IA da AWS |
+| | Chat Applications Policies | Acesso via Amazon Q Developer in chat applications (antigo AWS Chatbot) |
+
+> **Obs:** A AWS adiciona novos tipos de política com frequência. Vale conferir a documentação para a lista atualizada.
+
+#### Service Control Policies - SCP
+
+A SCP define as **permissões máximas** disponíveis para os users e roles de uma conta. Ela **não concede permissões**: funciona como um **guardrail**. Para uma ação ser permitida, ela precisa ser liberada **tanto pela SCP quanto pela policy IAM** do principal.
+
+**Nível de aplicabilidade**
+- Root (toda a organização)
+- Organizational Unit (OU)
+- Conta
+
+**Estratégias**
+- **Deny list (blocklist):** mantém a SCP padrão `FullAWSAccess` e adiciona SCPs com `Deny` para o que deve ser bloqueado. É a estratégia mais comum e de menor manutenção.
+- **Allow list:** remove a `FullAWSAccess` e libera explicitamente apenas os serviços e ações permitidos. Para uma ação ser permitida, ela precisa estar liberada em **todos os níveis** da hierarquia (Root → OU → conta).
+
+> **Obs:** Um `Deny` explícito em qualquer nível da hierarquia **sempre prevalece**.
+
+**Quem é afetado**
+- Todos os users e roles das member accounts, **incluindo o Root User** da conta.
+- **Não** afeta a **Management Account**, que precisa manter acesso completo para administrar a organização.
+- **Não** afeta **service-linked roles**.
+
+Casos de uso comuns:
+
+- Restringir o uso de determinados serviços (ex: bloqueio do EMR)
+- Garantir aderência a padrões como PCI, desabilitando serviços não conformes em uma conta
+- Restringir as regiões permitidas (condition `aws:RequestedRegion`)
+- Impedir que as contas saiam da organização (`organizations:LeaveOrganization`)
+- Impedir a desativação de serviços de segurança (CloudTrail, GuardDuty, Config)
+- Exigir tags na criação de recursos (condition `aws:RequestTag`)
+
+Exemplo de SCP que restringe as regiões permitidas:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "DenyOutsideAllowedRegions",
+    "Effect": "Deny",
+    "NotAction": ["iam:*", "organizations:*", "sts:*", "support:*"],
+    "Resource": "*",
+    "Condition": {
+      "StringNotEquals": {
+        "aws:RequestedRegion": ["us-east-1", "sa-east-1"]
+      }
+    }
+  }]
+}
+```
+
+> **Obs:** Serviços globais (IAM, Organizations, STS etc.) ficam no `NotAction` porque seus endpoints ficam em `us-east-1`.
+
+#### Resource Control Policies - RCP
+
+A RCP é o "espelho" da SCP para **recursos**. Ela define as **permissões máximas sobre os recursos** das member accounts, **independentemente de quem faz a requisição**, inclusive principals de **fora da organização**.
+
+- Assim como a SCP, **não concede permissões**. A política padrão é a `RCPFullAWSAccess`, e na prática as RCPs são usadas com `Deny`.
+- Suporta um conjunto específico de serviços (ex: S3, STS, KMS, SQS, Secrets Manager).
+- **Não** afeta recursos da **Management Account** nem de service-linked roles.
+
+**Caso de uso principal:** construir um **data perimeter**. Por exemplo: "nenhum bucket S3 da organização pode ser acessado por principals de fora da organização", mesmo que alguém configure uma bucket policy pública por engano.
+
+| | SCP | RCP |
+|---|---|---|
+| Limita | O que os **meus principals** podem fazer | O que pode ser feito **nos meus recursos** |
+| Protege contra | Usuários internos fazendo o que não devem | Acesso externo indevido aos recursos |
+
+#### Declarative Policies
+
+Definem uma **configuração base obrigatória** para um serviço em todas as contas. A configuração é aplicada no **control plane** do serviço e continua valendo mesmo quando o serviço lança novas APIs ou funcionalidades.
+
+Exemplos (EC2, VPC e EBS):
+- Exigir **IMDSv2** nas instâncias EC2
+- Bloquear o compartilhamento público de **AMIs** e **snapshots EBS**
+- Aplicar o **VPC Block Public Access**
+- Restringir quais AMIs podem ser usadas (**Allowed AMIs**)
+
+> **Obs:** Diferente da SCP, que bloqueia **chamadas de API**, a declarative policy garante o **estado da configuração**. É possível definir uma mensagem de erro customizada para os usuários.
+
+#### Backup Policies
+
+Permitem criar e aplicar **planos do AWS Backup** (frequência, retenção, vault, cópia cross-region/cross-account) de forma centralizada em todas as contas da organização.
+
+**Caso de uso:** garantir que todos os recursos com uma tag (ex: `backup=diario`) sejam copiados seguindo a mesma política, sem configurar conta a conta.
+
+#### Tag Policies
+
+Padronizam as **tags** usadas na organização: chaves permitidas, **capitalização** (ex: `CostCenter` vs `costcenter`) e **valores permitidos**.
+
+- Geram **relatórios de conformidade** das tags dos recursos.
+- Podem ser **enforced** para tipos de recurso específicos, bloqueando operações de tagging fora do padrão.
+
+> **Obs:** A tag policy **não obriga** que um recurso tenha uma tag. Para exigir tags na criação de um recurso, use uma **SCP** com a condition `aws:RequestTag`.
+
+#### AI Services Opt-out Policies
+
+Por padrão, alguns serviços de IA da AWS (ex: Rekognition, Comprehend, Transcribe, Lex) podem armazenar e usar o conteúdo processado para melhorar os serviços. Esta política faz o **opt-out** desse uso para **todas as contas** da organização de uma vez.
+
+**Caso de uso:** requisitos de **privacidade e compliance** (ex: LGPD) que proíbem o uso dos dados da empresa para treinar os serviços da AWS.
+
+#### Chat Applications Policies
+
+Controlam o acesso às contas via **Amazon Q Developer in chat applications** (antigo AWS Chatbot) a partir de ferramentas como Slack e Microsoft Teams. Por exemplo: quais workspaces podem ser usados e quais permissões são permitidas.
+
+## AWS IAM Identity Center (Sucessor do AWS Single Sign-On)
+
+![Diagrama AWS IAM Identity Center](./img/aws-iam-identity-center/aws-iam-identity-center-01.png)
+
+O IAM Identity Center é o serviço **recomendado pela AWS para gerenciar o acesso da força de trabalho** (funcionários, terceiros) a **múltiplas contas AWS** e **aplicações** a partir de um único lugar. O usuário faz login **uma única vez** no **AWS access portal** e vê todas as contas, roles e aplicações a que tem acesso (Single Sign-On).
+
+Ele é integrado ao **AWS Organizations**. Em vez de configurar federação SAML **conta a conta** (um IAM Identity Provider e várias roles em cada conta), a trust relationship com o IdP é configurada **uma única vez** no Identity Center, que cuida de criar as roles nas contas.
+
+![Diagrama AWS IAM Identity Center - Organizations](./img/aws-iam-identity-center/aws-iam-identity-center-02.png)
+
+#### Identity Source
+
+É de onde vêm os usuários e grupos. Só é possível ter **uma identity source por vez**:
+
+- **Identity Center directory:** diretório interno do próprio serviço. Usuários e grupos são criados direto no Identity Center. Indicado para ambientes sem IdP corporativo.
+- **Active Directory:** um AD via **AWS Managed Microsoft AD** ou um AD on-premises via **AD Connector**. Usuários e grupos são sincronizados a partir do AD.
+- **External IdP:** Okta, Entra ID, Ping, Google Workspace etc. A autenticação é feita via **SAML 2.0**, e o provisionamento de usuários e grupos é feito via **SCIM**.
+
+> **Obs:** O **SCIM** (*System for Cross-domain Identity Management*) sincroniza automaticamente usuários e grupos do IdP externo para o Identity Center. Sem ele, os usuários precisam ser criados manualmente no Identity Center (com o mesmo username do IdP).
+
+#### Permission Sets
+
+Um permission set é um **modelo de permissões** (AWS managed policies, customer managed policies, inline policy e permissions boundary) que define o que o usuário pode fazer em uma conta.
+
+- Quando um permission set é atribuído a uma conta, o Identity Center **cria automaticamente uma IAM Role** nela, com o nome `AWSReservedSSO_<PermissionSet>_<hash>`.
+- Essa role confia no Identity Center (via SAML provider criado na conta). **Não se deve editar essas roles manualmente**: qualquer alteração deve ser feita no permission set.
+- Define a **duração da sessão** (de 1 a 12 horas).
+
+> **Obs:** Para usar **customer managed policies** em um permission set, a policy precisa existir **com o mesmo nome em cada conta** de destino.
+
+#### Assignments
+
+O acesso é concedido por meio de uma **atribuição** que combina três elementos:
+
+**Usuário ou Grupo** + **Permission Set** + **Conta AWS**
+
+Exemplo: o grupo `Devs` recebe o permission set `PowerUserAccess` nas contas `dev` e `hom`, e o permission set `ReadOnlyAccess` na conta `prod`.
+
+> **Boa prática:** atribuir permissões a **grupos**, e não a usuários individuais.
+
+#### Aplicações
+
+Além das contas AWS, o Identity Center também oferece SSO para aplicações:
+
+- **AWS managed applications:** QuickSight, Amazon Q, SageMaker Studio, Redshift etc.
+- **Aplicações SAML 2.0 de terceiros:** Salesforce, Microsoft 365, Slack etc.
+- **Aplicações customizadas** compatíveis com SAML 2.0 ou OAuth 2.0.
+
+> **Obs:** O **Trusted Identity Propagation** permite que a identidade do usuário do Identity Center seja repassada entre serviços (ex: do QuickSight para o Redshift ou o Lake Formation). Assim, o acesso aos dados é auditado e controlado **por usuário**, e não por role.
+
+#### ABAC (Attribute-Based Access Control)
+
+O Identity Center pode repassar **atributos do usuário** (ex: departamento, centro de custo, cargo), vindos da identity source, como **session tags**. As policies dos permission sets podem usá-los em conditions com `aws:PrincipalTag`.
+
+Isso permite ter **um único permission set** cujas permissões variam conforme o atributo do usuário. Por exemplo, cada usuário só acessa os recursos com a tag `CostCenter` igual à sua.
+
+#### Outros pontos importantes
+
+- **Organization instance vs. Account instance:** a instância de organização é criada na management account e gerencia o acesso a todas as contas. A instância de conta é criada em uma conta isolada e serve apenas para aplicações AWS (não gerencia acesso a contas).
+- **Delegated administrator:** a administração do Identity Center pode ser delegada a uma **member account**. É uma boa prática evitar o uso da management account no dia a dia.
+- **MFA:** pode ser exigido no próprio Identity Center ou ficar a cargo do IdP externo.
+- **CLI:** a AWS CLI v2 suporta login via `aws sso login`, com credenciais temporárias e sem access keys de longo prazo.
+- **Auditoria:** as ações feitas com os permission sets aparecem no CloudTrail com a identidade do usuário no `RoleSessionName` da role `AWSReservedSSO_*`.
+
+#### Dicas para a prova
+
+- "Funcionários precisam acessar **várias contas** da Organization com **SSO** e **menor esforço operacional**" → **IAM Identity Center**.
+- "A empresa já usa **Okta / Entra ID** e quer **sincronizar automaticamente** usuários e grupos" → External IdP via **SAML 2.0 + SCIM**.
+- "Usar o **AD on-premises** existente como fonte de identidade" → Identity Center + **AD Connector** (ou AWS Managed AD com trust).
+- "Permissões devem variar conforme o **departamento** do usuário, sem criar um permission set para cada um" → **ABAC** com atributos do usuário.
+- "Federação SAML direto no IAM de cada conta" ainda é válida, mas em cenários multi-account o Identity Center é a resposta preferida.
+
+## AWS Control Tower
+
+O AWS Control Tower é a forma mais simples de **criar e governar um ambiente multi-account** seguindo as **boas práticas da AWS**. Ele cria automaticamente uma **landing zone**: uma estrutura base de contas, OUs, logs centralizados, controle de acesso e políticas de segurança.
+
+O Control Tower **não substitui** os outros serviços: ele os **orquestra**. Por baixo, ele usa:
+
+- **AWS Organizations:** contas, OUs e políticas (SCPs, RCPs)
+- **IAM Identity Center:** acesso dos usuários às contas
+- **AWS CloudTrail e AWS Config:** auditoria e conformidade dos recursos
+- **AWS Service Catalog e CloudFormation StackSets:** provisionamento padronizado de contas e recursos
+- **Amazon S3:** armazenamento centralizado dos logs
+
+#### Landing Zone
+
+Ao configurar o Control Tower, ele cria a seguinte estrutura:
+
+- **Management Account:** a conta onde o Control Tower é configurado. Ela administra a landing zone e a organização.
+- **Security OU**, com duas contas compartilhadas:
+  - **Log Archive Account:** recebe e armazena de forma centralizada os logs do **CloudTrail** e do **Config** de todas as contas.
+  - **Audit Account:** conta do time de segurança. Tem acesso **cross-account** (somente leitura ou administrativo) às demais contas e recebe as notificações de conformidade via **SNS**.
+- **Sandbox OU** (opcional): OU para as contas de workloads e experimentação. Outras OUs podem ser criadas conforme a necessidade.
+
+> **Obs:** O Control Tower pode ser configurado sobre uma **Organization existente**. Contas e OUs que já existiam podem ser **registradas (enroll)** para passar a ser governadas por ele.
+
+#### Controls (antigos Guardrails)
+
+Controls são **regras de governança** aplicadas às OUs. Eles são classificados por **comportamento**:
+
+| Comportamento | O que faz | Implementado com |
+|---|---|---|
+| **Preventive** | **Impede** que uma ação não conforme aconteça | SCPs, RCPs e Declarative Policies |
+| **Detective** | **Detecta** recursos não conformes após a criação e reporta no dashboard | Regras do AWS Config |
+| **Proactive** | **Verifica** recursos **antes** do provisionamento e bloqueia os não conformes | CloudFormation Hooks |
+
+E por **orientação**:
+
+- **Mandatory:** sempre habilitados e não podem ser desativados (ex: proteger os logs do CloudTrail na Log Archive account contra exclusão).
+- **Strongly recommended:** boas práticas que a AWS recomenda habilitar (ex: impedir o uso de access keys do root user).
+- **Elective:** controles opcionais para casos específicos (ex: bloquear a exclusão de objetos em buckets S3 sem MFA).
+
+Exemplos de controls:
+- Impedir alterações nas configurações do CloudTrail e do Config
+- Detectar se o MFA está habilitado para o root user
+- Detectar volumes EBS não criptografados
+- **Region deny:** bloquear o uso de regiões não governadas pelo Control Tower
+
+#### Account Factory
+
+O **Account Factory** permite **provisionar novas contas padronizadas** já com a configuração de rede, os controls e o acesso via Identity Center. Ele é exposto como um produto do **Service Catalog**, então até usuários sem acesso de administrador podem solicitar contas.
+
+Opções de customização:
+
+- **Account Factory Customization (AFC):** aplica **blueprints** (templates CloudFormation ou Terraform) nas contas durante o provisionamento.
+- **Account Factory for Terraform (AFT):** provisiona e customiza as contas via **pipeline GitOps com Terraform**.
+- **Customizations for AWS Control Tower (CfCT):** solução que usa CloudFormation e SCPs para aplicar customizações automaticamente sempre que uma conta é criada ou atualizada.
+
+#### Dashboard e Drift Detection
+
+- **Dashboard:** mostra de forma centralizada as contas, OUs, controls habilitados e **recursos não conformes**.
+- **Drift detection:** identifica alterações feitas **fora do Control Tower** que divergem da landing zone. Exemplos: mover uma conta entre OUs direto no Organizations ou editar uma SCP gerenciada pelo Control Tower. O drift deve ser corrigido com o **Repair** da landing zone ou re-registrando a OU/conta.
+
+> **Boa prática:** depois de adotar o Control Tower, faça as alterações de contas, OUs e controls **pelo Control Tower**, e não direto no Organizations.
+
+#### Control Tower vs. Organizations
+
+| | AWS Organizations | AWS Control Tower |
+|---|---|---|
+| O que é | Serviço base para agrupar contas e aplicar políticas | Orquestrador de uma landing zone completa |
+| Configuração | Manual: você cria OUs, SCPs, logs e acessos | Automatizada, seguindo boas práticas |
+| Governança | SCPs e outras políticas | Controls preventivos, detectivos e proativos + dashboard |
+| Novas contas | Criadas via API ou console, sem padrão | Account Factory, com baseline padronizado |
+
+#### Dicas para a prova
+
+- "Configurar rapidamente um **ambiente multi-account seguindo boas práticas**, com **menor esforço operacional**" → **Control Tower**.
+- "**Provisionar novas contas** de forma padronizada e automatizada" → **Account Factory** (ou **AFT**, se a questão mencionar Terraform).
+- "Detectar recursos não conformes em todas as contas" → **detective controls** (AWS Config).
+- "Impedir ações não conformes" → **preventive controls** (SCPs).
+- "Bloquear recursos não conformes **antes** de serem criados via CloudFormation" → **proactive controls**.
+- "Alguém alterou uma SCP ou moveu uma conta fora do Control Tower" → **drift**, corrigido com o **Repair** da landing zone.
+- "Logs centralizados de todas as contas" → **Log Archive account**. "Time de segurança precisa de acesso a todas as contas" → **Audit account**.
+
+## AWS Resource Access Manager - RAM
+
+O AWS Resource Access Manager (RAM) permite **compartilhar recursos de uma conta com outras contas** sem precisar duplicá-los. O recurso continua tendo **um único dono** (a conta que o criou), mas pode ser usado por outras contas, por OUs ou pela organização inteira.
+
+**Benefícios**
+- **Evita duplicação** de recursos em cada conta (ex: uma única Transit Gateway para toda a organização).
+- **Reduz custos** e **esforço operacional**.
+- **Centraliza o controle**: a conta dona mantém a gestão do recurso, e as demais só o consomem.
+- Não tem custo adicional: paga-se apenas pelos recursos compartilhados.
+
+#### Como funciona
+
+O compartilhamento é feito por meio de um **Resource Share**, que reúne:
+
+- **Resources:** os recursos que serão compartilhados (ex: subnets, Transit Gateway).
+- **Principals:** com quem serão compartilhados. Podem ser **contas AWS**, **OUs**, a **organização inteira** e, para alguns tipos de recurso, **IAM roles e users**.
+- **Managed Permissions:** o que os principals podem fazer com o recurso. Podem ser **AWS managed** (padrão) ou **customer managed**, para restringir ainda mais as ações permitidas.
+
+> **Obs:** Com o compartilhamento integrado ao **AWS Organizations** habilitado, os recursos são compartilhados com contas da organização **sem convite**. Com contas **fora da organização**, a conta destino precisa **aceitar um convite**.
+
+#### Recursos que podem ser compartilhados (principais)
+
+| Categoria | Recursos |
+|---|---|
+| **Rede** | **VPC Subnets**, **Transit Gateway**, **Route 53 Resolver Rules**, **Prefix Lists**, **IPAM Pools**, Cloud WAN, VPC Lattice service networks, Network Firewall policies |
+| **Compute** | EC2 Capacity Reservations, Dedicated Hosts, Image Builder, Outposts |
+| **Banco de dados** | **Aurora DB clusters** (para cloning cross-account) |
+| **Segurança e licenças** | **License Manager configurations**, AWS Private CA, Glue Data Catalog (via Lake Formation) |
+
+> **Obs:** A lista de recursos suportados cresce com frequência. Vale conferir a documentação para a lista atualizada.
+
+#### VPC Sharing
+
+É o caso de uso mais cobrado na prova. A conta dona da VPC (**owner**) compartilha **subnets** com outras contas (**participants**) da **mesma organização**.
+
+- **Owner:** cria e gerencia a VPC, as subnets, route tables, NACLs, Internet Gateway, NAT Gateways, VPC Endpoints, Transit Gateway attachments etc.
+- **Participants:** criam seus **próprios recursos** (EC2, RDS, Lambda, ELB etc.) dentro das subnets compartilhadas, mas **não podem alterar** a VPC nem as subnets.
+- Cada conta **só vê e gerencia os próprios recursos**. Um participant não consegue ver nem modificar os recursos do owner ou de outros participants.
+- **Security Groups** pertencem à conta que os criou. Dentro da mesma VPC compartilhada, é possível **referenciar o security group** de outra conta pelo ID.
+- **Billing:** cada participant paga pelos seus recursos. O owner paga pelos recursos de rede que criou (ex: NAT Gateway, VPC Endpoints).
+- **Não é possível** compartilhar subnets da **default VPC**.
+
+> **Obs:** As subnets são mapeadas pelo **AZ ID** (ex: `use1-az1`), e não pelo nome da AZ (ex: `us-east-1a`), porque o nome de uma AZ pode apontar para AZs físicas diferentes em cada conta.
+
+**Vantagens do VPC Sharing**
+- Separa as responsabilidades: o time de **rede** gerencia a VPC, e os times de **aplicação** gerenciam seus recursos em contas próprias (billing e permissões separados).
+- **Menos VPCs** para gerenciar e menos consumo de **IPs**.
+- Recursos de contas diferentes se comunicam diretamente pela mesma VPC, **sem VPC Peering ou Transit Gateway**.
+
+#### Outros casos de uso comuns
+
+- **Transit Gateway:** uma conta de rede central cria a TGW e a compartilha para que as demais contas façam attachments das suas VPCs.
+- **Route 53 Resolver Rules:** regras de encaminhamento de DNS (ex: para o DNS on-premises) criadas uma vez e compartilhadas com todas as VPCs da organização.
+- **Prefix Lists:** listas de CIDRs gerenciadas centralmente e usadas em security groups e route tables de várias contas.
+- **License Manager:** regras de licenciamento (ex: Windows, SQL Server, Oracle) aplicadas em todas as contas.
+- **Aurora:** compartilhar um cluster para que outra conta crie um **clone** dele (ex: copiar dados de prod para análise).
+
+#### RAM vs. outras formas de acesso cross-account
+
+| Mecanismo | Quando usar |
+|---|---|
+| **AWS RAM** | Compartilhar recursos de **infraestrutura** (subnets, TGW, resolver rules) para que outras contas os **usem** como se fossem seus |
+| **Resource-based policies** | Liberar acesso cross-account a recursos como **S3, KMS, SQS, SNS, Lambda**. Esses recursos **não** usam RAM |
+| **Cross-account IAM Role** | Um principal de outra conta precisa **assumir permissões** para operar na conta de destino |
+
+#### Dicas para a prova
+
+- "Várias contas precisam usar a **mesma VPC**, com o time de rede gerenciando a rede de forma centralizada" → **VPC Sharing via RAM**.
+- "Conectar as VPCs de todas as contas a uma **Transit Gateway central**" → compartilhar a TGW via **RAM**.
+- "Todas as VPCs da organização devem resolver o **DNS on-premises**" → compartilhar as **Route 53 Resolver Rules** via **RAM**.
+- "Compartilhar um bucket S3 ou uma chave KMS entre contas" → **resource-based policy**, e não RAM.
+- "Compartilhar recursos sem convite entre as contas da organização" → habilitar o **compartilhamento com o AWS Organizations** no RAM.
