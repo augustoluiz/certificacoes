@@ -4,6 +4,7 @@ certificacao: AWS Certified Solutions Architect - Professional (SAP-C02)
 servicos:
   - CloudTrail
   - KMS
+  - SSM Parameter Store
 criado-em: 2026-10-22
 atualizado-em: 2026-10-28
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
@@ -251,3 +252,109 @@ Para requisitos de compliance que exigem **controle total do hardware** onde as 
 - "Descriptografar os mesmos dados em **várias regiões** sem recriptografar" → **Multi-Region Keys**.
 - "`ThrottlingException` no KMS com muitas requisições ao S3" → **S3 Bucket Keys** (ou data key caching / aumento de quota).
 - "Evitar perder dados ao excluir uma chave" → **desabilitar** em vez de excluir, ou usar o **período de espera** + alarme de uso.
+
+## AWS SSM Parameter Store
+
+O AWS Systems Manager Parameter Store é um serviço **serverless** para **armazenar de forma centralizada e segura** dados de **configuração** e **secrets** (ex: URLs de endpoints, nomes de buckets, feature flags, senhas de banco de dados, API keys). Ele faz parte do **AWS Systems Manager (SSM)**.
+
+- Os parâmetros podem ser guardados em **texto claro** ou **criptografados com o KMS**.
+- O acesso é controlado com **IAM policies**, inclusive por **caminho** da hierarquia.
+- Mantém o **histórico de versões** de cada parâmetro.
+- Todas as chamadas de API são **auditadas no CloudTrail**, e as alterações nos parâmetros geram eventos no **EventBridge**.
+- É integrado a vários serviços: **Lambda, ECS, EC2, CodeBuild, CodePipeline, CloudFormation** etc.
+
+**Casos de uso:** separar configuração do código (*externalized configuration*), guardar parâmetros diferentes por ambiente (dev, hom, prod) e armazenar secrets simples sem custo adicional.
+
+### Tipos de parâmetro
+
+| Tipo | Descrição | Exemplo |
+|---|---|---|
+| **String** | Texto simples | `https://api.empresa.com` |
+| **StringList** | Lista de valores separados por vírgula | `us-east-1,sa-east-1` |
+| **SecureString** | Valor **criptografado com o KMS** | Senha do banco de dados |
+
+Detalhes do **SecureString**:
+- Pode usar a AWS managed key `aws/ssm` (padrão) ou uma **customer managed key**.
+- Para ler o valor descriptografado, a chamada precisa usar `WithDecryption=true`, e o principal precisa de permissão `ssm:GetParameter` **e** `kms:Decrypt` na chave.
+- Com uma customer managed key, é possível controlar **quem pode descriptografar** o parâmetro pela key policy.
+
+### Hierarquia
+
+Os parâmetros podem ser organizados em uma **hierarquia de caminhos**, como pastas:
+
+```
+/minha-app/dev/db-url
+/minha-app/dev/db-password
+/minha-app/prod/db-url
+/minha-app/prod/db-password
+/outra-app/...
+```
+
+- `GetParametersByPath` retorna todos os parâmetros de um caminho (ex: toda a configuração de `/minha-app/prod/`) em uma única chamada.
+- As **IAM policies** podem liberar acesso por caminho. Por exemplo, a role da aplicação de dev só lê `arn:aws:ssm:<region>:<account>:parameter/minha-app/dev/*`.
+
+### Tiers: Standard vs. Advanced
+
+| | Standard | Advanced |
+|---|---|---|
+| Quantidade de parâmetros (por conta/região) | 10.000 | 100.000 |
+| Tamanho máximo do valor | **4 KB** | **8 KB** |
+| Parameter Policies | ❌ | ✅ |
+| Compartilhamento com outras contas (via RAM) | ❌ | ✅ |
+| Custo de armazenamento | **Gratuito** | **US$ 0,05** por parâmetro/mês |
+
+> **Obs:** Um parâmetro Standard pode ser **convertido para Advanced** a qualquer momento, mas o contrário **não é possível**: seria preciso excluir e recriar o parâmetro.
+
+**Throughput:** por padrão, a quota é de cerca de **40 transações por segundo**. É possível habilitar o **higher throughput**, que aumenta o limite (até 10.000 TPS) mediante cobrança por chamada de API.
+
+### Parameter Policies (somente Advanced)
+
+Permitem definir regras de ciclo de vida para um parâmetro:
+
+- **Expiration:** **exclui** o parâmetro em uma data/hora definida (ex: uma senha temporária).
+- **ExpirationNotification:** envia um evento ao **EventBridge** antes da expiração (ex: 15 dias antes).
+- **NoChangeNotification:** envia um evento ao **EventBridge** se o parâmetro **não for alterado** por um período (ex: lembrar de trocar uma senha a cada 90 dias).
+
+> **Obs:** O Parameter Store **não tem rotação automática** de secrets. As parameter policies apenas **notificam**. Para rotacionar, é preciso montar uma automação própria (ex: EventBridge + Lambda) ou usar o **Secrets Manager**.
+
+### Versionamento e labels
+
+- Cada alteração em um parâmetro cria uma **nova versão**. É possível ler uma versão específica (ex: `/minha-app/prod/db-url:3`).
+- **Labels** são apelidos para uma versão (ex: `producao`, `v1`), referenciados como `/minha-app/prod/db-url:producao`.
+
+### Parâmetros públicos e referência ao Secrets Manager
+
+- **Public parameters:** a AWS publica parâmetros com informações atualizadas, como o **ID da AMI mais recente** de cada sistema operacional:
+  `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64`
+  Muito útil em templates CloudFormation e Launch Templates para sempre usar a AMI mais recente.
+- **Referência ao Secrets Manager:** um secret do Secrets Manager pode ser lido pela API do Parameter Store usando o caminho `/aws/reference/secretsmanager/<nome-do-secret>`.
+
+### Integração com CloudFormation
+
+- **Parameter types:** um parâmetro do template pode ser do tipo `AWS::SSM::Parameter::Value<String>`, e o CloudFormation resolve o valor no Parameter Store durante o deploy (ex: a AMI mais recente via public parameter).
+- **Dynamic references:** valores podem ser referenciados diretamente nas propriedades dos recursos:
+  - `{{resolve:ssm:/minha-app/prod/db-url}}` para String/StringList.
+  - `{{resolve:ssm-secure:/minha-app/prod/db-password}}` para SecureString (suportado apenas por alguns recursos e propriedades).
+
+### Parameter Store vs. Secrets Manager
+
+| | SSM Parameter Store | AWS Secrets Manager |
+|---|---|---|
+| Foco | **Configuração** em geral e secrets simples | **Secrets** (credenciais, API keys) |
+| Criptografia | Opcional (SecureString) | **Sempre** criptografado com KMS |
+| **Rotação automática** | ❌ (precisa de automação própria) | ✅ Nativa (Lambda), com integração pronta para **RDS, Aurora, Redshift, DocumentDB** |
+| Replicação multi-região | ❌ | ✅ |
+| Tamanho máximo | 4 KB (Standard) / 8 KB (Advanced) | 64 KB |
+| Custo | **Gratuito** (Standard) | US$ 0,40 por secret/mês + chamadas de API |
+
+### Dicas para a prova
+
+- "Armazenar **configurações** da aplicação de forma centralizada, por ambiente, com **menor custo**" → **Parameter Store** (Standard, hierarquia por caminho).
+- "Armazenar uma senha **criptografada** sem custo adicional" → **SecureString** no Parameter Store.
+- "Credenciais de banco de dados com **rotação automática**" → **Secrets Manager**, e não o Parameter Store.
+- "Garantir que cada aplicação só leia a **sua própria configuração**" → hierarquia + **IAM policy por caminho**.
+- "Ser **notificado** quando um parâmetro estiver para expirar ou não for alterado há muito tempo" → **Parameter Policies** (Advanced tier) + **EventBridge**.
+- "Parâmetro **maior que 4 KB**" → **Advanced tier** (até 8 KB). Acima disso, Secrets Manager (até 64 KB) ou S3.
+- "Sempre usar a **AMI mais recente** do Amazon Linux no CloudFormation" → **public parameter** `/aws/service/ami-amazon-linux-latest/...`.
+- "`ThrottlingException` ao ler parâmetros com alto volume" → habilitar **higher throughput** ou fazer **cache** dos valores na aplicação.
+- "Compartilhar parâmetros com outras contas" → **Advanced tier** + **AWS RAM**.
