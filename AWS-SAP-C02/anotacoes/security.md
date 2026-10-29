@@ -5,6 +5,7 @@ servicos:
   - CloudTrail
   - KMS
   - SSM Parameter Store
+  - Secrets Manager
 criado-em: 2026-10-22
 atualizado-em: 2026-10-28
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
@@ -358,3 +359,110 @@ Permitem definir regras de ciclo de vida para um parâmetro:
 - "Sempre usar a **AMI mais recente** do Amazon Linux no CloudFormation" → **public parameter** `/aws/service/ami-amazon-linux-latest/...`.
 - "`ThrottlingException` ao ler parâmetros com alto volume" → habilitar **higher throughput** ou fazer **cache** dos valores na aplicação.
 - "Compartilhar parâmetros com outras contas" → **Advanced tier** + **AWS RAM**.
+
+## AWS Secrets Manager
+
+O AWS Secrets Manager é o serviço para **armazenar, gerenciar e rotacionar secrets**, como credenciais de banco de dados, API keys, tokens OAuth e chaves SSH. A ideia é **eliminar secrets fixos no código** (*hardcoded*): a aplicação busca o secret via API em tempo de execução.
+
+- Os secrets são **sempre criptografados com o KMS**: com a AWS managed key `aws/secretsmanager` (padrão) ou com uma **customer managed key**.
+- Oferece **rotação automática** nativa, com integração pronta para **RDS, Aurora, Redshift e DocumentDB**.
+- O acesso é controlado por **IAM policies** e por **resource-based policies** no próprio secret.
+- Suporta **replicação multi-região**.
+- Todas as chamadas de API são **auditadas no CloudTrail**.
+- Um secret pode ter até **64 KB** e normalmente é armazenado como **JSON** (ex: `{"username": "admin", "password": "...", "host": "..."}`).
+
+**Custo:** **US$ 0,40** por secret/mês + **US$ 0,05** a cada 10.000 chamadas de API.
+
+### Rotação automática
+
+A rotação troca o valor do secret **periodicamente e sem intervenção manual**, atualizando ao mesmo tempo o secret e a credencial no banco ou serviço de destino. O agendamento pode ser feito por **frequência** (ex: a cada 30 dias) ou por **expressão cron**, com intervalo mínimo de **4 horas**.
+
+Existem duas formas de rotação:
+
+- **Managed rotation:** a rotação é feita **pelo próprio serviço** dono da credencial, sem Lambda. Exemplo: o **RDS/Aurora** pode gerenciar a senha do usuário master no Secrets Manager (`ManageMasterUserPassword`), com rotação automática a cada **7 dias** por padrão.
+- **Rotação via Lambda:** o Secrets Manager invoca uma **função Lambda** que executa a troca. A AWS fornece **templates prontos** para RDS, Aurora, Redshift e DocumentDB. Para outros casos (ex: API key de um serviço terceiro), é preciso escrever uma Lambda própria.
+
+**Etapas da Lambda de rotação:**
+
+1. **`createSecret`:** gera um novo valor e o grava como uma nova versão com o label `AWSPENDING`.
+2. **`setSecret`:** aplica o novo valor no banco/serviço de destino.
+3. **`testSecret`:** testa se a nova credencial funciona.
+4. **`finishSecret`:** move o label `AWSCURRENT` para a nova versão. A versão antiga recebe o label `AWSPREVIOUS`.
+
+> **Obs:** Os **staging labels** identificam as versões do secret: `AWSCURRENT` (versão atual, retornada por padrão), `AWSPENDING` (em rotação) e `AWSPREVIOUS` (anterior, útil para rollback).
+
+**Estratégias de rotação:**
+
+| Estratégia | Como funciona | Quando usar |
+|---|---|---|
+| **Single user** | Troca a senha do **mesmo usuário** | Mais simples. Pode haver uma breve janela em que conexões com a senha antiga falham |
+| **Alternating users** | Mantém **dois usuários** e alterna entre eles a cada rotação. Um terceiro secret (de um superusuário) é usado para alterar as senhas | Aplicações com **alta disponibilidade**, que não toleram falhas de conexão durante a rotação |
+
+> **Obs:** A Lambda de rotação precisa de **acesso de rede** ao banco de dados (normalmente rodando **na mesma VPC**) **e** ao endpoint do Secrets Manager (via **VPC Interface Endpoint** ou **NAT Gateway**). Esse é um ponto comum de falha da rotação.
+
+### Acesso cross-account
+
+Para que uma conta B leia um secret da conta A:
+
+1. **Resource policy** no secret (conta A) permitindo o principal da conta B (`secretsmanager:GetSecretValue`).
+2. O secret precisa estar criptografado com uma **customer managed key**, com a **key policy** permitindo `kms:Decrypt` para a conta B. Secrets criptografados com a `aws/secretsmanager` **não podem** ser lidos por outras contas.
+3. **IAM policy** na conta B permitindo o principal acessar o secret e a chave KMS da conta A.
+
+> **Obs:** A resource policy também pode ser usada para **bloquear** acessos. Por exemplo, negar o acesso a qualquer principal que não venha da VPC da aplicação (condition `aws:SourceVpc` ou `aws:SourceVpce`).
+
+### Replicação Multi-Region
+
+Um secret pode ser **replicado para outras regiões**. O Secrets Manager mantém as réplicas **sincronizadas** com o secret primário, inclusive após as rotações.
+
+- As réplicas são **somente leitura**. Cada uma é criptografada com uma chave KMS da sua própria região.
+- Em um cenário de **disaster recovery**, uma réplica pode ser **promovida a secret independente** (*standalone*).
+
+**Casos de uso:** aplicações **multi-região** (ex: com **Aurora Global Database** ou **DynamoDB Global Tables**) e DR, em que a aplicação na região secundária precisa das mesmas credenciais sem depender da região primária.
+
+### Como as aplicações consomem os secrets
+
+- **SDK/API:** `GetSecretValue` (ou `BatchGetSecretValue` para vários secrets de uma vez). As **bibliotecas de cache** do Secrets Manager (Java, Python, .NET, Go) reduzem a latência e o número de chamadas.
+- **Lambda:** a **AWS Parameters and Secrets Lambda Extension** faz cache dos secrets localmente na função.
+- **ECS:** a task definition referencia o secret no campo `secrets` (`valueFrom` com o ARN). O valor é injetado como **variável de ambiente** no container. A **task execution role** precisa de permissão para ler o secret.
+- **EKS:** **Secrets Store CSI Driver** com o provider da AWS, montando os secrets como volumes ou sincronizando com Kubernetes Secrets.
+- **CloudFormation:**
+  - **Dynamic reference:** `{{resolve:secretsmanager:MeuSecret:SecretString:password}}`.
+  - `AWS::SecretsManager::Secret` com `GenerateSecretString` para **gerar uma senha aleatória** durante o deploy, sem expô-la no template.
+  - `AWS::SecretsManager::SecretTargetAttachment` para associar o secret a uma instância RDS.
+
+### Exclusão de secrets
+
+- A exclusão tem um **recovery window** de **7 a 30 dias** (padrão de 30). Durante esse período, o secret não pode ser usado, mas a exclusão pode ser **cancelada**.
+- Com `ForceDeleteWithoutRecovery`, o secret é excluído **imediatamente**, sem possibilidade de recuperação.
+
+### Monitoramento e compliance
+
+- **CloudTrail:** registra quem acessou ou alterou cada secret.
+- **AWS Config:** regras gerenciadas como `secretsmanager-rotation-enabled-check` (rotação habilitada), `secretsmanager-secret-periodic-rotation` (rotação ocorrendo no prazo) e `secretsmanager-secret-unused` (secrets sem uso).
+- **EventBridge:** eventos de rotação (sucesso ou falha) podem disparar notificações ou automações.
+
+### Secrets Manager vs. Parameter Store
+
+| | AWS Secrets Manager | SSM Parameter Store |
+|---|---|---|
+| Foco | **Secrets** (credenciais, API keys) | **Configuração** em geral e secrets simples |
+| Criptografia | **Sempre** criptografado com KMS | Opcional (SecureString) |
+| **Rotação automática** | ✅ Nativa (managed rotation ou Lambda) | ❌ (precisa de automação própria) |
+| Replicação multi-região | ✅ | ❌ |
+| Cross-account | ✅ Resource policy | Advanced tier + RAM |
+| Tamanho máximo | 64 KB | 4 KB (Standard) / 8 KB (Advanced) |
+| Custo | US$ 0,40 por secret/mês + chamadas de API | **Gratuito** (Standard) |
+
+### Dicas para a prova
+
+- "Credenciais de banco de dados com **rotação automática**" → **Secrets Manager**.
+- "Rotacionar a senha do master user do **RDS/Aurora** com **menor esforço operacional**" → **managed rotation** do RDS com Secrets Manager (`ManageMasterUserPassword`).
+- "Rotacionar uma **API key de um serviço terceiro**" → Secrets Manager com **Lambda de rotação customizada**.
+- "A rotação está **falhando** com timeout" → a Lambda de rotação não tem **acesso de rede** ao banco ou ao endpoint do Secrets Manager (falta **VPC endpoint** ou **NAT Gateway**).
+- "A aplicação **não pode ter falhas de conexão** durante a rotação" → estratégia **alternating users**.
+- "Remover senhas **hardcoded** do código ou das variáveis de ambiente" → Secrets Manager (ou Parameter Store SecureString, se não houver necessidade de rotação).
+- "Compartilhar um secret com **outra conta**" → **resource policy** no secret + **customer managed key** com key policy liberando a outra conta.
+- "A aplicação na **região de DR** precisa das mesmas credenciais" → **replicação multi-região** do secret.
+- "Injetar o secret em um **container ECS**" → campo `secrets` da task definition + permissão na **task execution role**.
+- "Gerar a senha do banco no **CloudFormation** sem expô-la no template" → `GenerateSecretString` + **dynamic reference**.
+- "Armazenar configurações **simples e baratas**, sem rotação" → **Parameter Store**, e não Secrets Manager.
