@@ -466,3 +466,91 @@ Um secret pode ser **replicado para outras regiões**. O Secrets Manager mantém
 - "Injetar o secret em um **container ECS**" → campo `secrets` da task definition + permissão na **task execution role**.
 - "Gerar a senha do banco no **CloudFormation** sem expô-la no template" → `GenerateSecretString` + **dynamic reference**.
 - "Armazenar configurações **simples e baratas**, sem rotação" → **Parameter Store**, e não Secrets Manager.
+
+## AWS Certificate Manager - ACM
+
+O AWS Certificate Manager (ACM) é o serviço para **provisionar, gerenciar e implantar certificados SSL/TLS** usados para habilitar **HTTPS** (criptografia em trânsito) nos serviços da AWS.
+
+- Emite **certificados públicos gratuitamente** (paga-se apenas pelos recursos que os utilizam).
+- Faz a **renovação automática** dos certificados emitidos por ele.
+- Permite **importar certificados** emitidos por CAs de terceiros.
+- Suporta certificados **wildcard** (ex: `*.example.com`) e com múltiplos domínios (**SANs**).
+- As chaves privadas são protegidas pelo KMS e **nunca podem ser exportadas** dos certificados públicos emitidos pelo ACM.
+- É um serviço **regional**.
+
+### Integrações
+
+Os certificados do ACM só podem ser usados em **serviços integrados**:
+
+- **Elastic Load Balancing** (ALB, NLB e Classic LB).
+- **CloudFront** (o certificado precisa estar em **`us-east-1`**).
+- **API Gateway** (custom domain names).
+- **AWS App Runner**, **Elastic Beanstalk** (via ELB), **Cognito** (custom domain), **AWS Amplify**, **Verified Access**, entre outros.
+
+> **Obs:** Certificados públicos do ACM **não podem ser instalados diretamente em instâncias EC2**, porque a chave privada não é exportável. Para ter TLS dentro da EC2, a alternativa é terminar o TLS no load balancer, usar um certificado de terceiro (ex: Let's Encrypt) ou usar **certificados exportáveis** (ver abaixo). A exceção são os **Nitro Enclaves**, que suportam certificados do ACM via **ACM for Nitro Enclaves**.
+
+### Solicitando certificados públicos
+
+1. Informar os domínios do certificado (FQDN ou wildcard).
+2. Escolher o método de validação:
+   - **DNS Validation (recomendado):** cria-se um registro **CNAME** no DNS. Se o domínio estiver no **Route 53**, o ACM cria o registro automaticamente. Necessário para que a **renovação automática** funcione sem intervenção.
+   - **Email Validation:** um email é enviado aos contatos do domínio (WHOIS e endereços como `admin@`, `webmaster@`), que precisam aprovar manualmente.
+3. A validação pode levar algumas horas.
+4. Após emitido, o certificado entra na **renovação automática**: o ACM renova **60 dias antes** da expiração, sem nenhuma ação manual.
+
+> **Obs:** Na validação por DNS, o registro CNAME deve **permanecer** no DNS. Se ele for removido, a renovação automática falha.
+
+### Certificados importados
+
+- Gerados fora da AWS e importados no ACM (certificado, chave privada e chain).
+- **Não têm renovação automática**: é preciso importar um novo certificado antes da expiração.
+- O ACM envia **eventos diários de expiração** para o **EventBridge** a partir de **45 dias** antes do vencimento (o número de dias é configurável).
+- A regra gerenciada do **AWS Config** `acm-certificate-expiration-check` verifica certificados próximos da expiração e pode disparar notificações (SNS) ou automações.
+
+### Certificados exportáveis
+
+- O ACM passou a oferecer **certificados públicos exportáveis** (*exportable public certificates*), **pagos**, que permitem exportar o certificado e a chave privada.
+- Úteis para instalar o certificado em **EC2, containers ou servidores on-premises**, mantendo o ACM como ponto central de gestão e renovação.
+
+### AWS Private CA
+
+O **AWS Private Certificate Authority** permite criar uma **CA privada** (root e subordinadas) gerenciada pela AWS para emitir **certificados privados**.
+
+- Usada para **comunicação interna**: serviços internos, microsserviços, **mTLS**, dispositivos IoT, VPN, identificação de usuários e dispositivos.
+- Certificados privados são confiáveis **apenas dentro da organização** (os clientes precisam confiar na CA raiz), não pelos navegadores públicos.
+- Os certificados privados emitidos via ACM podem ser **exportados** e instalados em qualquer lugar (EC2, on-premises, containers).
+- Integra-se com **EKS** (via cert-manager), **App Mesh/Service Connect**, **IAM Roles Anywhere** e outros.
+- Pode ser **compartilhada entre contas** via **AWS RAM**.
+- Tem custo mensal por CA (modo *general-purpose*) e por certificado emitido. Existe o modo **short-lived certificate**, mais barato, para certificados de até 7 dias.
+
+### ACM com Load Balancers
+
+- O ALB/NLB faz a **terminação do TLS** (*SSL offloading*) usando o certificado do ACM, reduzindo o processamento nas instâncias.
+- Com **SNI** (Server Name Indication), um único listener HTTPS do ALB/NLB pode servir **múltiplos certificados** para **múltiplos domínios**. O Classic Load Balancer **não suporta** SNI (um certificado por CLB).
+- Uma regra comum é redirecionar **HTTP → HTTPS** no listener da porta 80 do ALB.
+- Se for necessária criptografia **ponta a ponta** (*end-to-end*), o tráfego entre o LB e os targets também deve usar HTTPS/TLS, com certificados instalados nos targets (ex: certificados privados ou exportáveis).
+
+### ACM com API Gateway
+
+Para usar um **custom domain name** no API Gateway:
+
+- **Edge-Optimized:** as requisições passam por uma distribuição CloudFront gerenciada → o certificado deve estar em **`us-east-1`**.
+- **Regional:** o certificado deve estar **na mesma região** do API Gateway.
+- **Private:** acessível somente via VPC Interface Endpoint.
+
+Depois, cria-se um registro **CNAME ou Alias (A)** no Route 53 apontando para o domínio do API Gateway.
+
+> **Obs:** O API Gateway também suporta **mTLS** em custom domains (regionais), com um **truststore** armazenado no S3 contendo as CAs dos clientes.
+
+### Dicas para a prova
+
+- "Habilitar HTTPS em um ALB/CloudFront com **menor esforço operacional** e renovação automática" → certificado **público do ACM** com **DNS validation**.
+- "Certificado para o **CloudFront**" ou "API Gateway **Edge-Optimized**" → certificado no ACM em **`us-east-1`**.
+- "Certificado para API Gateway **Regional**" → certificado na **mesma região** da API.
+- "A renovação automática do ACM **falhou**" → o registro **CNAME de validação** foi removido do DNS, ou a validação foi feita por **email** e não foi aprovada.
+- "Ser notificado sobre a **expiração de certificados importados**" → eventos do ACM no **EventBridge** ou regra do **AWS Config** `acm-certificate-expiration-check` + SNS.
+- "**Vários domínios** em um único ALB" → múltiplos certificados no listener usando **SNI**.
+- "Instalar o certificado do ACM **diretamente na EC2**" → não é possível com certificados públicos padrão. Terminar o TLS no **ALB/NLB**, usar **certificados exportáveis** ou **Nitro Enclaves**.
+- "Certificados para **comunicação interna** entre serviços / **mTLS**" → **AWS Private CA**.
+- "Compartilhar a CA privada com **outras contas** da organização" → **AWS RAM**.
+- "Criptografia em trânsito **até a instância**" → TLS também entre o LB e os targets (end-to-end), não apenas a terminação no LB.
