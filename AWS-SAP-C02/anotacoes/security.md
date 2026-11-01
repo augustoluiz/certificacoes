@@ -554,3 +554,79 @@ Depois, cria-se um registro **CNAME ou Alias (A)** no Route 53 apontando para o 
 - "Certificados para **comunicação interna** entre serviços / **mTLS**" → **AWS Private CA**.
 - "Compartilhar a CA privada com **outras contas** da organização" → **AWS RAM**.
 - "Criptografia em trânsito **até a instância**" → TLS também entre o LB e os targets (end-to-end), não apenas a terminação no LB.
+
+## CloudHSM
+
+O AWS CloudHSM fornece **HSMs (Hardware Security Modules) dedicados** na nuvem AWS, usados para **gerar, armazenar e usar chaves criptográficas** em hardware validado no **FIPS 140 nível 3**.
+
+- O HSM é **single-tenant**: o hardware é dedicado a você.
+- **Você gerencia** as chaves e os usuários do HSM. A AWS gerencia apenas o hardware (provisionamento, patches, backups) e **não tem acesso às chaves**. Se as credenciais do HSM forem perdidas, as chaves **não podem ser recuperadas** pela AWS.
+- Os HSMs ficam em uma **subnet da sua VPC**, acessados por meio de uma **ENI**.
+- Suporta **chaves simétricas e assimétricas**.
+- Suporta APIs padrão da indústria: **PKCS#11**, **JCE** (Java Cryptography Extensions), **OpenSSL Dynamic Engine** e **Microsoft CNG/KSP**.
+- **Não há free tier**. O custo é **por HSM por hora**, bem mais alto que o KMS.
+
+### Arquitetura e alta disponibilidade
+
+- Os HSMs são organizados em um **cluster**. A AWS **sincroniza automaticamente** as chaves e usuários entre os HSMs do cluster.
+- Para alta disponibilidade, o cluster deve ter **HSMs em várias AZs** (mínimo recomendado de **2 HSMs em AZs diferentes**). O client faz o **balanceamento de carga** entre eles.
+- Adicionar HSMs ao cluster também aumenta a **performance** (escala horizontal).
+- **Backups** do cluster são feitos automaticamente pela AWS (pelo menos uma vez a cada 24h), **criptografados** e armazenados no S3 gerenciado pela AWS. Os backups podem ser **copiados para outras regiões** para DR, e um novo cluster pode ser criado a partir de um backup.
+
+> **Obs:** O CloudHSM **não é replicado entre regiões** automaticamente. Para DR multi-região, copia-se o backup para a região de destino e cria-se um cluster a partir dele.
+
+![Diagrama AWS CloudHSM](./img/aws-cloudhsm/aws-cloudhsm-01.png)
+
+### Usuários do HSM
+
+O controle de acesso às chaves é feito **dentro do HSM**, com usuários próprios (não é IAM):
+
+- **Admin** (antigo **Crypto Officer - CO**): gerencia os usuários do HSM.
+- **Crypto User (CU)**: cria, gerencia e usa as chaves para operações criptográficas.
+- **Appliance User (AU)**: usuário usado pela AWS para sincronizar e clonar os HSMs. Não tem acesso às chaves.
+
+> **Obs:** O **IAM** controla apenas as operações de **gerenciamento do cluster** (criar/excluir cluster e HSMs, backups, tags). O uso das chaves é controlado **exclusivamente pelos usuários do HSM**.
+
+### Segurança de rede
+
+- O acesso ao HSM é feito pelo **CloudHSM client** instalado na instância EC2 (ou servidor on-premises com conectividade via VPN/Direct Connect).
+- O cluster tem um **security group** associado às ENIs. É preciso liberar as portas **2223-2225** a partir dos clients.
+- A comunicação entre client e HSM é **criptografada ponta a ponta** (TLS mútuo). Na inicialização do cluster, você assina o certificado do cluster com a **sua própria CA**, estabelecendo a confiança.
+
+### Casos de uso
+
+- **Requisitos de compliance** que exigem HSM dedicado, controle exclusivo das chaves ou FIPS 140 nível 3.
+- **SSL/TLS offloading** em servidores web (NGINX, Apache, IIS): a chave privada fica no HSM e as operações TLS são feitas por ele.
+- **Oracle TDE** (Transparent Data Encryption) em bancos Oracle **na EC2** (o RDS for Oracle **não** suporta CloudHSM; nele, o TDE usa chaves do próprio Oracle Wallet).
+- **Microsoft SQL Server TDE** via EKM (Extensible Key Management).
+- **Certificate Authority**: proteger a chave privada de uma **CA própria** (ex: Microsoft AD CS).
+- **Assinatura de código e documentos**, aplicações de pagamento e blockchain.
+- **Custom key store do KMS**: usar as integrações nativas do KMS com os serviços AWS (S3, EBS, RDS...) com as chaves armazenadas no seu cluster CloudHSM.
+
+### CloudHSM como Custom Key Store do KMS
+
+- O KMS usa o cluster CloudHSM como armazenamento das chaves. As **KMS keys** são criadas com origem `AWS_CLOUDHSM`.
+- Os serviços AWS continuam usando a **API do KMS** normalmente, e as operações criptográficas acontecem **no seu HSM**.
+- O **CloudTrail** registra o uso das chaves (via KMS), algo que não acontece no uso direto do CloudHSM.
+- Requisitos: o cluster precisa ter **pelo menos 2 HSMs ativos em AZs diferentes** e um usuário CU dedicado `kmsuser`.
+- Suporta apenas **chaves simétricas** de criptografia.
+
+> **Obs:** Se o cluster CloudHSM ficar indisponível ou for desconectado do KMS, os serviços que dependem dessas chaves **param de conseguir criptografar/descriptografar**.
+
+### Compartilhamento e integrações
+
+- Um cluster CloudHSM **não pode ser compartilhado** entre contas via AWS RAM. As aplicações de outras contas podem acessá-lo por **VPC peering** ou **Transit Gateway**, desde que tenham credenciais de usuário do HSM.
+- O uso das chaves no HSM **não é registrado no CloudTrail** (só as chamadas de gerenciamento). Os **audit logs** do HSM são enviados para o **CloudWatch Logs**.
+
+### Dicas para a prova
+
+- "**HSM dedicado**", "**single-tenant**", "**FIPS 140 nível 3**" ou "a AWS **não pode ter acesso** às chaves" → **CloudHSM**.
+- "Usar as chaves no HSM com **integração nativa** com S3, EBS, RDS..." → **KMS com custom key store** do CloudHSM.
+- "**SSL offloading** mantendo a chave privada em um HSM" → **CloudHSM**.
+- "**Oracle TDE** com chaves em HSM" → Oracle na **EC2** + CloudHSM.
+- "Aplicação precisa usar **PKCS#11, JCE ou CNG**" → **CloudHSM** (o KMS não suporta essas interfaces).
+- "Alta disponibilidade do CloudHSM" → cluster com **HSMs em várias AZs**.
+- "DR do CloudHSM em **outra região**" → **copiar o backup** do cluster para a região de destino e criar um novo cluster a partir dele.
+- "Controle de acesso às chaves do CloudHSM" → **usuários do HSM** (CU/Admin), e não IAM.
+- "Chaves armazenadas **fora da AWS** (on-premises)" → **External Key Store (XKS)** do KMS, e não CloudHSM.
+- "Criptografia gerenciada com **menor custo e esforço operacional**" → **KMS**, e não CloudHSM.
