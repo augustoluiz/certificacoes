@@ -630,3 +630,229 @@ O controle de acesso às chaves é feito **dentro do HSM**, com usuários própr
 - "Controle de acesso às chaves do CloudHSM" → **usuários do HSM** (CU/Admin), e não IAM.
 - "Chaves armazenadas **fora da AWS** (on-premises)" → **External Key Store (XKS)** do KMS, e não CloudHSM.
 - "Criptografia gerenciada com **menor custo e esforço operacional**" → **KMS**, e não CloudHSM.
+
+
+## S3 Security
+
+A segurança no S3 combina vários mecanismos: **controle de acesso** (quem pode fazer o quê), **criptografia** (em repouso e em trânsito), **controles de rede** (de onde o acesso pode vir), **proteção de dados** (contra exclusão ou alteração) e **auditoria/monitoramento**.
+
+### Mecanismos de controle de acesso
+
+| Mecanismo | Tipo | Uso principal |
+|---|---|---|
+| **IAM policies** | Identity-based | O que um usuário/role **da sua conta** pode fazer no S3 |
+| **Bucket policies** | Resource-based (JSON no bucket) | Acesso **cross-account**, acesso público, condições de rede/criptografia para **todos** os principals |
+| **ACLs** (bucket e objeto) | Legado | Desabilitadas por padrão. Usar apenas em casos muito específicos |
+| **Block Public Access** | Guardrail | Impede que o bucket/objetos fiquem **públicos**, mesmo que uma policy permita |
+| **S3 Access Points** | Resource-based por aplicação | Simplificar o acesso de **várias aplicações/times** a um bucket compartilhado |
+| **Pre-signed URLs** | Temporário | Dar acesso **temporário** a um objeto específico para quem não tem credenciais AWS |
+| **S3 Access Grants** | Mapeamento de identidades | Conceder acesso a **prefixos** para identidades corporativas (IAM Identity Center / diretório) |
+
+#### Avaliação de acesso
+
+Um principal pode acessar um objeto se:
+
+- **Mesma conta:** a **IAM policy OU** a **bucket policy** permite a ação, e **não existe nenhum Deny explícito**.
+- **Cross-account:** a **IAM policy** (na conta do principal) **E** a **bucket policy** (na conta do bucket) permitem a ação.
+
+Um **Deny explícito** em qualquer policy (SCP, RCP, IAM policy, bucket policy) sempre prevalece.
+
+![Diagrama S3 Security - Avaliação de acesso](./img/aws-s3-security/aws-s3-security-01.png)
+
+#### Bucket policies
+
+Policies JSON anexadas ao bucket, com `Principal`, `Action`, `Resource` e `Condition`. São usadas para:
+
+- Conceder acesso **cross-account** ou **público** (ex: site estático).
+- **Forçar requisições seguras** e restringir a origem do acesso para **qualquer** principal.
+
+**Conditions mais cobradas:**
+
+| Condition | Uso |
+|---|---|
+| `aws:SecureTransport` | Negar requisições **sem HTTPS** (`"Bool": {"aws:SecureTransport": "false"}` com `Deny`) |
+| `s3:TlsVersion` | Exigir uma versão mínima de TLS (ex: 1.2) |
+| `s3:x-amz-server-side-encryption` | Exigir um tipo de criptografia no upload (ex: `aws:kms`) |
+| `s3:x-amz-server-side-encryption-aws-kms-key-id` | Exigir uma **chave KMS específica** |
+| `aws:SourceVpce` / `aws:SourceVpc` | Permitir acesso **somente via um VPC endpoint** / VPC |
+| `aws:SourceIp` | Restringir por **IP público** (não funciona para tráfego via VPC endpoint) |
+| `aws:PrincipalOrgID` | Permitir acesso a **todas as contas da Organization** sem listar cada conta |
+| `aws:MultiFactorAuthPresent` | Exigir **MFA** para determinadas ações |
+| `aws:SourceArn` / `aws:SourceAccount` | Restringir qual recurso de um **serviço AWS** pode acessar (ex: distribuição CloudFront) |
+
+> **Obs:** Para negar uploads sem criptografia, o mais comum hoje é usar a **default encryption** do bucket (que criptografa tudo automaticamente). A bucket policy com `s3:x-amz-server-side-encryption` serve para **exigir um tipo específico** (ex: SSE-KMS com uma chave específica).
+
+#### Object Ownership e ACLs
+
+O **S3 Object Ownership** define quem é dono dos objetos enviados ao bucket:
+
+- **Bucket owner enforced (padrão, recomendado):** **ACLs desabilitadas**. O dono do bucket é dono de **todos os objetos**, inclusive os enviados por outras contas. O acesso é controlado só por policies.
+- **Bucket owner preferred:** ACLs ativas. O dono do bucket passa a ser dono do objeto se o upload incluir a ACL `bucket-owner-full-control`.
+- **Object writer:** ACLs ativas. A conta que fez o upload é dona do objeto (comportamento legado, causava problemas de acesso cross-account).
+
+> **Obs:** Desde **abril de 2023**, buckets novos são criados com **ACLs desabilitadas** e **Block Public Access habilitado** por padrão.
+
+#### Block Public Access
+
+Camada extra que **sobrepõe** policies e ACLs para impedir exposição pública. Pode ser configurado no **bucket** ou na **conta** (vale para todos os buckets). Tem 4 configurações:
+
+- `BlockPublicAcls`: bloqueia novas ACLs públicas.
+- `IgnorePublicAcls`: ignora ACLs públicas existentes.
+- `BlockPublicPolicy`: bloqueia bucket policies que concedam acesso público.
+- `RestrictPublicBuckets`: restringe buckets com policy pública ao acesso de serviços AWS e principals da própria conta.
+
+> **Obs:** Para garantir que ninguém desabilite o Block Public Access, habilite-o **no nível da conta** e use uma **SCP** negando `s3:PutAccountPublicAccessBlock` / `s3:PutBucketPublicAccessBlock`.
+
+#### Acesso cross-account
+
+Três formas de dar acesso a outra conta:
+
+1. **Bucket policy + IAM policy:** a bucket policy permite o principal da outra conta, e a outra conta concede permissão ao seu usuário/role via IAM policy.
+2. **IAM role cross-account:** a outra conta assume uma role na conta do bucket (`sts:AssumeRole`). Útil quando o acesso envolve vários buckets/serviços.
+3. **ACLs:** legado, não recomendado.
+
+> **Obs:** Se os objetos estiverem criptografados com **SSE-KMS**, a **key policy** também precisa permitir `kms:Decrypt` (e `kms:GenerateDataKey` para uploads) para a outra conta. Isso só é possível com **customer managed key**. A chave `aws/s3` **não pode** ser compartilhada.
+
+#### S3 Access Points
+
+Cada access point tem **nome, DNS e policy próprios**, apontando para um bucket (ou um prefixo). Em vez de uma bucket policy gigante, cada aplicação/time recebe seu access point com permissões específicas.
+
+- **Network origin:** `Internet` ou **`VPC`** (só aceita requisições daquela VPC, via VPC endpoint).
+- A bucket policy pode **delegar** o controle de acesso para os access points (condition `s3:DataAccessPointAccount`).
+- **Multi-Region Access Points:** endpoint global que roteia para buckets em várias regiões (com replicação), com failover.
+
+#### Pre-signed URLs
+
+URL com **assinatura e validade** que dá acesso temporário a um objeto (download com `GET` ou upload com `PUT`).
+
+- Herda as **permissões de quem gerou** a URL.
+- Validade: até **12 horas** pelo console e até **7 dias** via CLI/SDK (SigV4). Se gerada com credenciais temporárias (role), expira quando as credenciais expirarem.
+- Casos de uso: download de conteúdo privado por usuários de uma aplicação, upload direto do browser para o S3.
+
+### Criptografia
+
+#### Criptografia em repouso
+
+| Tipo | Quem gerencia a chave | Detalhes |
+|---|---|---|
+| **SSE-S3** | AWS (S3) | AES-256. **Padrão** para todos os objetos novos desde **janeiro de 2023**. Header `x-amz-server-side-encryption: AES256` |
+| **SSE-KMS** | KMS (AWS managed `aws/s3` ou **customer managed key**) | **Auditoria no CloudTrail**, controle de acesso pela key policy, rotação. Header `aws:kms` |
+| **DSSE-KMS** | KMS | **Dupla camada** de criptografia, para requisitos de compliance específicos. Header `aws:kms:dsse` |
+| **SSE-C** | **Cliente** (enviada em cada requisição) | O S3 não armazena a chave. **Exige HTTPS**. Só via CLI/SDK/API |
+| **Client-side** | **Cliente** | Os dados são criptografados **antes** do upload (ex: AWS Encryption SDK) |
+
+**Limites do SSE-KMS:** cada upload chama `GenerateDataKey` e cada download chama `Decrypt` no KMS, o que conta para a **quota de requisições do KMS** por região. Com alto volume, pode ocorrer **throttling**. Soluções:
+
+- **S3 Bucket Key:** o S3 gera uma chave intermediária no nível do bucket, reduzindo as chamadas ao KMS em **até 99%** (e o custo).
+- Solicitar aumento da quota do KMS (Service Quotas).
+
+> **Obs:** A **default encryption** do bucket define a criptografia aplicada quando o upload não especifica nenhuma. Alterar a default encryption **não recriptografa** objetos existentes. Para isso, use **S3 Batch Operations** (copiando os objetos) ou copie-os novamente.
+
+#### Criptografia em trânsito
+
+- O S3 expõe endpoints **HTTP e HTTPS**. Para forçar HTTPS, use a bucket policy com **`aws:SecureTransport = false` → Deny**.
+- **SSE-C exige HTTPS**.
+
+### Controles de rede
+
+#### VPC Endpoints
+
+| | **Gateway endpoint** | **Interface endpoint** (PrivateLink) |
+|---|---|---|
+| Como funciona | Entrada na **route table** (prefix list do S3) | **ENI** com IP privado na subnet |
+| Custo | **Gratuito** | Pago (por hora + por GB) |
+| Acesso de **on-premises**, peering, TGW ou outra região | ❌ | ✅ |
+| DNS | Usa o DNS público do S3 | DNS específico do endpoint (ou private DNS) |
+
+- A **bucket policy** restringe o acesso com `aws:SourceVpce` (endpoint específico) ou `aws:SourceVpc` (VPC).
+- A **endpoint policy** (no VPC endpoint) restringe **quais buckets** podem ser acessados a partir da VPC, prevenindo exfiltração de dados (ex: `aws:ResourceOrgID` para permitir só buckets da sua Organization).
+
+![Diagrama S3 Security - Acesso privado via VPC Endpoints](./img/aws-s3-security/aws-s3-security-02.png)
+
+> **Obs:** `aws:SourceIp` **não funciona** com tráfego via VPC endpoint, porque as requisições usam IPs privados. Nesse caso use `aws:SourceVpce` ou `aws:SourceVpc`.
+
+#### CloudFront com Origin Access Control (OAC)
+
+Para servir conteúdo de um bucket **privado** via CloudFront:
+
+- O **OAC** assina as requisições do CloudFront para o S3 com **SigV4**.
+- A bucket policy permite somente o principal `cloudfront.amazonaws.com` com condition **`AWS:SourceArn`** igual ao ARN da distribuição.
+- O bucket permanece com **Block Public Access** habilitado. Acessos diretos ao S3 recebem **403**.
+- O OAC **substitui o OAI** (Origin Access Identity, legado). Diferente do OAI, o OAC suporta **SSE-KMS**, todas as regiões e requisições `PUT`/`DELETE`.
+
+![Diagrama S3 Security - CloudFront com OAC](./img/aws-s3-security/aws-s3-security-03.png)
+
+> **Obs:** Se o bucket usa **SSE-KMS**, a **key policy** também precisa permitir `kms:Decrypt` para o CloudFront. O OAC **não funciona** com o endpoint de **website** do S3 (nesse caso a origem é tratada como custom origin).
+
+### Proteção de dados
+
+#### Versioning
+
+- Mantém **todas as versões** de um objeto. Protege contra sobrescrita e exclusão acidental (a exclusão cria um **delete marker**).
+- É pré-requisito para **MFA Delete**, **Object Lock** e **replicação**.
+
+#### MFA Delete
+
+- Exige **MFA** para **excluir permanentemente uma versão** de objeto e para **suspender o versioning**.
+- Só pode ser habilitado pelo **root user** e somente via **CLI/SDK/API**.
+
+#### S3 Object Lock (WORM)
+
+Modelo **Write Once Read Many**: impede que objetos sejam excluídos ou sobrescritos por um período. Exige **versioning**.
+
+| Modo | Comportamento |
+|---|---|
+| **Governance** | A maioria dos usuários não pode excluir/alterar. Usuários com permissão `s3:BypassGovernanceRetention` **podem** contornar |
+| **Compliance** | **Ninguém** pode excluir ou alterar a versão do objeto, **nem o root**, até o fim do período de retenção. O modo e o período não podem ser reduzidos |
+
+- **Retention period:** período fixo de proteção.
+- **Legal hold:** proteção **sem data de expiração**, independente da retenção. Aplicada/removida por quem tem `s3:PutObjectLegalHold`.
+- **Glacier Vault Lock:** equivalente para vaults do S3 Glacier (policy imutável depois de travada).
+
+#### Replicação
+
+- **CRR/SRR** com replicação para um bucket em **outra conta** (com **ownership override** para a conta de destino) protege contra exclusão maliciosa na conta de origem.
+- Objetos com **SSE-KMS** só são replicados se isso for configurado explicitamente na regra (informando a chave KMS de destino).
+
+### Auditoria e monitoramento
+
+- **S3 Server Access Logs:** registram **todas as requisições** ao bucket, entregues em **outro bucket** da mesma região (nunca no mesmo bucket, para evitar loop). Best effort.
+- **CloudTrail:** management events (operações de bucket) por padrão. Operações em objetos (`GetObject`, `PutObject`...) exigem **data events** (pagos).
+- **Amazon GuardDuty (S3 Protection):** detecta atividades suspeitas (acesso de IPs maliciosos, padrões anômalos de exfiltração) usando os data events do CloudTrail.
+- **Amazon Macie:** descobre e classifica **dados sensíveis** (PII, dados financeiros) nos buckets.
+- **IAM Access Analyzer for S3:** identifica buckets com **acesso público** ou **compartilhados com outras contas**.
+- **AWS Config:** regras gerenciadas como `s3-bucket-public-read-prohibited`, `s3-bucket-ssl-requests-only`, `s3-bucket-server-side-encryption-enabled` e `s3-bucket-logging-enabled`, com remediação automática via SSM Automation.
+- **S3 Event Notifications / EventBridge:** reagir a eventos nos objetos (ex: escanear arquivos enviados).
+
+### CORS
+
+O **CORS** (Cross-Origin Resource Sharing) é uma configuração do bucket que permite que páginas de **outra origem** (domínio) façam requisições ao bucket a partir do browser. Não é um mecanismo de autorização: ele apenas informa ao browser quais origens, métodos e headers são aceitos.
+
+### Dicas para a prova
+
+- "Garantir que **nenhum bucket** da conta fique público" → **Block Public Access no nível da conta** + **SCP** impedindo a alteração.
+- "Forçar **HTTPS** no acesso ao bucket" → bucket policy com **Deny** quando `aws:SecureTransport = false`.
+- "Exigir criptografia com uma **chave KMS específica**" → default encryption SSE-KMS + bucket policy com `s3:x-amz-server-side-encryption-aws-kms-key-id`.
+- "Precisa **auditar o uso da chave** de criptografia" ou "controlar quem pode descriptografar" → **SSE-KMS** com customer managed key.
+- "**Throttling** do KMS com alto volume de requisições no S3" → habilitar **S3 Bucket Key**.
+- "A empresa precisa **gerenciar as próprias chaves** fora da AWS e não quer criptografar no cliente" → **SSE-C**.
+- "Dados criptografados **antes** de sair da aplicação" → **client-side encryption**.
+- "Permitir acesso ao bucket **somente a partir da VPC**" → **VPC endpoint** + bucket policy com `aws:SourceVpce`.
+- "Acesso privado ao S3 a partir de **on-premises** (Direct Connect/VPN)" → **interface endpoint** (o gateway endpoint não suporta).
+- "Acesso privado ao S3 a partir da VPC com **menor custo**" → **gateway endpoint**.
+- "Evitar **exfiltração de dados** para buckets de outras contas" → **endpoint policy** no VPC endpoint (ex: `aws:ResourceOrgID`).
+- "Permitir acesso a **todas as contas da Organization**" → bucket policy com `aws:PrincipalOrgID`.
+- "Conteúdo do bucket acessível **somente pelo CloudFront**" → **OAC** + bucket policy com `AWS:SourceArn` da distribuição.
+- "Objetos enviados por **outra conta** não podem ser lidos pelo dono do bucket" → **Object Ownership = Bucket owner enforced**.
+- "Acesso cross-account a objetos com **SSE-KMS**" → bucket policy + IAM policy + **key policy** da **customer managed key** liberando a outra conta.
+- "Várias aplicações acessando o mesmo bucket com **permissões diferentes**" → **S3 Access Points**.
+- "Dar acesso **temporário** a um objeto privado para um usuário sem credenciais AWS" → **pre-signed URL**.
+- "Dados **imutáveis** por exigência regulatória, nem o root pode apagar" → **Object Lock em Compliance mode**.
+- "Proteção WORM, mas **administradores podem** remover em casos excepcionais" → **Object Lock em Governance mode**.
+- "Reter um objeto **por tempo indeterminado** por causa de um processo judicial" → **Legal hold**.
+- "Proteger contra **exclusão permanente** de versões" → **Versioning + MFA Delete**.
+- "Descobrir **dados sensíveis (PII)** nos buckets" → **Amazon Macie**.
+- "Detectar **acessos suspeitos** aos dados do S3" → **GuardDuty S3 Protection**.
+- "Identificar buckets **compartilhados com contas externas** ou públicos" → **IAM Access Analyzer for S3**.
+- "Registrar **quem acessou cada objeto**" → **CloudTrail data events** (ou Server Access Logs).
+- "Criptografar **objetos já existentes** após mudar a default encryption" → **S3 Batch Operations**.
