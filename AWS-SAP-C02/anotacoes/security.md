@@ -1087,3 +1087,89 @@ As boas práticas de resiliência a DDoS da AWS seguem alguns princípios:
 - "Reduzir a **superfície de ataque**" → recursos em **subnets privadas**, exposição apenas via **ALB/CloudFront**, origem acessível somente pelo CloudFront.
 - "Evitar **aumento de custo** causado por um ataque DDoS" → **Shield Advanced** (cost protection).
 - "Precisa de **suporte especializado 24/7** durante um ataque" → **Shield Advanced** + **Shield Response Team (SRT)**.
+
+## AWS Shield
+
+O AWS Shield é o serviço gerenciado de **proteção contra ataques DDoS** da AWS. Ele tem dois níveis: **Shield Standard**, gratuito e automático para todos os clientes, e **Shield Advanced**, pago, com proteções e suporte adicionais.
+
+### Shield Standard
+
+- **Gratuito** e **habilitado automaticamente** para todos os clientes da AWS, sem nenhuma configuração.
+- Protege contra os ataques mais comuns das **camadas 3 e 4**: SYN/UDP floods, ataques de reflexão e amplificação e outros ataques de rede e transporte.
+- Detecção **always-on** e mitigação **inline**, sem impacto perceptível na latência.
+- A proteção é mais forte nos serviços de **borda** (**CloudFront**, **Route 53** e **Global Accelerator**), que absorvem os ataques nas edge locations, longe da aplicação.
+- **Não** protege contra ataques de **camada 7** (HTTP flood, por exemplo). Para isso é preciso usar o **AWS WAF** ou o Shield Advanced.
+
+### Shield Advanced
+
+Serviço pago que adiciona proteção mais sofisticada, visibilidade e suporte especializado para **recursos específicos** que você escolhe proteger.
+
+**Recursos que podem ser protegidos:**
+
+- Distribuições **CloudFront**.
+- Hosted zones do **Route 53**.
+- Accelerators do **Global Accelerator**.
+- **Elastic Load Balancers** (ALB, NLB e Classic Load Balancer).
+- **Elastic IPs** de instâncias EC2 (e, por consequência, NLBs e outros recursos expostos via EIP).
+
+**Custo:** **US$ 3.000 por mês por organização** (o valor cobre todas as contas da AWS Organization sob o mesmo payer), com **compromisso de 1 ano**, mais uma taxa de **transferência de dados (data transfer out)** dos recursos protegidos.
+
+![Diagrama AWS Shield - Arquitetura protegida](./img/aws-shield/aws-shield-01.png)
+
+#### Funcionalidades do Shield Advanced
+
+- **Detecção personalizada:** o Shield aprende o **baseline** do tráfego de cada recurso protegido e detecta anomalias com mais precisão. Também detecta ataques **L3/L4/L7** que o Standard não trata.
+- **Detecção baseada em saúde (health-based detection):** ao associar **health checks do Route 53** aos recursos protegidos, o Shield usa a saúde da aplicação para detectar ataques **mais rápido** e reduzir falsos positivos. É **pré-requisito** para o proactive engagement.
+- **Mitigação automática na camada 7:** o Shield Advanced cria e gerencia **regras do AWS WAF** em um **rule group** dentro da sua web ACL quando detecta um ataque HTTP, e as remove quando o ataque termina. As regras podem ficar em modo **Count** (só monitorar) ou **Block**. Exige uma **web ACL** associada ao recurso (CloudFront ou ALB).
+- **Shield Response Team (SRT):** time de especialistas da AWS em DDoS, disponível **24/7** durante ataques. O SRT pode analisar o tráfego e **criar regras no WAF por você**, desde que você conceda uma **IAM role** de acesso (e, opcionalmente, acesso aos logs no S3). Exige plano de suporte **Business** ou **Enterprise**.
+- **Proactive engagement:** o SRT **entra em contato com você** (contatos de emergência cadastrados) quando um ataque afeta a saúde da aplicação, em vez de esperar você abrir um caso. Exige health checks do Route 53 associados aos recursos.
+- **Proteção de custo (cost protection):** créditos para os aumentos de cobrança causados por um ataque DDoS (scaling de EC2, ELB, CloudFront, Route 53, Global Accelerator). É solicitada abrindo um caso no suporte.
+- **Visibilidade:** métricas no **CloudWatch** (`DDoSDetected`, `DDoSAttackBitsPerSecond`, `DDoSAttackPacketsPerSecond`, `DDoSAttackRequestsPerSecond`), diagnóstico detalhado dos ataques e histórico no console.
+- **AWS WAF e Firewall Manager sem custo adicional** para os recursos protegidos pelo Shield Advanced.
+- **Protection groups:** agrupam recursos (ex: todos os ALBs de uma aplicação) para que o Shield trate o grupo como **uma unidade**, melhorando a precisão da detecção.
+- **Mitigação de borda para Elastic IPs:** para recursos protegidos via EIP, o Shield Advanced pode aplicar as **NACLs** da VPC **na borda da rede AWS**, bloqueando o tráfego antes de ele chegar à VPC.
+
+![Diagrama AWS Shield - Mitigação automática e proactive engagement](./img/aws-shield/aws-shield-02.png)
+
+### Shield Standard vs. Shield Advanced
+
+| | Shield Standard | Shield Advanced |
+|---|---|---|
+| Custo | **Gratuito** | **US$ 3.000/mês por organização** + data transfer, compromisso de 1 ano |
+| Ativação | Automática | Assinatura + escolha dos recursos protegidos |
+| Camadas | 3 e 4 | 3, 4 e **7** |
+| Recursos | Toda a infraestrutura AWS | CloudFront, Route 53, Global Accelerator, ELB, Elastic IP |
+| Detecção | Assinaturas de ataques comuns | Baseline por recurso + **health checks** |
+| Mitigação L7 | ❌ (usar WAF manualmente) | ✅ **Automática** via regras no WAF |
+| Suporte especializado | ❌ | ✅ **SRT 24/7** (com Business/Enterprise Support) |
+| Proactive engagement | ❌ | ✅ |
+| Proteção de custo | ❌ | ✅ |
+| WAF e Firewall Manager | Cobrados normalmente | **Sem custo adicional** nos recursos protegidos |
+| Métricas e relatórios | Básicos | Métricas no CloudWatch e diagnóstico detalhado |
+
+### Shield Advanced em ambientes multi-account
+
+- A assinatura é feita **por conta**, mas o valor mensal é cobrado **uma única vez por organização** (consolidated billing).
+- O **AWS Firewall Manager** permite criar **políticas de Shield Advanced** que aplicam a proteção **automaticamente** a todos os recursos (e aos novos recursos criados) em todas as contas da Organization, garantindo que nenhum recurso exposto fique sem proteção.
+
+### Boas práticas com o Shield
+
+- Colocar a aplicação atrás de **CloudFront** e usar **Route 53** para o DNS: são os serviços com a maior capacidade de absorção.
+- Associar uma **web ACL do WAF** com **rate-based rules** aos recursos expostos.
+- Associar **health checks do Route 53** aos recursos protegidos para habilitar a detecção baseada em saúde e o proactive engagement.
+- Conceder ao **SRT** uma IAM role de acesso **antes** de um ataque acontecer.
+- Criar **alarmes no CloudWatch** para as métricas `DDoSDetected`.
+- Restringir o acesso à origem (ALB/S3) para que ela só aceite tráfego do CloudFront.
+
+### Dicas para a prova
+
+- "Proteção contra DDoS **sem custo adicional**" ou "ataques **SYN/UDP flood** e **reflexão**" → **Shield Standard** (já está ativo).
+- "Proteção contra ataques **de camada 7** com **menor esforço operacional**" → **Shield Advanced** com **mitigação automática L7** (ou **WAF** com rate-based rules, se o requisito for custo).
+- "Acesso a **especialistas da AWS 24/7** durante um ataque" → **Shield Advanced + SRT** (exige **Business/Enterprise Support**).
+- "Ser **contatado proativamente** pela AWS durante um ataque" → **proactive engagement** + **health checks do Route 53**.
+- "Evitar **custos inesperados** de scaling causados por DDoS" → **Shield Advanced cost protection**.
+- "Detecção de ataques **mais rápida e precisa**" → **health-based detection** com Route 53 health checks.
+- "Aplicar o Shield Advanced automaticamente a **todos os recursos** de **todas as contas** da Organization" → **AWS Firewall Manager** com políticas de Shield Advanced.
+- "Proteger uma aplicação em **EC2 exposta diretamente** (sem ELB/CloudFront)" → Shield Advanced no **Elastic IP** da instância.
+- "**Visibilidade e métricas** detalhadas sobre ataques DDoS" → **Shield Advanced** + métricas no **CloudWatch**.
+- "O SRT precisa **criar regras no WAF** em nome da empresa" → conceder uma **IAM role** de acesso ao SRT.
