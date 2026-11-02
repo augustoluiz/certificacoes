@@ -1173,3 +1173,156 @@ Serviço pago que adiciona proteção mais sofisticada, visibilidade e suporte e
 - "Proteger uma aplicação em **EC2 exposta diretamente** (sem ELB/CloudFront)" → Shield Advanced no **Elastic IP** da instância.
 - "**Visibilidade e métricas** detalhadas sobre ataques DDoS" → **Shield Advanced** + métricas no **CloudWatch**.
 - "O SRT precisa **criar regras no WAF** em nome da empresa" → conceder uma **IAM role** de acesso ao SRT.
+
+## AWS Web Application Firewall (WAF)
+
+O AWS WAF é um **firewall de aplicação web** que protege aplicações contra ataques e explorações na **camada 7 (HTTP/HTTPS)**: SQL injection, cross-site scripting (XSS), bots, abuso de APIs e ataques DDoS de camada de aplicação (HTTP flood).
+
+Ele inspeciona cada requisição HTTP (IP de origem, país, headers, query string, URI, cookies, body) e decide se ela deve ser **permitida, bloqueada, contada ou desafiada**.
+
+### Onde o WAF pode ser usado
+
+O WAF é associado a recursos específicos, e **não** a uma VPC ou instância:
+
+- **Amazon CloudFront** (escopo **global**: a web ACL é criada em **`us-east-1`**).
+- **Application Load Balancer**.
+- **Amazon API Gateway** (REST APIs).
+- **AWS AppSync** (GraphQL APIs).
+- **Amazon Cognito** (user pools).
+- **AWS App Runner** e **AWS Verified Access**.
+
+Para os recursos regionais, a web ACL deve estar **na mesma região** do recurso. Uma web ACL pode ser associada a **vários recursos**, mas cada recurso tem **no máximo uma** web ACL.
+
+> **Obs:** O WAF **não** pode ser associado a **Network Load Balancer**, Gateway Load Balancer ou **instâncias EC2** diretamente, porque eles operam na camada 4. Para proteger esses casos, coloque um **ALB** ou o **CloudFront** na frente, ou use o **AWS Network Firewall** dentro da VPC.
+
+![Diagrama AWS WAF - Integrações e logs](./img/aws-waf/aws-waf-01.png)
+
+### Componentes
+
+- **Web ACL (Web Access Control List):** o conjunto de **regras** associado aos recursos protegidos, com uma **default action** (Allow ou Block) aplicada quando nenhuma regra termina a avaliação.
+- **Rules:** cada regra tem uma **condição** (statement) e uma **ação**. As regras são avaliadas em ordem de **prioridade**.
+- **Rule groups:** conjuntos reutilizáveis de regras. Podem ser **próprios**, **AWS Managed Rules** ou do **AWS Marketplace**.
+- **IP sets** e **regex pattern sets:** listas reutilizáveis de IPs/CIDRs (até **10.000** por IP set) e de expressões regulares.
+- **WCU (Web ACL Capacity Units):** cada regra consome capacidade de acordo com a complexidade. Uma web ACL pode usar até **5.000 WCUs** (acima de **1.500** há custo adicional).
+
+### Statements (condições)
+
+| Statement | O que inspeciona |
+|---|---|
+| **IP set match** | IP de origem (ou IP de um header, como `X-Forwarded-For`) |
+| **Geo match** | País/região de origem da requisição |
+| **String / regex match** | Texto em headers, URI, query string, body, cookies |
+| **Size constraint** | Tamanho de partes da requisição (ex: body muito grande) |
+| **SQL injection / XSS** | Padrões de **SQLi** e **cross-site scripting** |
+| **Rate-based** | Quantidade de requisições por chave em uma janela de tempo |
+| **Label match** | Labels adicionadas por regras avaliadas antes |
+| **AND / OR / NOT** | Combinação de statements |
+
+> **Obs:** O WAF inspeciona apenas os **primeiros bytes do body**: **8 KB** no ALB e no AppSync, e **16 KB por padrão** no CloudFront, API Gateway, Cognito, App Runner e Verified Access (configurável até **64 KB**, com custo adicional). É preciso definir o que fazer com o restante (*oversize handling*: continuar, permitir ou bloquear).
+
+### Ações
+
+| Ação | Tipo | Comportamento |
+|---|---|---|
+| **Allow** | Terminativa | Encaminha a requisição para o recurso protegido (pode inserir headers customizados) |
+| **Block** | Terminativa | Retorna **HTTP 403** ou uma **resposta customizada** (status code, headers e body próprios) |
+| **Count** | **Não terminativa** | Só **conta** e registra a requisição, e a avaliação continua. Usado para **testar regras** antes de bloquear |
+| **CAPTCHA** | Terminativa* | Exige que o usuário resolva um **quebra-cabeça**. Com token válido, a requisição segue |
+| **Challenge** | Terminativa* | Desafio **silencioso** (JavaScript) para verificar se o cliente é um navegador. Com token válido, a requisição segue |
+
+\* Quando o cliente já tem um **token válido**, CAPTCHA e Challenge funcionam como Count e a avaliação continua.
+
+**Labels:** qualquer regra pode adicionar **labels** à requisição (ex: `awswaf:managed:aws:bot-control:bot:category:scraper`). Regras com prioridade maior podem usar essas labels para tomar decisões, combinando várias regras. Exemplo: um managed rule group em modo Count adiciona a label, e uma regra própria bloqueia só quando a label aparece em uma rota específica.
+
+![Diagrama AWS WAF - Avaliação da web ACL](./img/aws-waf/aws-waf-02.png)
+
+### Rate-based rules
+
+Contam as requisições de cada **chave de agregação** em uma **janela de tempo** e aplicam a ação quando o limite é ultrapassado. São a principal proteção do WAF contra **HTTP flood**, **brute force** e **scraping**.
+
+- **Chave de agregação:** **IP de origem** (padrão), IP de um header (`X-Forwarded-For`), ou **chaves customizadas** combinando headers, cookies, query args, método HTTP, URI ou labels (ex: limite por **API key** ou por **usuário**).
+- **Janela de avaliação:** **1, 2, 5 ou 10 minutos** (padrão de 5 minutos).
+- **Escopo:** o limite pode valer para **todas as requisições** ou só para as que atendem a uma condição (ex: só o endpoint `/login`).
+- Quando a taxa volta a ficar abaixo do limite, as requisições voltam a ser permitidas automaticamente.
+
+### Managed rule groups
+
+Conjuntos de regras prontos, mantidos e atualizados pela AWS ou por vendors do Marketplace, sem que você precise escrever as regras.
+
+**AWS Managed Rules (gratuitas, exceto as marcadas):**
+
+| Rule group | Protege contra |
+|---|---|
+| **Core rule set (CRS)** | Vulnerabilidades comuns do **OWASP Top 10** |
+| **Known bad inputs** | Padrões de requisição sabidamente maliciosos (ex: Log4j) |
+| **SQL database** | SQL injection |
+| **Linux / Windows / PHP / WordPress / POSIX** | Explorações específicas de sistemas e plataformas |
+| **Amazon IP reputation list** | IPs com má reputação, identificados pela inteligência de ameaças da AWS |
+| **Anonymous IP list** | Requisições de VPNs, proxies, Tor e provedores de hospedagem |
+| **Bot Control** (pago) | Bots comuns (crawlers, scrapers) e, no nível *targeted*, bots sofisticados |
+| **Fraud Control: Account Takeover Prevention (ATP)** (pago) | Ataques de **credential stuffing** e brute force na página de **login** |
+| **Fraud Control: Account Creation Fraud Prevention (ACFP)** (pago) | Criação de **contas falsas** em massa |
+| **Anti-DDoS** (pago) | Ataques DDoS de camada 7, com detecção baseada em baseline |
+
+> **Obs:** Uma boa prática é adicionar um managed rule group em modo **Count** primeiro, analisar os logs para identificar **falsos positivos** e só então mudar para Block. Também é possível sobrescrever a ação de regras individuais dentro do rule group.
+
+### Logging e monitoramento
+
+- **Logs completos** das requisições inspecionadas (regra que correspondeu, ação, headers...) podem ser enviados para:
+  - **CloudWatch Logs** (log group com nome iniciando em **`aws-waf-logs-`**);
+  - **Amazon S3** (bucket com nome iniciando em **`aws-waf-logs-`**);
+  - **Amazon Data Firehose** (stream com nome iniciando em **`aws-waf-logs-`**), para enviar a ferramentas de terceiros (SIEM).
+- **Filtros de log** permitem registrar só algumas requisições (ex: só as bloqueadas), e **campos sensíveis podem ser omitidos** (*redacted*, ex: header `Authorization`).
+- **Métricas no CloudWatch** por regra e por web ACL (`AllowedRequests`, `BlockedRequests`, `CountedRequests`).
+- **Sampled requests:** amostra das requisições recentes no console, útil para depuração rápida.
+- **Análise:** consultas nos logs do S3 com **Athena**, ou com o **CloudWatch Logs Insights**.
+
+### Gerenciamento centralizado: AWS Firewall Manager
+
+Em ambientes **multi-account**, o **AWS Firewall Manager** permite criar **políticas de WAF** aplicadas automaticamente a todas as contas da **AWS Organization**:
+
+- Define regras **obrigatórias** (rule groups aplicados primeiro e por último na web ACL) que os times das contas não podem remover.
+- Aplica a política automaticamente a **novos recursos** (ex: todo ALB ou CloudFront criado).
+- Exige **AWS Organizations** e **AWS Config** habilitado nas contas.
+
+### Padrões de arquitetura comuns
+
+- **Proteger a origem do CloudFront:** para que o ALB só aceite requisições vindas do CloudFront, configure o CloudFront para enviar um **header customizado secreto** e crie uma regra no **WAF do ALB** que bloqueia requisições sem esse header. Complemente com o **security group** do ALB liberando apenas a **managed prefix list** do CloudFront. Alternativamente, use **CloudFront VPC origins** para manter o ALB em subnet privada.
+- **IP real do cliente:** quando há um proxy ou CDN na frente, o IP de origem visto pelo WAF é o do proxy. Configure os statements para usar o IP do header **`X-Forwarded-For`**. Com o CloudFront na frente, o ideal é aplicar o WAF **no CloudFront**, que vê o IP real.
+- **WAF no CloudFront vs. no ALB:** no CloudFront o ataque é bloqueado **na borda**, antes de consumir recursos na região, e a web ACL protege a aplicação globalmente. No ALB, a proteção é regional.
+- **Bloquear países:** **geo match** no WAF (ou **geo restriction** do próprio CloudFront, mais simples, mas sem as outras condições).
+
+### Custo
+
+- **US$ 5** por web ACL por mês.
+- **US$ 1** por regra (ou rule group) por mês.
+- **US$ 0,60** por milhão de requisições inspecionadas.
+- Custos adicionais para **Bot Control**, **Fraud Control**, **Anti-DDoS**, **CAPTCHA/Challenge** e inspeção de body acima do padrão.
+- Recursos protegidos pelo **Shield Advanced** não pagam o WAF.
+
+### WAF vs. outros controles de rede
+
+| | AWS WAF | Security Groups / NACLs | AWS Network Firewall | AWS Shield |
+|---|---|---|---|---|
+| Camada | **7** (HTTP/HTTPS) | 3/4 | 3 a 7 | 3/4 (Standard), 3 a 7 (Advanced) |
+| Onde atua | CloudFront, ALB, API Gateway, AppSync, Cognito... | ENI / subnet | Na **VPC** (subnets de firewall) | Infraestrutura AWS e recursos protegidos |
+| Inspeciona | Conteúdo HTTP (headers, body, URI) | IP, porta, protocolo | Pacotes, domínios (SNI), assinaturas IPS | Padrões de tráfego DDoS |
+| Uso típico | SQLi, XSS, bots, rate limit | Controle de acesso de rede | Filtro de saída, IPS, tráfego entre VPCs | Ataques DDoS |
+
+### Dicas para a prova
+
+- "Proteger contra **SQL injection** e **XSS**" → **AWS WAF** (managed rules **Core rule set** e **SQL database**).
+- "Bloquear IPs que fazem **muitas requisições**", "**HTTP flood**" ou "**brute force** no login" → **rate-based rule**.
+- "Limitar requisições **por API key/usuário**, e não por IP" → rate-based rule com **chave de agregação customizada** (header).
+- "Bloquear acesso de **determinados países**" → **geo match** no WAF (ou geo restriction do CloudFront).
+- "Bloquear uma **lista de IPs** maliciosos" → **IP set** com ação Block. Com o CloudFront ou proxy na frente, use o IP do **`X-Forwarded-For`**.
+- "Proteção contra vulnerabilidades comuns **com menor esforço operacional**" → **AWS Managed Rules**.
+- "Testar regras **sem impactar os usuários**" → ação **Count**, depois analisar os logs.
+- "Bloquear **bots**/scrapers" → **Bot Control**. "**Credential stuffing**" → **Account Takeover Prevention (ATP)**. "Criação de **contas falsas**" → **ACFP**.
+- "Diferenciar humanos de bots **sem bloquear**" → **CAPTCHA** ou **Challenge**.
+- "Proteger uma aplicação atrás de um **NLB**" → o WAF **não suporta** NLB: usar **ALB** ou **CloudFront** na frente.
+- "Garantir que o ALB só receba tráfego **vindo do CloudFront**" → **header customizado secreto** + regra no WAF do ALB (e prefix list do CloudFront no security group).
+- "Web ACL para o **CloudFront**" → criada em **`us-east-1`** (escopo CLOUDFRONT).
+- "Aplicar as mesmas regras de WAF em **todas as contas** da Organization" → **AWS Firewall Manager**.
+- "Analisar os logs do WAF com **SQL**" → logs no **S3** + **Athena**. "Enviar para um **SIEM**" → **Data Firehose**.
+- "Retornar uma **página customizada** quando a requisição é bloqueada" → **custom response** na ação Block.
