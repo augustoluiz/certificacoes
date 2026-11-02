@@ -1530,3 +1530,161 @@ O padrão mais comum combina **EventBridge** com outros serviços:
 - "Habilitar o Inspector em **todas as contas** da Organization, inclusive nas novas" → **admin delegado** + ativação automática.
 - "Visão **centralizada** de findings do Inspector, GuardDuty e Macie" → **Security Hub**.
 - "Detectar **comportamento malicioso** (ex: instância minerando criptomoedas)" → **GuardDuty**, e não Inspector.
+
+## AWS Config
+
+O AWS Config é o serviço que **registra continuamente a configuração dos recursos** da conta, mantém o **histórico de mudanças** e **avalia a conformidade** dessas configurações com regras definidas pela empresa.
+
+Ele responde a perguntas como:
+
+- "Como estava configurado este security group **na semana passada**?"
+- "**Quais buckets S3** estão com acesso público?"
+- "Quais volumes EBS **não estão criptografados**?"
+- "**Quem** alterou esta configuração, e quando?" (em conjunto com o CloudTrail)
+
+**Características:**
+
+- É um serviço **regional**: precisa ser habilitado em **cada região** (e em cada conta) que se quer monitorar. Para recursos globais (ex: IAM), a gravação deve ser habilitada em **uma única região**, para evitar duplicidade.
+- É um **controle detectivo**: **identifica** configurações fora do padrão, mas **não impede** que elas sejam feitas. Para prevenir, use **SCPs**, **IAM** ou as **regras proativas** do Config.
+
+### Componentes
+
+- **Configuration recorder:** registra as configurações dos recursos. Pode gravar **todos os tipos de recurso** ou apenas os escolhidos, de forma **contínua** (a cada mudança) ou **diária** (mais barato, com menos detalhe).
+- **Configuration item (CI):** o "retrato" da configuração de um recurso em um momento: atributos, tags, **relacionamentos** com outros recursos (ex: a instância EC2 está na subnet X e usa o security group Y) e eventos do CloudTrail relacionados.
+- **Configuration history** e **snapshots:** o histórico de CIs de cada recurso e uma "foto" de todos os recursos em um momento.
+- **Delivery channel:** envia o histórico e os snapshots para um **bucket S3** e, opcionalmente, notificações de mudanças para um **tópico SNS**.
+- **Resource timeline:** linha do tempo de cada recurso, mostrando **o que mudou** (Config) e **quem mudou** (CloudTrail).
+
+### Config Rules
+
+Regras que avaliam se os recursos estão **em conformidade** (`COMPLIANT` ou `NON_COMPLIANT`).
+
+- **AWS managed rules:** centenas de regras prontas. Exemplos:
+  - `s3-bucket-public-read-prohibited` / `s3-bucket-public-write-prohibited`;
+  - `restricted-ssh` (security groups com SSH aberto para `0.0.0.0/0`);
+  - `encrypted-volumes` e `rds-storage-encrypted`;
+  - `required-tags`;
+  - `cloudtrail-enabled` e `root-account-mfa-enabled`;
+  - `approved-amis-by-id`.
+- **Custom rules:**
+  - **Lambda:** uma função Lambda avalia o recurso com qualquer lógica.
+  - **Custom policy (Guard):** regras escritas em **CloudFormation Guard**, sem precisar de Lambda.
+- **Gatilhos (triggers):**
+  - **Mudança de configuração:** a regra é avaliada quando um recurso no escopo é alterado.
+  - **Periódico:** a regra é avaliada a cada 1, 3, 6, 12 ou 24 horas.
+- **Modo de avaliação:**
+  - **Detectivo:** avalia os recursos que já existem.
+  - **Proativo:** avalia a configuração **antes** de o recurso ser criado (ex: via **CloudFormation Hooks**), permitindo bloquear o deploy.
+
+![Diagrama AWS Config - Funcionamento](./img/aws-config/aws-config-01.png)
+
+### Remediação
+
+- Recursos não conformes podem ser corrigidos com **SSM Automation documents** (runbooks), prontos da AWS ou próprios. Exemplos: `AWS-DisableS3BucketPublicReadWrite`, `AWS-DisableIncomingSSHOnPort22`.
+- A remediação pode ser **manual** (alguém dispara pelo console) ou **automática**, com número de **tentativas** configurável.
+- A remediação usa uma **IAM role** com permissão para alterar o recurso.
+- Para fluxos mais complexos, use o **EventBridge**: cada mudança de conformidade gera um evento que pode acionar **Lambda**, **SNS**, Step Functions etc.
+
+### Conformance Packs
+
+Um **conformance pack** é um **conjunto de regras do Config e ações de remediação** empacotado em um template **YAML**, implantado como uma unidade.
+
+- A AWS fornece **templates de exemplo** para frameworks de compliance: **CIS Benchmarks**, **PCI DSS**, **HIPAA**, **NIST**, Operational Best Practices para serviços específicos etc.
+- Podem ser implantados em uma conta ou em **toda a Organization** (organization conformance packs).
+- Têm um **score de conformidade** próprio, facilitando o acompanhamento por framework.
+
+### Multi-account e multi-region
+
+- **Aggregator:** consolida os dados de configuração e conformidade de **várias contas e regiões** em uma única conta. É **somente leitura**: **não aplica regras** nas contas (detalhes em [Config Aggregator](#config-aggregator)).
+- **Organization rules** e **organization conformance packs:** a management account ou uma **conta administradora delegada** implanta regras e conformance packs em **todas as contas** da Organization, inclusive nas novas.
+- **Delivery channel centralizado:** as contas podem enviar o histórico para um **bucket S3 central** na conta de log/segurança.
+- **Advanced queries:** consultas em **SQL** sobre o estado atual de configuração dos recursos, em uma conta ou **em todo o aggregator** (ex: "liste todas as instâncias EC2 do tipo t2.micro em todas as contas"). Também é possível gerar a consulta a partir de linguagem natural.
+
+![Diagrama AWS Config - Multi-account](./img/aws-config/aws-config-02.png)
+
+> **Obs:** O **AWS Security Hub** usa regras do Config para executar seus **controles de segurança**, e o **AWS Control Tower** usa o Config para os seus **controles detectivos**. Por isso o Config precisa estar habilitado nas contas para que esses serviços funcionem. O **Firewall Manager** também exige o Config.
+
+### Config Aggregator
+
+O **aggregator** é um recurso do Config que **coleta e consolida** os dados de configuração e de conformidade de **várias contas e regiões** em uma **única conta** (a *aggregator account*, normalmente a conta de segurança). Com ele, o time de segurança tem uma visão central do inventário e da conformidade de todo o ambiente, sem precisar acessar cada conta e região.
+
+**O que o aggregator consolida:**
+
+- **Configuração dos recursos:** inventário de todos os recursos gravados nas contas e regiões de origem.
+- **Conformidade:** status das **Config rules** e dos **conformance packs** de cada conta.
+- **Advanced queries** podem ser executadas **sobre o aggregator**, consultando com SQL o inventário de todas as contas e regiões de uma vez.
+
+#### Tipos de origem
+
+| | **AWS Organization** | **Contas individuais** |
+|---|---|---|
+| Onde é criado | **Management account** ou **conta administradora delegada** do Config | Qualquer conta |
+| Autorização | **Não precisa** de autorização conta a conta: usa uma **IAM role** com a policy `AWSConfigRoleForOrganizations` | **Cada conta de origem** precisa criar uma **authorization** para a conta e a região do aggregator |
+| Contas novas | Incluídas **automaticamente** | Precisam ser **adicionadas e autorizar** manualmente |
+| Uso típico | Todas as contas da empresa | Contas **fora da Organization** (parceiros, empresas adquiridas, outra Organization) |
+
+Nos dois tipos, é possível escolher **todas as regiões** (incluindo regiões habilitadas no futuro) ou só **regiões específicas**.
+
+![Diagrama AWS Config - Tipos de origem do aggregator](./img/aws-config/aws-config-03.png)
+
+> **Obs:** Para usar uma **conta administradora delegada** no Config, a management account registra a conta para o service principal correto. São dois: `config.amazonaws.com` para **aggregators** e `config-multiaccountsetup.amazonaws.com` para **organization rules e conformance packs**. Para fazer as duas coisas a partir da conta de segurança, é preciso registrar os dois.
+
+#### Limitações e cuidados
+
+- O aggregator **não habilita o Config** nas contas de origem: o **configuration recorder** precisa estar ativo em cada conta e região, senão não há dados para agregar. Use **organization conformance packs**, **CloudFormation StackSets** ou o **Control Tower** para garantir isso.
+- É **somente leitura**: não cria regras, não executa **remediação** e não altera recursos nas contas de origem. Para aplicar regras use **organization rules / conformance packs**; para remediar, configure a remediação nas próprias regras (em cada conta).
+- **Não copia os dados** para um bucket S3: a visão consolidada fica disponível no **console** e nas **APIs** do Config da conta do aggregator. Para centralizar o **histórico** em arquivos, configure o **delivery channel** das contas para um **bucket S3 central**.
+- Os dados aparecem no aggregator com um pequeno **atraso** em relação à conta de origem.
+- O aggregator em si **não tem custo adicional**: o custo continua sendo o da gravação e das avaliações de regras em cada conta.
+
+#### Aggregator vs. outras visões centralizadas
+
+| Necessidade | Serviço |
+|---|---|
+| Inventário e **conformidade de configuração** de todas as contas e regiões | **Config aggregator** |
+| **Aplicar** as mesmas regras em todas as contas | **Organization rules / conformance packs** |
+| Visão consolidada de **findings de segurança** (GuardDuty, Inspector, Macie, controles do Config) | **AWS Security Hub** (com agregação entre regiões e admin delegado) |
+| Visão consolidada de **dados operacionais** (OpsItems, patches, inventário de instâncias) | **Systems Manager Explorer** |
+
+#### Dicas para a prova (aggregator)
+
+- "Visão **centralizada** da conformidade de **todas as contas e regiões**" → **Config aggregator** na conta de segurança.
+- "Incluir **automaticamente** as contas novas na visão consolidada" → aggregator com origem **AWS Organization**.
+- "Agregar dados de contas que **não fazem parte da Organization**" → aggregator com **contas individuais** + **authorization** em cada conta de origem.
+- "Consultar com **SQL** o inventário de recursos de **várias contas**" → **advanced queries** no aggregator.
+- "O aggregator não mostra dados de uma conta/região" → verificar se o **configuration recorder** está habilitado nela e, no tipo contas individuais, se a **authorization** foi criada.
+- "Usar a conta de segurança, e não a management account, para gerenciar o aggregator" → registrar a conta como **administradora delegada** (`config.amazonaws.com`).
+- "Corrigir automaticamente recursos não conformes vistos no aggregator" → o aggregator **não remedia**: configurar **remediação nas regras** das contas (ex: via conformance pack com remediação).
+
+### Custo
+
+- Por **configuration item** gravado (a gravação **diária** tem preço diferente da contínua).
+- Por **avaliação de regra**.
+- Por **avaliação de conformance pack**.
+- Custos adicionais de S3, SNS, Lambda (custom rules) e SSM Automation.
+
+> **Obs:** Gravar **todos os tipos de recurso** de forma **contínua**, em ambientes com muitas mudanças (ex: Auto Scaling frequente), pode gerar um custo alto. Para reduzir, grave apenas os tipos de recurso relevantes ou use a gravação **diária** para os menos críticos.
+
+### Config vs. CloudTrail vs. CloudWatch
+
+| | AWS Config | AWS CloudTrail | Amazon CloudWatch |
+|---|---|---|---|
+| Pergunta | **Como** o recurso está (e estava) configurado? Está **em conformidade**? | **Quem** fez **qual chamada de API**, e quando? | Como está a **performance** e a **saúde**? |
+| Dado | Configuração e relacionamentos dos recursos | Eventos de API | Métricas, logs e alarmes |
+| Uso típico | Compliance, auditoria de configuração, histórico de mudanças | Auditoria de ações, investigação de incidentes | Monitoramento operacional |
+
+### Dicas para a prova
+
+- "Auditar e avaliar **continuamente a conformidade** da configuração dos recursos" → **AWS Config rules**.
+- "Ver o **histórico de configuração** de um recurso" ou "como estava configurado em uma **data passada**" → **AWS Config**.
+- "Saber **quem** alterou a configuração" → **CloudTrail** (o Config mostra os eventos do CloudTrail na timeline do recurso).
+- "**Corrigir automaticamente** recursos não conformes" (ex: bucket público, SSH aberto) → Config rule + **remediação automática com SSM Automation**.
+- "Ser **notificado** quando um recurso ficar não conforme" → Config + **EventBridge** → SNS.
+- "Aplicar um conjunto de regras de um **framework de compliance** (PCI DSS, HIPAA, CIS)" → **conformance packs**.
+- "Implantar regras do Config em **todas as contas** da Organization" → **organization rules / organization conformance packs** com **admin delegado**.
+- "Visão **consolidada** de conformidade de **várias contas e regiões**" → **Config aggregator**.
+- "Consultar o **inventário** de recursos de todas as contas com SQL" → **advanced queries** sobre o aggregator.
+- "Regra de conformidade **específica da empresa** que não existe como managed rule" → **custom rule** (Lambda ou Guard).
+- "**Impedir** a criação de recursos não conformes" → o Config é detectivo: usar **SCPs**, IAM ou **regras proativas** do Config com **CloudFormation Hooks**.
+- "Garantir que todos os recursos tenham **tags obrigatórias**" → managed rule **`required-tags`** (para impedir a criação sem tags: **tag policies** + SCP).
+- "**Reduzir o custo** do AWS Config" → gravar apenas os **tipos de recurso necessários** ou usar a gravação **diária**.
