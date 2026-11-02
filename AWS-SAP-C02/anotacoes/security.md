@@ -713,13 +713,15 @@ Três formas de dar acesso a outra conta:
 
 > **Obs:** Se os objetos estiverem criptografados com **SSE-KMS**, a **key policy** também precisa permitir `kms:Decrypt` (e `kms:GenerateDataKey` para uploads) para a outra conta. Isso só é possível com **customer managed key**. A chave `aws/s3` **não pode** ser compartilhada.
 
-#### S3 Access Points
+#### S3 Access Points (resumo)
 
 Cada access point tem **nome, DNS e policy próprios**, apontando para um bucket (ou um prefixo). Em vez de uma bucket policy gigante, cada aplicação/time recebe seu access point com permissões específicas.
 
 - **Network origin:** `Internet` ou **`VPC`** (só aceita requisições daquela VPC, via VPC endpoint).
 - A bucket policy pode **delegar** o controle de acesso para os access points (condition `s3:DataAccessPointAccount`).
 - **Multi-Region Access Points:** endpoint global que roteia para buckets em várias regiões (com replicação), com failover.
+
+> **Obs:** Mais detalhes na seção [S3 Access Points](#s3-access-points).
 
 #### Pre-signed URLs
 
@@ -856,3 +858,116 @@ O **CORS** (Cross-Origin Resource Sharing) é uma configuração do bucket que p
 - "Identificar buckets **compartilhados com contas externas** ou públicos" → **IAM Access Analyzer for S3**.
 - "Registrar **quem acessou cada objeto**" → **CloudTrail data events** (ou Server Access Logs).
 - "Criptografar **objetos já existentes** após mudar a default encryption" → **S3 Batch Operations**.
+
+## S3 Access Points
+
+Os S3 Access Points são **pontos de acesso nomeados** associados a um bucket, cada um com **policy, configurações de rede e Block Public Access próprios**. O objetivo é **simplificar o gerenciamento de acesso** a buckets compartilhados por muitas aplicações, times ou contas.
+
+**O problema que resolvem:** em um data lake ou bucket compartilhado, a bucket policy acumula regras de dezenas de aplicações e times, fica difícil de manter e pode atingir o **limite de 20 KB**. Uma mudança errada nela afeta todos os consumidores. Com access points, cada consumidor tem **o seu próprio ponto de entrada**, com uma policy pequena e isolada.
+
+### Características
+
+- Cada access point tem:
+  - **Nome** e **ARN** próprios: `arn:aws:s3:us-east-1:111122223333:accesspoint/finance-ap`.
+  - **DNS** próprio: `finance-ap-111122223333.s3-accesspoint.us-east-1.amazonaws.com`.
+  - **Alias** (`finance-ap-abc123...-s3alias`), que pode ser usado **no lugar do nome do bucket** em qualquer aplicação ou serviço que espera um nome de bucket.
+  - **Access point policy** (resource-based), que normalmente restringe o acesso a um **prefixo** do bucket.
+  - **Block Public Access** próprio.
+  - **Network origin**: `Internet` ou `VPC`.
+- Um bucket pode ter **milhares de access points** (quota padrão de 10.000 por região por conta, ajustável).
+- Suporta as **operações de objeto** (`GetObject`, `PutObject`, `ListObjects`...). Operações de configuração do bucket (ex: excluir o bucket, alterar versioning) continuam sendo feitas no bucket.
+- As requisições feitas via access point aparecem no **CloudTrail** com o ARN do access point, facilitando a auditoria por aplicação.
+
+![Diagrama S3 Access Points - Bucket compartilhado](./img/aws-s3-access-points/aws-s3-access-points-01.png)
+
+### Policies e delegação
+
+Uma requisição feita por um access point precisa ser permitida pela **policy do access point E pela bucket policy**. Para não ter que repetir as permissões nos dois lugares, a bucket policy **delega** o controle de acesso para os access points da conta:
+
+```json
+{
+  "Effect": "Allow",
+  "Principal": { "AWS": "*" },
+  "Action": "*",
+  "Resource": ["arn:aws:s3:::meu-bucket", "arn:aws:s3:::meu-bucket/*"],
+  "Condition": {
+    "StringEquals": { "s3:DataAccessPointAccount": "111122223333" }
+  }
+}
+```
+
+A policy do access point concede as permissões de cada consumidor. Note que o recurso é referenciado **pelo ARN do access point**, com o prefixo `object/`:
+
+```json
+{
+  "Effect": "Allow",
+  "Principal": { "AWS": "arn:aws:iam::111122223333:role/Finance" },
+  "Action": ["s3:GetObject", "s3:PutObject"],
+  "Resource": "arn:aws:s3:us-east-1:111122223333:accesspoint/finance-ap/object/finance/*"
+}
+```
+
+> **Obs:** Para **forçar** que todo acesso ao bucket passe por access points, use uma bucket policy com `Deny` quando a condition `s3:DataAccessPointArn` não existir (ou não for de um access point aprovado). Para impedir a criação de access points com origem Internet, use uma **SCP** com a condition `s3:AccessPointNetworkOrigin`.
+
+### Network origin: VPC
+
+- Um access point com network origin **VPC** só aceita requisições **vindas daquela VPC**, através de um **VPC endpoint** (gateway ou interface) do S3.
+- A network origin é definida **na criação** e **não pode ser alterada** depois.
+- A **endpoint policy** do VPC endpoint precisa permitir o acesso ao **access point** e ao **bucket** de destino.
+- É uma forma simples de garantir que dados sensíveis só sejam acessados de dentro de uma rede privada, **sem mexer na bucket policy**.
+
+### Access points cross-account
+
+- Um access point pode ser criado em uma **conta diferente** da conta dona do bucket.
+- O **dono do bucket** precisa autorizar, com a bucket policy delegando para a conta do access point (`s3:DataAccessPointAccount`), ou permitindo o ARN do access point.
+- Útil quando a conta consumidora quer **gerenciar o próprio acesso** (policy, rede) a um bucket central, como em arquiteturas de **data mesh** ou data lake multi-account.
+
+### Multi-Region Access Points
+
+Um **Multi-Region Access Point (MRAP)** fornece um **endpoint global único** que roteia as requisições para buckets em **várias regiões**.
+
+- O tráfego é roteado pela **rede global da AWS** (tecnologia do **AWS Global Accelerator**) para o bucket com **menor latência** para o cliente.
+- Os buckets são mantidos sincronizados com **S3 Cross-Region Replication** (normalmente **bidirecional**), configurada à parte.
+- **Failover controls:** a configuração de roteamento pode ser **ativo/ativo** ou **ativo/passivo**. Em um incidente, é possível mover o tráfego para outra região **em minutos**, sem alterar a aplicação.
+- As requisições são assinadas com **SigV4A** (assinatura válida para várias regiões). Os SDKs atuais suportam esse tipo de assinatura.
+- Suporta buckets em **outras contas** e tem policy própria, avaliada junto com a bucket policy de cada bucket.
+- O **Block Public Access** é sempre habilitado em um MRAP e não pode ser alterado.
+- Custo: taxa de **roteamento de dados** por GB, mais o custo de transferência e replicação entre regiões.
+
+![Diagrama S3 Access Points - Multi-Region Access Point](./img/aws-s3-access-points/aws-s3-access-points-02.png)
+
+**Casos de uso:** aplicações **multi-região** com usuários espalhados globalmente, **disaster recovery** ativo/passivo do armazenamento e simplificação da configuração das aplicações (um único endpoint, independente de região).
+
+### S3 Object Lambda Access Points
+
+Um **Object Lambda Access Point** invoca uma **função Lambda** para **transformar o objeto** no momento da leitura (`GetObject`, `HeadObject`, `ListObjects`), sem precisar armazenar cópias modificadas.
+
+- A aplicação faz a requisição ao Object Lambda Access Point, que invoca a Lambda.
+- A Lambda busca o objeto original por um **supporting access point** (um access point comum do bucket), aplica a transformação e devolve o resultado com `WriteGetObjectResponse`.
+- Exemplos: **mascarar PII** para aplicações sem permissão de ver dados sensíveis, converter formatos (ex: XML → JSON), redimensionar imagens ou adicionar marca d'água, enriquecer dados consultando outra fonte.
+
+![Diagrama S3 Access Points - Object Lambda Access Point](./img/aws-s3-access-points/aws-s3-access-points-03.png)
+
+> **Obs:** A AWS anunciou que o S3 Object Lambda **não aceita mais novos clientes**. Contas que já usavam o recurso continuam com acesso. Confirme a situação atual na documentação. O tema ainda pode aparecer na prova.
+
+### Access Points vs. outras formas de controle de acesso
+
+| | Bucket policy | S3 Access Points | S3 Access Grants |
+|---|---|---|---|
+| Escopo | Uma policy para o bucket inteiro | Uma policy **por aplicação/time** | Concessões por **prefixo** para identidades |
+| Identidades | IAM principals | IAM principals | IAM principals **e** usuários/grupos corporativos (IAM Identity Center / diretório) |
+| Controle de rede | Via conditions (`aws:SourceVpce`) | **Network origin VPC** nativo | ❌ |
+| Melhor para | Poucos consumidores, regras globais (ex: forçar HTTPS) | **Muitas aplicações** acessando um bucket compartilhado | Acesso de **usuários corporativos** em escala a data lakes |
+
+### Dicas para a prova
+
+- "Bucket compartilhado por **muitos times/aplicações** e a bucket policy está **complexa** ou atingindo o **limite de tamanho**" → **S3 Access Points**, um por aplicação, com delegação na bucket policy.
+- "Cada time deve acessar **somente o seu prefixo**" → access point por time com policy restrita ao prefixo.
+- "Garantir que um conjunto de dados só seja acessado **de dentro de uma VPC**, sem alterar a bucket policy" → access point com **network origin VPC**.
+- "Obrigar todo acesso ao bucket a passar por access points" → bucket policy com Deny baseado em `s3:DataAccessPointArn`.
+- "Impedir que alguém crie access points **acessíveis pela Internet**" → **SCP** com `s3:AccessPointNetworkOrigin`.
+- "Uma aplicação espera um **nome de bucket**, mas o acesso deve passar pelo access point" → **access point alias**.
+- "Endpoint **global único** para buckets em várias regiões com **menor latência**" → **Multi-Region Access Point** + CRR.
+- "**Failover** do S3 entre regiões em minutos, **sem alterar a aplicação**" → **MRAP com failover controls** (ativo/passivo).
+- "Remover **PII** dos objetos para algumas aplicações **sem manter cópias** dos dados" → **S3 Object Lambda Access Point**.
+- "Dar acesso a dados do S3 para **usuários do diretório corporativo** em escala" → **S3 Access Grants**, e não access points.
