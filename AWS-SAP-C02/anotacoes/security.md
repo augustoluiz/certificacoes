@@ -1326,3 +1326,207 @@ Em ambientes **multi-account**, o **AWS Firewall Manager** permite criar **polí
 - "Aplicar as mesmas regras de WAF em **todas as contas** da Organization" → **AWS Firewall Manager**.
 - "Analisar os logs do WAF com **SQL**" → logs no **S3** + **Athena**. "Enviar para um **SIEM**" → **Data Firehose**.
 - "Retornar uma **página customizada** quando a requisição é bloqueada" → **custom response** na ação Block.
+
+
+## AWS Firewall Manager
+
+O AWS Firewall Manager (FMS) é o serviço para **gerenciar regras de firewall e proteções de segurança de forma centralizada** em **todas as contas e recursos de uma AWS Organization**.
+
+Em vez de configurar WAF, Shield Advanced, security groups e Network Firewall conta por conta, o time de segurança define **políticas** uma única vez, e o FMS as aplica automaticamente às contas, OUs e recursos que estão no escopo, **inclusive contas e recursos criados depois**.
+
+### Pré-requisitos
+
+- **AWS Organizations** com **all features** habilitado.
+- Uma **conta administradora do FMS**, definida pela management account. A boa prática é delegar para uma conta de **segurança** dedicada, e não usar a management account.
+- **AWS Config** habilitado em **todas as contas e regiões** onde as políticas serão aplicadas. O FMS usa o Config para descobrir os recursos e avaliar a conformidade.
+- Para políticas de Shield Advanced, a assinatura do **Shield Advanced**. Para Network Firewall e DNS Firewall, os respectivos serviços disponíveis nas contas.
+
+> **Obs:** É possível ter **várias contas administradoras** do FMS, cada uma com um **escopo administrativo** (contas, OUs, regiões e tipos de política). Exemplo: o time de rede administra as políticas de Network Firewall e o time de AppSec administra as de WAF.
+
+![Diagrama AWS Firewall Manager - Visão multi-account](./img/aws-firewall-manager/aws-firewall-manager-01.png)
+
+### Tipos de política
+
+| Tipo | O que o FMS faz |
+|---|---|
+| **AWS WAF** | Cria e associa **web ACLs** aos recursos (CloudFront, ALB, API Gateway, AppSync...), com rule groups obrigatórios |
+| **Shield Advanced** | Habilita a proteção do **Shield Advanced** nos recursos (e, opcionalmente, a mitigação automática na camada 7) |
+| **Security groups** | Aplica security groups **baseline**, **audita** regras permissivas e identifica security groups **não usados ou redundantes** |
+| **Network ACLs** | Garante que as subnets tenham entradas **obrigatórias** nas NACLs (primeiras e últimas regras) |
+| **AWS Network Firewall** | Cria **firewall endpoints** nas VPCs e aplica as políticas de firewall (modelo **distribuído** ou **centralizado**) |
+| **Route 53 Resolver DNS Firewall** | Associa **rule groups de DNS Firewall** às VPCs, bloqueando consultas a domínios maliciosos |
+| **Firewalls de terceiros** | Gerencia firewalls do Marketplace, como Palo Alto Cloud NGFW e Fortigate Cloud-Native Firewall |
+
+### Escopo das políticas
+
+Cada política define **onde** ela é aplicada:
+
+- **Contas e OUs:** incluir ou excluir contas e OUs específicas.
+- **Tipos de recurso:** ex: só ALBs, só distribuições CloudFront.
+- **Tags:** incluir ou excluir recursos com determinadas tags.
+- **Região:** as políticas são **regionais**. Para CloudFront, a política de WAF é criada em **`us-east-1`**.
+
+Quando uma conta entra em uma OU no escopo, ou quando um recurso novo é criado, o FMS aplica a política **automaticamente**.
+
+### Remediação
+
+- **Remediação automática:** o FMS **cria, associa ou corrige** as proteções nos recursos não conformes (ex: associa a web ACL a um ALB novo).
+- **Somente identificação (audit):** o FMS **apenas reporta** os recursos não conformes, sem alterá-los. Útil para avaliar o impacto antes de aplicar.
+
+A conformidade aparece no **painel do FMS**, e as violações podem ser enviadas como **findings para o Security Hub** e como **notificações via SNS**.
+
+### Políticas de WAF
+
+A web ACL criada pelo FMS em cada conta tem uma estrutura em camadas:
+
+1. **First rule groups:** definidos pelo admin do FMS, avaliados **primeiro** (ex: AWS Managed Rules, IP reputation).
+2. **Regras da conta:** o time da aplicação pode adicionar regras **próprias** no meio.
+3. **Last rule groups:** definidos pelo admin do FMS, avaliados **por último** (ex: rate-based rule padrão).
+4. **Default action:** definida na política.
+
+O time da conta **não consegue remover** os rule groups do FMS. Com a opção de **retrofit**, o FMS também passa a gerenciar **web ACLs que já existiam** nas contas, adicionando os rule groups obrigatórios a elas. A política também pode definir uma configuração **centralizada de logs** do WAF.
+
+![Diagrama AWS Firewall Manager - Política de WAF](./img/aws-firewall-manager/aws-firewall-manager-02.png)
+
+### Políticas de Security Groups
+
+Três tipos:
+
+- **Common security groups:** associa security groups **padrão** (definidos na conta admin) às ENIs, instâncias EC2 e load balancers das contas. Ex: um SG que libera o acesso dos servidores de monitoramento a todas as instâncias.
+- **Content audit:** compara as regras dos security groups com **regras proibidas ou permitidas**. Ex: identificar e remover regras que liberam **SSH/RDP para `0.0.0.0/0`**.
+- **Usage audit:** identifica security groups **não utilizados** ou **redundantes** e pode removê-los ou consolidá-los.
+
+### Políticas de Network Firewall
+
+- **Modelo distribuído:** o FMS cria um **firewall endpoint em cada VPC** no escopo.
+- **Modelo centralizado:** o firewall fica em uma **VPC de inspeção** central, normalmente ligada às outras VPCs por **Transit Gateway**.
+- O FMS também pode gerenciar as **rotas** necessárias para enviar o tráfego pelo firewall, ou apenas monitorar se elas estão configuradas.
+
+### Custo
+
+- **US$ 100** por política de proteção por região por mês.
+- Mais o custo dos serviços envolvidos (WAF, Network Firewall, DNS Firewall) e do **AWS Config**.
+- Para assinantes do **Shield Advanced**, as políticas de **WAF** e **Shield Advanced** do FMS **não têm custo adicional**.
+
+### Firewall Manager vs. outros serviços
+
+| | Firewall Manager | AWS WAF / Shield / Network Firewall | AWS Config | SCPs |
+|---|---|---|---|---|
+| Função | **Orquestra** proteções em várias contas | **Executam** a proteção | **Avalia** a conformidade das configurações | **Limitam** as ações permitidas nas contas |
+| Escopo | Organization inteira | Recurso ou conta | Conta (ou Organization com aggregator e conformance packs) | Organization |
+| Exemplo | "Todo ALB deve ter esta web ACL" | A web ACL em si | "Existe ALB sem web ACL?" | "Ninguém pode desassociar web ACLs" |
+
+### Dicas para a prova
+
+- "Aplicar regras de **WAF** de forma **consistente em todas as contas** da Organization" → **Firewall Manager** com política de WAF.
+- "Garantir que **novos recursos** (ALB, CloudFront) e **novas contas** recebam a proteção **automaticamente**" → **Firewall Manager**.
+- "Habilitar o **Shield Advanced** em todos os recursos expostos de todas as contas" → **Firewall Manager** com política de Shield Advanced.
+- "Regras de segurança **obrigatórias** que os times das aplicações **não podem remover**, mas que permitem regras próprias" → política de WAF do FMS com **first/last rule groups**.
+- "Identificar e corrigir security groups com **SSH aberto para a Internet** em todas as contas" → política de **security group content audit**.
+- "Remover security groups **não utilizados** em várias contas" → política de **usage audit**.
+- "Implantar o **Network Firewall** em todas as VPCs da Organization" → política de **Network Firewall** do FMS.
+- "Bloquear consultas DNS a **domínios maliciosos** em todas as VPCs" → política de **Route 53 Resolver DNS Firewall** do FMS.
+- "**Pré-requisitos** do Firewall Manager" → **AWS Organizations** (all features), **conta administradora** e **AWS Config** habilitado.
+- "Times diferentes devem administrar **tipos de política diferentes**" → **várias contas administradoras** com escopos administrativos.
+- "Avaliar o **impacto** de uma política antes de aplicá-la" → política sem **remediação automática** (apenas identificação).
+
+
+## Amazon Inspector
+
+O Amazon Inspector é o serviço de **gerenciamento automatizado e contínuo de vulnerabilidades** da AWS. Ele escaneia as cargas de trabalho em busca de **vulnerabilidades de software conhecidas (CVEs)** e de **exposição de rede não intencional**, e prioriza os findings de acordo com o risco real de cada recurso.
+
+- É um serviço **regional**, habilitado com poucos cliques. A descoberta dos recursos e os scans são **automáticos e contínuos**.
+- Os recursos são **reescaneados automaticamente** quando uma **nova CVE é publicada** ou quando o software do recurso muda (novo pacote instalado, nova imagem enviada, nova versão da função).
+- Usa diversas fontes de inteligência de vulnerabilidades (NVD, avisos de segurança dos fornecedores e distribuições, feeds da própria AWS).
+
+> **Obs:** A versão atual substituiu o **Amazon Inspector Classic**, que exigia um agente próprio e templates de avaliação executados manualmente. Se uma questão mencionar "assessment templates" ou "Inspector agent", ela está falando do Classic.
+
+### O que o Inspector escaneia
+
+| Recurso | Como funciona | O que encontra |
+|---|---|---|
+| **Instâncias EC2** | Com o **SSM Agent** (a instância precisa ser **managed instance** do Systems Manager) ou **agentless**, escaneando **snapshots EBS**. O modo **híbrido** usa o agente quando disponível e o agentless nas outras instâncias | CVEs em pacotes do **sistema operacional** e de **linguagens** (Java, Python, Node.js...), **alcançabilidade de rede** e **CIS benchmarks** do SO |
+| **Imagens de container no ECR** | **Enhanced scanning** do ECR: escaneia no **push** e continuamente durante um período configurável | CVEs nos pacotes do SO e de linguagens da imagem |
+| **Funções Lambda** | **Standard scanning** (dependências) e **code scanning** (código da função) | CVEs em bibliotecas e **falhas no código** (injection, vazamento de dados, criptografia fraca, **secrets hardcoded**) |
+| **Repositórios de código** | **Code Security**: integra com GitHub e GitLab | **SAST** (código), **SCA** (dependências) e **IaC** (configurações inseguras em templates) |
+| **Pipelines CI/CD** | Gera o **SBOM** da imagem ou artefato e chama a API de scan do Inspector (plugins para Jenkins, TeamCity e outros) | Vulnerabilidades **antes** do deploy |
+
+> **Obs:** Se uma instância EC2 não aparece como escaneada, normalmente o motivo é: o **SSM Agent não está instalado/rodando**, a instância **não tem uma instance role** com permissões do Systems Manager, ou não tem **conectividade** com os endpoints do SSM (sem internet/NAT e sem **VPC endpoints**). O modo **agentless** resolve parte desses casos.
+
+### Alcançabilidade de rede (network reachability)
+
+Para instâncias EC2, o Inspector analisa a **configuração de rede** da VPC (security groups, NACLs, route tables, internet gateways, load balancers) e identifica **portas acessíveis a partir da Internet** e por qual caminho.
+
+- Não envia tráfego para as instâncias: é uma **análise da configuração**.
+- **Não precisa de agente**.
+- Combinada com as CVEs, aumenta a prioridade de vulnerabilidades em serviços **expostos à Internet**.
+
+### Inspector risk score
+
+Cada finding recebe um **Inspector score**, calculado a partir da nota **CVSS** da vulnerabilidade e **ajustado pelo contexto** do recurso:
+
+- A vulnerabilidade é explorável **pela rede** e a instância está **acessível pela Internet**? O score aumenta.
+- Existe **exploit público** conhecido para a CVE? O score aumenta.
+- A instância não está exposta? O score pode diminuir.
+
+Com isso, os times priorizam o que **realmente representa risco**, e não só o que tem a nota CVSS mais alta.
+
+![Diagrama Amazon Inspector - Funcionamento](./img/amazon-inspector/amazon-inspector-01.png)
+
+### Findings e integrações
+
+- **Severidade:** Critical, High, Medium, Low, Informational e Untriaged.
+- **Suppression rules:** ocultam findings que correspondem a critérios (ex: CVEs aceitas como risco em ambiente de dev), sem desabilitar o scan.
+- **AWS Security Hub:** os findings são enviados automaticamente, junto com os de GuardDuty, Macie, Config e outros.
+- **Amazon EventBridge:** cada finding novo ou atualizado gera um evento, base para **automação** e **notificações**.
+- **Exportação para S3:** relatórios de findings e de **SBOM** (formatos **CycloneDX** e **SPDX**), criptografados com uma chave **KMS**.
+- **Dashboard:** visão de cobertura (quais recursos estão sendo escaneados) e das vulnerabilidades mais críticas.
+
+### Multi-account
+
+- Integração com **AWS Organizations**: a management account define uma **conta administradora delegada** (normalmente a conta de segurança).
+- O admin delegado **habilita o Inspector** nas contas membro, pode **ativar automaticamente** o serviço em **novas contas** e vê os findings de **toda a Organization**.
+
+### Remediação automatizada
+
+O padrão mais comum combina **EventBridge** com outros serviços:
+
+- **EC2:** finding crítico → regra do EventBridge → **Systems Manager Patch Manager** ou **SSM Automation** aplica o patch → o Inspector reescaneia a instância e **fecha o finding automaticamente**.
+- **ECR:** imagem vulnerável → regra do EventBridge → **Lambda** marca a imagem (tag), impede o deploy ou notifica o time via **SNS**.
+- **Lambda e repositórios de código:** finding → abertura automática de ticket (ex: Jira) ou notificação para o time dono do código.
+
+![Diagrama Amazon Inspector - Remediação automatizada](./img/amazon-inspector/amazon-inspector-02.png)
+
+### Custo
+
+- **EC2:** por instância escaneada por mês (o agentless tem um custo diferente, por instância escaneada).
+- **ECR:** por imagem no scan inicial, mais um valor menor por **rescan**.
+- **Lambda:** por função por mês (o code scanning é cobrado à parte).
+- **Code Security** e **CIS benchmarks** têm cobrança própria.
+- Há um **período de avaliação gratuito de 15 dias** para novas contas.
+
+### Inspector vs. outros serviços de segurança
+
+| Serviço | Pergunta que responde |
+|---|---|
+| **Amazon Inspector** | "Meu software tem **vulnerabilidades conhecidas** ou está **exposto** à rede?" |
+| **Amazon GuardDuty** | "Há **atividade maliciosa** ou comportamento suspeito acontecendo agora?" |
+| **Amazon Macie** | "Há **dados sensíveis** (PII) nos meus buckets S3?" |
+| **AWS Config** | "Minhas **configurações** estão de acordo com as regras?" |
+| **AWS Security Hub** | "Qual é a **visão consolidada** de todos os findings de segurança?" |
+| **SSM Patch Manager** | "Como **aplico os patches** de SO nas instâncias?" |
+
+### Dicas para a prova
+
+- "Identificar **vulnerabilidades de software (CVEs)** em instâncias EC2, imagens de container ou funções Lambda" → **Amazon Inspector**.
+- "Escanear **imagens de container** no ECR automaticamente no **push**" → **ECR enhanced scanning** com o **Inspector**.
+- "Identificar instâncias com **portas expostas à Internet**" → **network reachability** do Inspector.
+- "O Inspector não está escaneando algumas instâncias EC2" → verificar o **SSM Agent**, a **instance role** com permissões do SSM e a conectividade (**VPC endpoints** do SSM), ou usar o modo **agentless**.
+- "Priorizar vulnerabilidades pelo **risco real** do ambiente" → **Inspector risk score**.
+- "**Corrigir automaticamente** vulnerabilidades em EC2" → Inspector + **EventBridge** + **SSM Patch Manager/Automation**.
+- "Impedir o **deploy** de imagens com vulnerabilidades críticas" → scan no **pipeline CI/CD** ou Inspector + EventBridge + Lambda.
+- "Detectar **secrets hardcoded** ou falhas de segurança no **código** de funções Lambda" → **Lambda code scanning** do Inspector.
+- "Gerar um **SBOM** (Software Bill of Materials) das cargas de trabalho" → **exportação de SBOM** do Inspector (CycloneDX/SPDX).
+- "Habilitar o Inspector em **todas as contas** da Organization, inclusive nas novas" → **admin delegado** + ativação automática.
+- "Visão **centralizada** de findings do Inspector, GuardDuty e Macie" → **Security Hub**.
+- "Detectar **comportamento malicioso** (ex: instância minerando criptomoedas)" → **GuardDuty**, e não Inspector.
