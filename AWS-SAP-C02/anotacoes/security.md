@@ -971,3 +971,119 @@ Um **Object Lambda Access Point** invoca uma **função Lambda** para **transfor
 - "**Failover** do S3 entre regiões em minutos, **sem alterar a aplicação**" → **MRAP com failover controls** (ativo/passivo).
 - "Remover **PII** dos objetos para algumas aplicações **sem manter cópias** dos dados" → **S3 Object Lambda Access Point**.
 - "Dar acesso a dados do S3 para **usuários do diretório corporativo** em escala" → **S3 Access Grants**, e não access points.
+
+## DDoS Attacks
+
+Um ataque de **negação de serviço (DoS - Denial of Service)** tenta deixar uma aplicação, servidor ou rede **indisponível para os usuários legítimos**, esgotando algum recurso do alvo: banda de rede, conexões, CPU, memória, threads ou limites de uma API.
+
+Em um **DDoS (Distributed Denial of Service)**, o ataque parte de **milhares ou milhões de origens ao mesmo tempo**. Isso torna o ataque muito maior e muito mais difícil de bloquear, porque não basta bloquear um IP.
+
+### Como um DDoS é executado
+
+A forma mais comum é por meio de uma **botnet**: uma rede de dispositivos comprometidos por malware (PCs, câmeras IP, roteadores, servidores mal configurados) controlada pelo atacante através de servidores de **Command & Control (C&C)**. Quando o atacante dá a ordem, todos os bots enviam tráfego para o alvo ao mesmo tempo.
+
+![Diagrama DDoS Attacks - Botnet](./img/ddos-attacks/ddos-attacks-01.png)
+
+- Botnets formadas por dispositivos **IoT** mal protegidos (ex: Mirai, em 2016) geram ataques enormes, porque existem milhões desses dispositivos conectados.
+- Existem serviços de "**DDoS de aluguel**" (*booters/stressers*), o que torna esse tipo de ataque barato e acessível.
+
+**Motivações:** extorsão (pedido de resgate para parar o ataque), concorrência, ativismo (*hacktivism*), vingança e **cortina de fumaça** para desviar a atenção do time de segurança enquanto outro ataque acontece (ex: exfiltração de dados).
+
+### Métricas de um ataque
+
+| Métrica | Mede | Tipo de ataque |
+|---|---|---|
+| **bps** (bits por segundo) | Volume de tráfego | Volumétricos: saturam o link |
+| **pps** (pacotes por segundo) | Quantidade de pacotes | Protocolo: esgotam a capacidade de processamento de roteadores, firewalls e load balancers |
+| **rps** (requisições por segundo) | Requisições HTTP/DNS | Camada de aplicação: esgotam os servidores da aplicação |
+
+> **Obs:** Os ataques crescem a cada ano. Em fevereiro de 2020, a AWS reportou ter mitigado com o **AWS Shield** um ataque de **2,3 Tbps** (reflexão CLDAP). Desde então, provedores de CDN já reportaram ataques bem maiores. Não é viável dimensionar uma infraestrutura própria para absorver ataques desse tamanho, por isso a mitigação acontece na **borda** de redes globais.
+
+### Tipos de ataque
+
+Os ataques são normalmente classificados pela **camada do modelo OSI** que atingem.
+
+#### Camada 3 e 4: Ataques volumétricos
+
+Tentam **saturar a banda** do alvo com um volume enorme de tráfego. São os ataques mais comuns.
+
+- **UDP flood:** grande volume de pacotes UDP para portas aleatórias. O servidor gasta recursos verificando as portas e respondendo com ICMP "destination unreachable".
+- **ICMP flood:** grande volume de pacotes ICMP (ex: ping).
+- **Reflexão e amplificação:** o tipo de ataque volumétrico mais eficiente (detalhado abaixo).
+
+#### Reflexão e amplificação
+
+O atacante envia **requisições pequenas** para servidores abertos na Internet (DNS, NTP, Memcached, SSDP, CLDAP...), **falsificando o IP de origem** com o IP da vítima (*IP spoofing*). Os servidores respondem para a vítima com respostas **muito maiores** que as requisições.
+
+- **Reflexão:** o tráfego chega à vítima a partir de servidores legítimos, escondendo a origem real do ataque.
+- **Amplificação:** cada byte enviado pelo atacante vira dezenas, centenas ou milhares de bytes na vítima.
+- Esses ataques usam **UDP**, porque o protocolo não tem handshake. Assim, o servidor responde sem validar se a origem é verdadeira.
+
+![Diagrama DDoS Attacks - Reflexão e amplificação](./img/ddos-attacks/ddos-attacks-02.png)
+
+#### Camada 4: Ataques de protocolo (*state exhaustion*)
+
+Exploram o funcionamento dos protocolos para **esgotar tabelas de estado** de servidores, firewalls e load balancers, mesmo com pouco volume de tráfego.
+
+- **SYN flood:** o atacante envia milhares de pacotes `SYN` (início do handshake TCP) com IPs falsificados. O servidor responde com `SYN-ACK` e **reserva recursos** para cada conexão, aguardando um `ACK` que nunca chega. A fila de conexões *half-open* (backlog) enche e novas conexões legítimas são descartadas.
+- **ACK/RST flood:** pacotes TCP fora de contexto que obrigam firewalls *stateful* a consultar suas tabelas.
+- **Ataques de fragmentação:** pacotes fragmentados que consomem recursos na remontagem.
+
+![Diagrama DDoS Attacks - SYN flood](./img/ddos-attacks/ddos-attacks-03.png)
+
+> **Obs:** A defesa clássica contra SYN flood são os **SYN cookies**: o servidor não reserva recursos até receber o `ACK` final. Na AWS, o Shield e serviços de borda (CloudFront, Global Accelerator, ELB) absorvem esses ataques antes que eles cheguem às instâncias.
+
+#### Camada 7: Ataques à aplicação
+
+Imitam o comportamento de **usuários legítimos** para esgotar os recursos da aplicação (servidores web, banco de dados, APIs). Usam muito menos tráfego que os volumétricos, mas são **mais difíceis de detectar**, porque cada requisição isolada parece normal.
+
+- **HTTP flood:** grande volume de requisições `GET`/`POST`, frequentemente para páginas "caras" (busca, login, relatórios) que consomem banco de dados e CPU.
+- **Cache-busting:** variações na query string (`?x=123`) para que as requisições **não sejam atendidas pelo cache** da CDN e cheguem à origem.
+- **Slowloris / slow POST:** abre muitas conexões e envia dados **muito devagar**, mantendo-as abertas para esgotar o limite de conexões do servidor.
+- **DNS query flood:** grande volume de consultas para domínios inexistentes ou aleatórios, sobrecarregando o servidor DNS autoritativo.
+- **Abuso de vulnerabilidades de protocolo:** ex: **HTTP/2 Rapid Reset** (2023), que abre e cancela streams em sequência para gerar centenas de milhões de requisições por segundo.
+- **Bots e scraping agressivo, credential stuffing e abuso de APIs** também podem causar indisponibilidade.
+
+### Resumo das categorias
+
+| Categoria | Camada | Exemplos | Alvo | Medido em |
+|---|---|---|---|---|
+| **Volumétrico** | 3/4 | UDP flood, reflexão/amplificação (DNS, NTP, Memcached) | Banda do link | bps |
+| **Protocolo** | 3/4 | SYN flood, ACK flood, fragmentação | Tabelas de estado, firewalls, LBs | pps |
+| **Aplicação** | 7 | HTTP flood, cache-busting, Slowloris, DNS query flood | Servidores e banco de dados | rps |
+
+### DDoS na nuvem: impacto financeiro
+
+Na nuvem, uma arquitetura com **Auto Scaling** pode **absorver** parte de um ataque escalando a infraestrutura, mas isso gera **custo**. Esse risco é chamado de **EDoS (Economic Denial of Sustainability)**: o serviço continua no ar, mas a conta explode (instâncias, transferência de dados, requisições ao CloudFront/API Gateway, invocações Lambda).
+
+> **Obs:** O **AWS Shield Advanced** oferece **proteção de custo** (*cost protection*): créditos para os aumentos de cobrança causados por um ataque DDoS em recursos protegidos.
+
+### Princípios de mitigação
+
+As boas práticas de resiliência a DDoS da AWS seguem alguns princípios:
+
+1. **Reduzir a superfície de ataque:** expor à Internet só o necessário. Instâncias e bancos em **subnets privadas**, acesso apenas via load balancer ou CDN, **security groups** e **NACLs** restritivos, origens acessíveis somente pelo CloudFront.
+2. **Absorver o ataque na borda:** usar serviços com capacidade global (**CloudFront**, **Route 53**, **Global Accelerator**) para que o tráfego malicioso seja absorvido nas **edge locations**, longe da aplicação.
+3. **Escalar para absorver:** **ELB** e **Auto Scaling** distribuem a carga e aumentam a capacidade durante picos. Arquiteturas **serverless** escalam automaticamente.
+4. **Detectar e filtrar requisições maliciosas na camada 7:** **AWS WAF** com rate-based rules, managed rules e controle de bots. **Cache** agressivo no CloudFront para que menos requisições cheguem à origem.
+5. **Monitorar e ter um plano de resposta:** métricas e alarmes no **CloudWatch** (picos de requisições, erros 5xx, latência), runbook de resposta a incidentes e, com o Shield Advanced, suporte do **Shield Response Team (SRT)**.
+
+### Serviços AWS envolvidos
+
+| Camada | Serviços AWS |
+|---|---|
+| 3/4 (volumétrico e protocolo) | **AWS Shield Standard** (automático e gratuito para todos), **Shield Advanced**, CloudFront, Route 53, Global Accelerator, ELB |
+| 7 (aplicação) | **AWS WAF**, **Shield Advanced** (mitigação automática na camada 7), CloudFront (cache), API Gateway (throttling) |
+| Rede da VPC | Security Groups, NACLs, **AWS Network Firewall**, subnets privadas |
+| Escalabilidade | ELB, Auto Scaling, serviços serverless |
+| Monitoramento | CloudWatch, Shield Advanced (métricas e notificações de ataques), Firewall Manager (gestão centralizada) |
+
+### Dicas para a prova
+
+- "Tráfego vindo de **milhares de IPs diferentes**" → é um **DDoS**. Bloquear IPs com NACL ou security group **não resolve**, porque a NACL tem limite de regras e os IPs mudam o tempo todo.
+- "Ataque de **reflexão/amplificação UDP**" ou "**SYN flood**" → camadas 3/4: **AWS Shield** (o Standard já protege automaticamente) + serviços de borda.
+- "Ataque com requisições HTTP que **parecem legítimas**", "**HTTP flood**" → camada 7: **AWS WAF** com **rate-based rules**, de preferência no **CloudFront**.
+- "Proteger a origem contra **cache-busting**" → ajustar o cache no CloudFront (ignorar query strings desnecessárias) + WAF.
+- "Reduzir a **superfície de ataque**" → recursos em **subnets privadas**, exposição apenas via **ALB/CloudFront**, origem acessível somente pelo CloudFront.
+- "Evitar **aumento de custo** causado por um ataque DDoS" → **Shield Advanced** (cost protection).
+- "Precisa de **suporte especializado 24/7** durante um ataque" → **Shield Advanced** + **Shield Response Team (SRT)**.
