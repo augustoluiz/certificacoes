@@ -1688,3 +1688,187 @@ Nos dois tipos, é possível escolher **todas as regiões** (incluindo regiões 
 - "**Impedir** a criação de recursos não conformes" → o Config é detectivo: usar **SCPs**, IAM ou **regras proativas** do Config com **CloudFormation Hooks**.
 - "Garantir que todos os recursos tenham **tags obrigatórias**" → managed rule **`required-tags`** (para impedir a criação sem tags: **tag policies** + SCP).
 - "**Reduzir o custo** do AWS Config" → gravar apenas os **tipos de recurso necessários** ou usar a gravação **diária**.
+
+
+## Amazon GuardDuty
+
+O Amazon GuardDuty é o serviço de **detecção inteligente de ameaças** da AWS. Ele analisa continuamente eventos e logs da conta usando **machine learning**, **detecção de anomalias** e **threat intelligence** para identificar **atividades maliciosas ou suspeitas**, como instâncias comprometidas, credenciais vazadas, mineração de criptomoedas e reconhecimento de rede.
+
+- É um serviço **regional**, habilitado com **um clique**, sem agentes (exceto no Runtime Monitoring) e sem impacto na performance dos recursos.
+- **Período de avaliação gratuito de 30 dias**.
+- É um controle **detectivo**: gera **findings**, mas **não bloqueia** nada. A resposta é implementada com **EventBridge** e automação.
+- Usa **threat intelligence** da AWS e de parceiros (listas de IPs e domínios maliciosos) e aprende o **comportamento normal** da conta para detectar desvios.
+
+### Fontes de dados
+
+#### Fontes fundamentais
+
+Analisadas automaticamente assim que o GuardDuty é habilitado:
+
+- **CloudTrail management events:** chamadas de API na conta (ex: alguém desabilitando o CloudTrail, chamadas de API vindas de um IP malicioso).
+- **VPC Flow Logs:** tráfego de rede de instâncias e ENIs (ex: comunicação com servidores de C&C, port scanning).
+- **Route 53 Resolver DNS query logs:** consultas DNS das VPCs (ex: consultas a domínios de mineração de criptomoedas ou usados para exfiltração).
+
+> **Obs:** **Não é preciso habilitar** o CloudTrail, os VPC Flow Logs ou os DNS logs para o GuardDuty funcionar: ele consome **fluxos de dados independentes e duplicados** diretamente da AWS. Esses dados também não aparecem nos seus buckets nem geram custo de armazenamento para você.
+
+> **Obs:** O GuardDuty só enxerga as consultas DNS que passam pelo **Route 53 Resolver** (o DNS padrão da VPC, `AmazonProvidedDNS`). Se as instâncias usam um **servidor DNS próprio** ou externo, essas consultas **não são analisadas**.
+
+#### Protection plans (opcionais)
+
+| Protection plan | O que analisa | Detecta |
+|---|---|---|
+| **S3 Protection** | **CloudTrail data events** do S3 | Acesso suspeito a dados (ex: leitura em massa a partir de IP malicioso, desabilitação do Block Public Access) |
+| **EKS Protection** | **Audit logs** do EKS | Atividade suspeita no plano de controle do Kubernetes (ex: pod privilegiado, acesso anônimo) |
+| **Runtime Monitoring** | **Agente** (security agent) em **EC2**, **ECS** (inclusive Fargate) e **EKS** | Ameaças no **sistema operacional**: processos, arquivos, conexões (ex: execução de malware, escalação de privilégio) |
+| **Malware Protection for EC2** | **Snapshots EBS** (agentless) | **Malware** nos volumes, escaneados quando um finding indica possível comprometimento (ou sob demanda) |
+| **Malware Protection for S3** | **Novos objetos** enviados a buckets selecionados | **Malware** em arquivos enviados (pode ser usado mesmo sem habilitar o GuardDuty inteiro) |
+| **RDS Protection** | **Atividade de login** no Aurora/RDS | Tentativas de login anômalas ou de força bruta |
+| **Lambda Protection** | **Atividade de rede** das funções Lambda | Funções comunicando com destinos maliciosos (ex: mineração) |
+
+![Diagrama Amazon GuardDuty - Fontes de dados e findings](./img/amazon-guardduty/amazon-guardduty-01.png)
+
+### Findings
+
+Cada finding tem um **tipo**, uma **severidade**, o recurso afetado e os detalhes da atividade.
+
+**Formato do tipo:** `ThreatPurpose:ResourceTypeAffected/ThreatFamilyName.DetectionMechanism!Artifact`
+
+| Exemplo | Significado |
+|---|---|
+| `CryptoCurrency:EC2/BitcoinTool.B!DNS` | Instância consultando domínios de **mineração de criptomoedas** |
+| `Backdoor:EC2/C&CActivity.B!DNS` | Instância se comunicando com um servidor de **command & control** |
+| `UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS` | Credenciais de uma **instance role** sendo usadas **fora da AWS** (credenciais vazadas) |
+| `Recon:EC2/PortProbeUnprotectedPort` | Porta exposta sendo **sondada** por um IP malicioso |
+| `Trojan:EC2/DNSDataExfiltration` | **Exfiltração de dados** via consultas DNS |
+| `Policy:IAMUser/RootCredentialUsage` | Uso das credenciais do **root user** |
+| `Stealth:IAMUser/CloudTrailLoggingDisabled` | Alguém **desabilitou o CloudTrail** |
+| `Policy:S3/BucketBlockPublicAccessDisabled` | Block Public Access de um bucket **desabilitado** |
+
+**Severidade:** **Low**, **Medium**, **High** e **Critical** (esta última usada para attack sequences).
+
+#### Extended Threat Detection
+
+O GuardDuty **correlaciona vários sinais** ao longo do tempo (eventos de API, findings, comportamento em runtime) e de diferentes recursos para identificar **sequências de ataque** (*attack sequences*) com várias etapas, como reconhecimento → escalação de privilégio → exfiltração de dados. Essas sequências geram um único finding de severidade **Critical**, com a linha do tempo do ataque e o mapeamento para táticas do **MITRE ATT&CK**.
+
+### Personalização
+
+- **Trusted IP lists:** IPs confiáveis (ex: da própria empresa) que **não geram findings**.
+- **Threat lists:** listas próprias de **IPs maliciosos** conhecidos, que **geram findings** quando aparecem.
+- **Suppression rules:** **arquivam automaticamente** findings que correspondem a critérios (ex: um scanner de vulnerabilidades interno que gera findings de port scan), reduzindo o ruído sem desabilitar a detecção.
+
+### Integrações e resposta automatizada
+
+- **Amazon EventBridge:** cada finding novo gera um evento. Atualizações de findings existentes são enviadas com frequência configurável (**15 minutos, 1 hora ou 6 horas**, padrão de 6 horas).
+- **AWS Security Hub:** os findings são enviados automaticamente para a visão consolidada.
+- **Amazon Detective:** a partir de um finding, permite **investigar a causa raiz** com visualizações do comportamento dos recursos ao longo do tempo.
+- **Exportação para S3:** os findings podem ser exportados para um **bucket S3**, criptografados com uma chave **KMS** (útil para retenção longa, já que o GuardDuty guarda os findings por **90 dias**).
+
+**Resposta automatizada:** finding → **EventBridge** → **Lambda**, **Step Functions** ou **SSM Automation** executando ações de contenção:
+
+- **Isolar a instância:** trocar o security group por um SG de **quarentena** (sem regras de entrada/saída).
+- **Preservar evidências:** criar **snapshots** dos volumes EBS para análise forense.
+- **Bloquear o IP ou domínio malicioso:** em **NACLs**, **WAF**, **AWS Network Firewall** ou **Route 53 Resolver DNS Firewall**.
+- **Revogar credenciais:** invalidar as sessões da **IAM role** comprometida ou desativar **access keys**.
+- **Notificar** o time via **SNS**, chat ou ferramenta de incidentes.
+
+![Diagrama Amazon GuardDuty - Resposta automatizada](./img/amazon-guardduty/amazon-guardduty-02.png)
+
+### Multi-account e multi-region
+
+- Integração com **AWS Organizations**: a management account define uma **conta administradora delegada** (normalmente a de segurança). Como o GuardDuty é **regional**, o admin delegado precisa ser configurado **em cada região**.
+- O admin delegado **habilita o GuardDuty** e os protection plans nas contas membro, pode **ativar automaticamente** (*auto-enable*) o serviço em **contas novas** e vê os findings de **toda a Organization** naquela região.
+- As contas membro **não conseguem desabilitar** o GuardDuty nem alterar as configurações definidas pelo admin.
+- Também existe o modelo por **convite** (para contas fora da Organization), hoje menos usado.
+
+**Centralizando findings de várias regiões:** os findings do GuardDuty ficam na região onde foram gerados. Para ter uma visão única:
+
+- **AWS Security Hub** com **agregação entre regiões** (*cross-region aggregation*): os findings de todas as regiões chegam a uma **home region**.
+- **EventBridge:** encaminhar os eventos de findings de cada região para um **event bus central** (cross-region e cross-account), onde fica a automação de resposta.
+- **Exportação para S3:** cada região exporta para um **bucket central** (com KMS), para retenção e análise com Athena.
+
+> **Obs:** A boa prática é habilitar o GuardDuty em **todas as regiões**, inclusive nas que a empresa **não usa**. Um atacante com credenciais vazadas costuma criar recursos (ex: instâncias para minerar criptomoedas) justamente em regiões sem monitoramento. Para impedir o uso dessas regiões, combine com uma **SCP** que nega ações fora das regiões aprovadas.
+
+![Diagrama Amazon GuardDuty - Multi-account e multi-region](./img/amazon-guardduty/amazon-guardduty-03.png)
+
+### Malware Protection for S3 em detalhe
+
+Escaneia **novos objetos** enviados a buckets selecionados (ex: bucket de upload de arquivos de usuários), sem agentes e sem infraestrutura própria.
+
+- Pode ser habilitado **por bucket** e **mesmo sem habilitar o GuardDuty** na conta.
+- Depois do scan, o GuardDuty pode adicionar ao objeto a tag **`GuardDutyMalwareScanStatus`** com o resultado: `NO_THREATS_FOUND`, `THREATS_FOUND`, `UNSUPPORTED`, `ACCESS_DENIED` ou `FAILED`.
+- Com uma **bucket policy** baseada nessa tag (`s3:ExistingObjectTag/GuardDutyMalwareScanStatus`), é possível **bloquear a leitura** de objetos que ainda não foram escaneados ou que estão infectados.
+- O resultado também gera um **evento no EventBridge**, que pode acionar uma Lambda para **mover o objeto para um bucket de quarentena** ou notificar o time.
+- Exige uma **IAM role** que permita ao GuardDuty ler os objetos (e usar a chave KMS, se o bucket for criptografado com SSE-KMS) e adicionar as tags.
+
+![Diagrama Amazon GuardDuty - Malware Protection for S3](./img/amazon-guardduty/amazon-guardduty-04.png)
+
+### Runtime Monitoring em detalhe
+
+- Usa um **security agent** do GuardDuty que coleta eventos do sistema operacional (processos, acesso a arquivos, conexões de rede).
+- O agente pode ser **gerenciado automaticamente** pelo GuardDuty:
+  - **EKS:** instalado como **EKS add-on**;
+  - **ECS no Fargate:** injetado como **sidecar** nas novas tasks;
+  - **EC2:** instalado via **Systems Manager** (a instância precisa ser uma managed instance do SSM).
+- O agente envia os dados por um **VPC endpoint** do GuardDuty. Com o gerenciamento automático, o GuardDuty **cria o VPC endpoint** nas VPCs. Se uma **SCP** ou policy impedir a criação do endpoint, o agente não consegue enviar os dados.
+- Também é possível gerenciar o agente **manualmente** (ex: quando a empresa controla todos os componentes instalados nos clusters).
+
+### Testando a automação: sample findings
+
+O GuardDuty pode gerar **findings de exemplo** (*sample findings*) pelo console ou pela API `CreateSampleFindings`. Eles têm o prefixo **`[SAMPLE]`** e servem para **testar as regras do EventBridge** e os playbooks de resposta sem precisar simular um ataque real.
+
+### Exemplo de regra do EventBridge
+
+Regra que dispara a automação para findings de severidade **alta ou crítica** (7 ou mais):
+
+```json
+{
+  "source": ["aws.guardduty"],
+  "detail-type": ["GuardDuty Finding"],
+  "detail": {
+    "severity": [{ "numeric": [">=", 7] }]
+  }
+}
+```
+
+Também é possível filtrar pelo **tipo** do finding, por exemplo `"type": [{ "prefix": "CryptoCurrency:EC2/" }]`.
+
+### Custo
+
+- Baseado no **volume de dados analisados**: quantidade de **eventos do CloudTrail** e **GB** de VPC Flow Logs e DNS logs.
+- Cada **protection plan** tem cobrança própria (eventos de S3/EKS, vCPUs monitoradas no Runtime Monitoring, GB escaneados no Malware Protection etc.).
+- O console mostra uma **estimativa de custo** por conta e por fonte de dados.
+
+### GuardDuty vs. outros serviços de segurança
+
+| Serviço | Pergunta que responde |
+|---|---|
+| **Amazon GuardDuty** | "Há **atividade maliciosa** ou suspeita acontecendo na conta?" |
+| **Amazon Inspector** | "Meu software tem **vulnerabilidades conhecidas**?" |
+| **Amazon Macie** | "Há **dados sensíveis** expostos no S3?" |
+| **Amazon Detective** | "**Qual a causa raiz** e o alcance deste incidente?" |
+| **AWS Security Hub** | "Qual é a **visão consolidada** dos findings e da postura de segurança?" |
+| **AWS Config** | "As **configurações** estão em conformidade?" |
+
+### Dicas para a prova
+
+- "Detectar **atividade maliciosa**, **instâncias comprometidas** ou **comportamento anômalo** na conta" → **GuardDuty**.
+- "Detectar **mineração de criptomoedas** em instâncias EC2" → **GuardDuty** (findings `CryptoCurrency`).
+- "Detectar o uso de **credenciais de instance role fora da AWS**" → **GuardDuty** (`InstanceCredentialExfiltration`).
+- "Solução de detecção de ameaças com **menor esforço operacional**, sem agentes e sem habilitar logs" → **GuardDuty**.
+- "**Responder automaticamente** a um finding" (isolar instância, bloquear IP) → **EventBridge** + **Lambda / Step Functions / SSM Automation**.
+- "Detectar **malware** em instâncias EC2 **sem instalar agentes**" → **Malware Protection for EC2**.
+- "Escanear **arquivos enviados** a um bucket S3 em busca de malware" → **Malware Protection for S3**.
+- "Detectar ameaças **dentro do sistema operacional** de containers e instâncias" → **Runtime Monitoring**.
+- "Detectar acessos **suspeitos aos dados do S3**" → **S3 Protection**.
+- "Detectar **logins anômalos** no Aurora/RDS" → **RDS Protection**.
+- "Reduzir **falsos positivos** de um scanner interno" → **trusted IP list** ou **suppression rule**.
+- "O GuardDuty não detecta consultas DNS das instâncias" → elas não usam o **Route 53 Resolver** (DNS próprio).
+- "Habilitar o GuardDuty em **todas as contas e regiões**, inclusive nas novas" → **admin delegado** + **auto-enable** (em cada região).
+- "**Reter findings** por mais de 90 dias" → **exportação para S3**.
+- "**Investigar a causa raiz** de um finding" → **Amazon Detective**.
+- "**Bloquear** o tráfego malicioso" → o GuardDuty **não bloqueia**: usar NACL, WAF, Network Firewall ou DNS Firewall (via automação).
+- "Visão **única** dos findings de **todas as regiões**" → **Security Hub** com **agregação entre regiões** (ou EventBridge encaminhando para um event bus central).
+- "Detectar atividade em **regiões que a empresa não usa**" → habilitar o GuardDuty em **todas as regiões** (e restringir regiões com SCP).
+- "Impedir que aplicações leiam **arquivos com malware** enviados ao S3" → **Malware Protection for S3** + bucket policy baseada na tag **`GuardDutyMalwareScanStatus`**.
+- "**Testar** as regras de resposta automatizada sem um ataque real" → **sample findings** (`CreateSampleFindings`).
+- "Runtime Monitoring não recebe dados das instâncias/containers" → verificar o **VPC endpoint** do GuardDuty (e se uma SCP bloqueou a criação) e o **SSM Agent** nas instâncias EC2.
