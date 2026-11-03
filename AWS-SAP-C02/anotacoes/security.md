@@ -2024,3 +2024,86 @@ Remediação automática de findings de controles com falha e severidade alta ou
 - "Findings **duplicados** de recursos globais (IAM) em várias regiões" → desabilitar os controles de recursos globais fora da região principal (e **consolidated control findings** para duplicidade entre padrões).
 - "**Investigar** a causa raiz de um finding visto no Security Hub" → **Amazon Detective**.
 - "Centralizar **logs** de segurança em formato aberto para análise e retenção" → **Security Lake** (o Security Hub centraliza **findings**, não logs).
+
+## Amazon Detective
+
+O Amazon Detective é o serviço de **investigação de incidentes de segurança** da AWS. A partir de um finding (ex: do GuardDuty), ele ajuda a responder **qual a causa raiz**, **qual o alcance** do incidente e **o que mais foi afetado**, usando **machine learning**, **análise estatística** e **teoria dos grafos** sobre os logs da conta.
+
+- É um serviço **regional**, habilitado com **um clique**, sem agentes e sem precisar habilitar ou armazenar logs.
+- **Período de avaliação gratuito de 30 dias**.
+- **Pré-requisito:** o **GuardDuty** precisa estar habilitado na conta (a AWS recomenda que esteja ativo há pelo menos **48 horas** antes de habilitar o Detective).
+- **Não detecta** ameaças e **não bloqueia** nada: o Detective entra **depois** da detecção, na fase de **investigação**.
+- Mantém até **1 ano** de dados históricos agregados, permitindo comparar o comportamento atual com o **baseline** do período.
+
+> **Obs:** Investigar um finding sem o Detective significa consultar manualmente o CloudTrail, os VPC Flow Logs e outros logs (ex: com **Athena** ou **CloudWatch Logs Insights**), cruzando IPs, roles e horários. O Detective faz essa correlação automaticamente e apresenta o resultado em **visualizações prontas**.
+
+### Fontes de dados
+
+**Core (ingeridas automaticamente):**
+
+- **CloudTrail management events:** chamadas de API, logins no console, uso de roles.
+- **VPC Flow Logs:** tráfego de rede das instâncias EC2.
+- **GuardDuty findings:** normalmente o ponto de partida da investigação.
+
+**Source packages (opcionais):**
+
+- **EKS audit logs:** atividade no plano de controle dos clusters EKS (pods, service accounts, imagens).
+- **AWS security findings:** findings agregados no **Security Hub** (ex: Inspector, Macie, parceiros), para investigá-los no mesmo grafo.
+
+> **Obs:** Assim como no GuardDuty, **não é preciso habilitar** o CloudTrail ou os VPC Flow Logs: o Detective consome **fluxos independentes** diretamente da AWS.
+
+![Diagrama Amazon Detective - Funcionamento](./img/amazon-detective/amazon-detective-01.png)
+
+### Componentes
+
+- **Behavior graph:** o **grafo** criado pelo Detective em cada região, com as **entidades** (recursos) e as **interações** entre elas, alimentado continuamente pelas fontes de dados. Em ambientes multi-account, o behavior graph pertence à **conta administradora** e inclui os dados das contas membro.
+- **Entities:** IAM roles e usuários, role sessions, contas AWS, instâncias EC2, endereços IP, user agents, clusters/pods/containers do EKS, buckets S3 e findings.
+- **Entity profiles:** página de cada entidade com **painéis** prontos: chamadas de API feitas, IPs de origem, geolocalização, volume de tráfego, recursos acessados, findings relacionados. Os valores do **período investigado** (*scope time*) são comparados com o **baseline**, destacando o que é **novo ou incomum**.
+- **Pivot:** a partir de uma entidade, navegar para as entidades relacionadas (ex: finding → role → IP → outras contas acessadas pelo IP), seguindo o rastro do ataque.
+- **Finding groups:** agrupam automaticamente **findings e entidades relacionados a um mesmo incidente** (ex: vários findings do GuardDuty envolvendo a mesma role e o mesmo IP), mostrando o ataque como um todo, inclusive as táticas do **MITRE ATT&CK**. Os finding groups podem ter um **resumo gerado por IA generativa** em linguagem natural.
+- **Investigations:** análise automática de um **usuário ou role IAM** em um período, que retorna **indicadores de comprometimento**: TTPs (táticas, técnicas e procedimentos) observados, **IPs sinalizados** por threat intelligence, **viagem impossível** (*impossible travel*), geolocalizações raras, findings relacionados. Também disponível pela **API** (`StartInvestigation`), para integrar com automação ou SIEM.
+
+### Fluxo típico de investigação
+
+1. O **GuardDuty** gera um finding (ex: `UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS`).
+2. No console do GuardDuty ou do **Security Hub**, o analista usa **"Investigate in Detective"**, que abre o finding (ou a entidade) já no Detective.
+3. O analista navega pelos **entity profiles** (role → IP → instância), verificando o que mudou em relação ao baseline.
+4. Com a **causa raiz** e o **escopo** definidos, o time executa a **resposta** (isolar a instância, revogar as sessões da role) e decide se o finding era um **falso positivo** (podendo criar uma suppression rule no GuardDuty).
+
+![Diagrama Amazon Detective - Investigação](./img/amazon-detective/amazon-detective-02.png)
+
+### Multi-account
+
+- Integração com **AWS Organizations**: a management account define uma **conta administradora delegada**. A AWS recomenda usar a **mesma conta** de admin delegado do **GuardDuty** e do **Security Hub**.
+- O admin delegado pode **habilitar automaticamente** o Detective em contas novas da Organization. Também existe o modelo por **convite**.
+- Um behavior graph suporta até **1.200 contas membro**.
+- Como é **regional**, o Detective precisa ser habilitado (e o admin delegado configurado) **em cada região**.
+
+### Custo
+
+- Baseado no **volume de dados ingeridos** (GB) no behavior graph, por conta e por região.
+- Os source packages opcionais (EKS audit logs, security findings) aumentam o volume ingerido.
+- O console mostra o **volume ingerido** e uma **estimativa de custo** por conta.
+
+### Detective vs. outros serviços
+
+| Serviço | Papel na resposta a incidentes |
+|---|---|
+| **Amazon GuardDuty** | **Detectar** a ameaça (gera o finding) |
+| **AWS Security Hub** | **Centralizar e priorizar** os findings |
+| **Amazon Detective** | **Investigar**: causa raiz, escopo e linha do tempo |
+| **EventBridge + Lambda/SSM** | **Responder** (contenção e remediação) |
+| **CloudTrail Lake / Athena** | Consultas **manuais** e flexíveis sobre os logs brutos |
+| **Amazon Security Lake** | **Armazenar** logs de segurança por longo prazo (OCSF) para SIEM e análises |
+
+### Dicas para a prova
+
+- "Identificar a **causa raiz** / o **alcance** de um finding do GuardDuty" → **Amazon Detective**.
+- "**Investigar** atividade suspeita com o **menor esforço operacional**, sem consultar logs manualmente" → **Detective** (em vez de Athena sobre CloudTrail e VPC Flow Logs).
+- "Visualizar as **interações** de uma role, usuário, instância ou IP ao longo do tempo" → **Detective** (entity profiles).
+- "Agrupar findings relacionados a um **mesmo incidente**" → **finding groups** do Detective (ou attack sequences do GuardDuty).
+- "Verificar se um usuário/role IAM foi **comprometido** (IPs maliciosos, viagem impossível)" → **Detective Investigations**.
+- "Investigar atividade suspeita em clusters **EKS**" → Detective com o source package de **EKS audit logs**.
+- "Não é possível habilitar o Detective" → o **GuardDuty** não está habilitado.
+- "**Detectar** ameaças" → **GuardDuty**, não Detective. "**Bloquear**" → nenhum dos dois (WAF, NACL, Network Firewall via automação).
+- "Investigar findings de **todas as contas** da Organization em um único lugar" → **admin delegado** do Detective (de preferência o mesmo do GuardDuty e do Security Hub).
