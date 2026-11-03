@@ -1872,3 +1872,155 @@ Também é possível filtrar pelo **tipo** do finding, por exemplo `"type": [{ "
 - "Impedir que aplicações leiam **arquivos com malware** enviados ao S3" → **Malware Protection for S3** + bucket policy baseada na tag **`GuardDutyMalwareScanStatus`**.
 - "**Testar** as regras de resposta automatizada sem um ataque real" → **sample findings** (`CreateSampleFindings`).
 - "Runtime Monitoring não recebe dados das instâncias/containers" → verificar o **VPC endpoint** do GuardDuty (e se uma SCP bloqueou a criação) e o **SSM Agent** nas instâncias EC2.
+
+## AWS Security Hub
+
+O AWS Security Hub é o serviço de **gerenciamento da postura de segurança** (*CSPM — Cloud Security Posture Management*) e de **centralização de findings** da AWS. Ele faz duas coisas:
+
+1. **Avalia continuamente** os recursos contra **padrões de segurança** (best practices da AWS, CIS, PCI DSS, NIST) e gera um **security score**.
+2. **Agrega, normaliza e prioriza** os findings de outros serviços de segurança da AWS (GuardDuty, Inspector, Macie etc.) e de **parceiros**, em um único painel.
+
+- É um serviço **regional**, com suporte a **agregação entre regiões** e **multi-account** via AWS Organizations.
+- **Período de avaliação gratuito de 30 dias**.
+- É um controle **detectivo**: consolida e prioriza, mas **não bloqueia** nada. A resposta é implementada com **EventBridge** e automação.
+- **Pré-requisito:** os controles dos padrões de segurança usam **regras do AWS Config** (*service-linked rules*), então o **AWS Config precisa estar habilitado** e gravando os recursos em todas as contas e regiões monitoradas.
+
+> **Obs:** No fim de 2025 a AWS lançou uma **nova versão do Security Hub**, que unifica GuardDuty, Inspector, Macie e o CSPM e adiciona **exposure findings** (correlação de vulnerabilidades, configurações incorretas e exposição à Internet de um mesmo recurso) e visualização de **caminhos de ataque**, com findings no formato **OCSF**. A funcionalidade "clássica" de padrões e controles passou a se chamar **AWS Security Hub CSPM**. As questões da prova ainda são baseadas principalmente nos conceitos abaixo (padrões, controles, ASFF, insights, automação, agregação), que continuam válidos.
+
+![Diagrama AWS Security Hub - Funcionamento](./img/aws-security-hub/aws-security-hub-01.png)
+
+### Padrões de segurança e controles
+
+Um **padrão** (*security standard*) é um conjunto de **controles**. Cada controle verifica uma configuração específica (ex: `S3.8 — S3 buckets should block public access`, `IAM.6 — Hardware MFA should be enabled for the root user`).
+
+| Padrão | Uso |
+|---|---|
+| **AWS Foundational Security Best Practices (FSBP)** | Boas práticas da própria AWS. Padrão **recomendado** e mais abrangente |
+| **CIS AWS Foundations Benchmark** | Benchmark do Center for Internet Security (várias versões) |
+| **PCI DSS** | Ambientes que processam **dados de cartão de pagamento** |
+| **NIST SP 800-53** | Requisitos do governo dos EUA / frameworks regulatórios |
+| **AWS Resource Tagging Standard** | Verifica se os recursos têm as **tags obrigatórias** |
+| **Service-Managed Standard: AWS Control Tower** | Controles detectivos gerenciados pelo **Control Tower** |
+
+- Cada controle tem uma **severidade** e um resultado: **PASSED**, **FAILED**, **WARNING** ou **NOT_AVAILABLE**.
+- É possível **desabilitar controles** que não se aplicam (ex: controles de recursos globais do IAM em regiões que não são a principal) e, em alguns controles, **customizar parâmetros** (ex: idade máxima de uma access key).
+- **Consolidated control findings:** quando ativado, um controle que aparece em vários padrões gera **um único finding**, em vez de um por padrão (reduz ruído).
+- **Security score:** percentual de controles **aprovados**, por padrão e geral. Útil para acompanhar a evolução da postura de segurança.
+
+### Findings e o ASFF
+
+Todos os findings são normalizados no **AWS Security Finding Format (ASFF)**, um formato JSON padronizado. Isso permite tratar findings de origens diferentes da mesma forma (filtros, automação, integrações).
+
+**Origens dos findings:**
+
+- **Serviços da AWS:** GuardDuty, Inspector, Macie, IAM Access Analyzer, Firewall Manager, Config (regras próprias), Systems Manager Patch Manager, Health, Detective.
+- **Parceiros:** CrowdStrike, Palo Alto, Trend Micro, Prisma Cloud e outros (integração habilitada no console).
+- **Findings customizados:** qualquer ferramenta própria pode enviar findings no formato ASFF pela API **`BatchImportFindings`**.
+
+**Campos importantes de um finding:**
+
+| Campo | Valores | Significado |
+|---|---|---|
+| **Severity.Label** | `INFORMATIONAL`, `LOW`, `MEDIUM`, `HIGH`, `CRITICAL` | Criticidade normalizada |
+| **Workflow.Status** | `NEW`, `NOTIFIED`, `RESOLVED`, `SUPPRESSED` | Andamento da investigação (controlado pelo time) |
+| **RecordState** | `ACTIVE`, `ARCHIVED` | Se o finding ainda é válido (controlado pela origem) |
+| **Compliance.Status** | `PASSED`, `FAILED`, `WARNING`, `NOT_AVAILABLE` | Resultado do controle (findings de padrões) |
+
+- Os findings ficam disponíveis por **90 dias** após a última atualização. Para retenção longa, exportar via **EventBridge → Kinesis Data Firehose → S3** ou usar o **Amazon Security Lake**.
+
+### Insights
+
+**Insights** são **agrupamentos** de findings relacionados, definidos por um filtro e um atributo de agrupamento (ex: "recursos EC2 com mais findings", "contas com mais findings críticos", "buckets S3 com permissões públicas").
+
+- **Managed insights:** prontos, fornecidos pela AWS.
+- **Custom insights:** criados pelo time com filtros próprios.
+
+### Automação e resposta
+
+**Automation rules:** regras avaliadas **no momento em que o finding é criado ou atualizado**, que **alteram campos** automaticamente, sem código:
+
+- ajustar a **severidade** (ex: elevar para `CRITICAL` findings de contas de produção);
+- adicionar uma **nota** ou **campos de usuário** (ex: time responsável);
+- mudar o **workflow status** para `SUPPRESSED` (ex: findings esperados em contas de sandbox).
+
+**Integração com o EventBridge:**
+
+- **`Security Hub Findings - Imported`:** todo finding novo ou atualizado gera um evento automaticamente. Usado para **remediação automática**.
+- **`Security Hub Findings - Custom Action`:** o analista seleciona findings no console e escolhe uma **custom action** (ex: "Enviar para o Jira", "Isolar instância"). Usado para **resposta sob demanda**, com um humano decidindo.
+- **`Security Hub Insight Results`:** resultados de um insight enviados por custom action.
+
+O alvo da regra do EventBridge é uma **Lambda**, **Step Functions**, **SSM Automation**, **SNS** ou ferramenta de ticketing.
+
+**Automated Security Response on AWS (ASR):** solução da AWS (antiga *Security Hub Automated Response and Remediation*, SHARR) com **playbooks prontos** em SSM Automation para corrigir controles comuns dos padrões FSBP, CIS e PCI DSS (ex: bloquear o acesso público de um bucket, habilitar o CloudTrail).
+
+Também há integrações bidirecionais com **Jira** e **ServiceNow** para abrir e sincronizar tickets a partir dos findings.
+
+![Diagrama AWS Security Hub - Automação](./img/aws-security-hub/aws-security-hub-02.png)
+
+#### Exemplo de regra do EventBridge
+
+Remediação automática de findings de controles com falha e severidade alta ou crítica:
+
+```json
+{
+  "source": ["aws.securityhub"],
+  "detail-type": ["Security Hub Findings - Imported"],
+  "detail": {
+    "findings": {
+      "Compliance": { "Status": ["FAILED"] },
+      "Severity": { "Label": ["HIGH", "CRITICAL"] },
+      "Workflow": { "Status": ["NEW"] },
+      "RecordState": ["ACTIVE"]
+    }
+  }
+}
+```
+
+### Multi-account e multi-region
+
+- Integração com **AWS Organizations**: a management account define uma **conta administradora delegada** (normalmente a de segurança). Diferente do GuardDuty, o admin delegado definido na região principal vale para as **demais regiões**.
+- O admin delegado vê e gerencia os findings de **todas as contas membro**, e pode **ativar automaticamente** o Security Hub em **contas novas**.
+- **Central configuration:** o admin delegado cria **configuration policies** na **home region** e as associa a **OUs** ou contas. A policy define se o Security Hub fica habilitado, quais **padrões** e **controles** ficam ativos e os parâmetros dos controles, e vale para **todas as regiões vinculadas**. Contas novas **herdam** a policy da OU.
+- **Cross-region aggregation:** os findings, insights e security scores das **linked regions** são replicados para uma **home region** (aggregation region). Atualizações feitas na home region (ex: mudar o workflow status) são **replicadas de volta** para a região de origem.
+- Com a agregação, a **automação central** pode ficar só na home region: um único EventBridge recebe os findings de todas as contas e regiões.
+
+> **Obs:** Como os controles dependem do **AWS Config**, ele precisa estar habilitado em **todas as contas e regiões** (normalmente via Control Tower, StackSets ou Quick Setup). Para recursos globais (ex: IAM), a boa prática é gravá-los no Config **apenas em uma região** e **desabilitar os controles de recursos globais** nas demais, evitando findings duplicados.
+
+![Diagrama AWS Security Hub - Multi-account e multi-region](./img/aws-security-hub/aws-security-hub-03.png)
+
+### Custo
+
+- **Security checks:** cobrança por **verificação de controle** realizada (por conta, por região, por mês).
+- **Finding ingestion events:** cobrança por **finding ingerido** de outros serviços e parceiros, com uma faixa **gratuita** mensal (os findings dos próprios controles do Security Hub não são cobrados como ingestão).
+- **Automation rules:** cobrança por avaliação de regra.
+- O custo do **AWS Config** (itens de configuração e avaliações de regras) é **separado** e pode ser relevante em ambientes grandes.
+
+### Security Hub vs. outros serviços
+
+| Serviço | Papel |
+|---|---|
+| **AWS Security Hub** | **Painel central**: postura de segurança (padrões e controles) + agregação e priorização dos findings |
+| **Amazon GuardDuty** | **Detecta ameaças** (atividade maliciosa). Envia findings ao Security Hub |
+| **Amazon Inspector** | **Detecta vulnerabilidades** de software. Envia findings ao Security Hub |
+| **Amazon Macie** | Descobre **dados sensíveis** no S3. Envia findings ao Security Hub |
+| **AWS Config** | Registra configurações e avalia **regras**. É o **motor** dos controles do Security Hub |
+| **Amazon Detective** | **Investiga a causa raiz** de um finding |
+| **Amazon Security Lake** | **Data lake** de logs e eventos de segurança no S3, no formato **OCSF**, para retenção longa e análise (Athena, SIEM) |
+| **AWS Audit Manager** | Coleta **evidências** para **auditorias** e relatórios de compliance |
+
+### Dicas para a prova
+
+- "**Visão única** dos findings de GuardDuty, Inspector, Macie e ferramentas de parceiros" → **Security Hub**.
+- "Avaliar continuamente as contas contra o **CIS Benchmark**, **PCI DSS** ou as **best practices da AWS**" → **Security Hub** (padrões de segurança).
+- "Security Hub não mostra resultados dos controles" → o **AWS Config** não está habilitado/gravando os recursos.
+- "Habilitar o Security Hub e os mesmos padrões em **todas as contas e regiões**, inclusive nas novas" → **admin delegado** + **central configuration** (configuration policies por OU).
+- "Visão **única** dos findings de **todas as regiões**" → **cross-region aggregation** (home region).
+- "**Remediar automaticamente** controles com falha" → **EventBridge** (`Findings - Imported`) + **SSM Automation / Lambda**, ou a solução **Automated Security Response on AWS**.
+- "Permitir que o **analista decida** quando executar uma ação sobre um finding" → **custom action** + EventBridge.
+- "**Elevar a severidade** ou **suprimir** findings automaticamente, **sem código**" → **automation rules**.
+- "Enviar findings de uma **ferramenta própria** ao Security Hub" → **`BatchImportFindings`** no formato **ASFF**.
+- "**Reter findings** por mais de 90 dias" → EventBridge + **Firehose → S3**, ou **Security Lake**.
+- "Abrir **tickets** automaticamente a partir de findings" → integração com **Jira/ServiceNow** ou EventBridge + Lambda.
+- "Findings **duplicados** de recursos globais (IAM) em várias regiões" → desabilitar os controles de recursos globais fora da região principal (e **consolidated control findings** para duplicidade entre padrões).
+- "**Investigar** a causa raiz de um finding visto no Security Hub" → **Amazon Detective**.
+- "Centralizar **logs** de segurança em formato aberto para análise e retenção" → **Security Lake** (o Security Hub centraliza **findings**, não logs).
