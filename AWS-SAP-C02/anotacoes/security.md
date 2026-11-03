@@ -6,15 +6,45 @@ servicos:
   - KMS
   - SSM Parameter Store
   - Secrets Manager
+  - ACM
+  - CloudHSM
+  - S3 Security
+  - S3 Access Points
+  - Macie
+  - Shield
+  - WAF
+  - Firewall Manager
+  - Network Firewall
+  - Route 53 Resolver DNS Firewall
+  - Inspector
+  - Config
+  - GuardDuty
+  - Security Hub
+  - Detective
+  - Security Lake
+  - Audit Manager
 criado-em: 2026-10-22
-atualizado-em: 2026-10-28
+atualizado-em: 2026-11-02
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
 tags: [sap-c02, security]
 ---
 
 # Security
 
-## CloudTrail
+> **Escopo:** serviços de auditoria, criptografia, proteção de dados, proteção de rede e borda, detecção de ameaças, postura de segurança e investigação de incidentes na AWS.
+>
+> **Por que cai na prova:** a SAP-C02 cobra a escolha do serviço certo para cada requisito de segurança, a centralização em ambientes **multi-account** (admin delegado, Organizations, agregação entre regiões) e a **resposta automatizada** a findings com o menor esforço operacional.
+
+## Índice
+
+- **Auditoria e compliance:** [AWS CloudTrail](#aws-cloudtrail) · [AWS Config](#aws-config) · [AWS Audit Manager](#aws-audit-manager)
+- **Criptografia, certificados e segredos:** [AWS KMS](#aws-key-management-service-kms) · [AWS CloudHSM](#aws-cloudhsm) · [AWS Certificate Manager (ACM)](#aws-certificate-manager-acm) · [SSM Parameter Store](#aws-systems-manager-ssm-parameter-store) · [AWS Secrets Manager](#aws-secrets-manager)
+- **Proteção de dados no S3:** [Amazon S3 Security](#amazon-s3-security) · [Amazon S3 Access Points](#amazon-s3-access-points) · [Amazon Macie](#amazon-macie)
+- **Proteção de rede, borda e DDoS:** [DDoS Attacks](#ddos-attacks) · [AWS Shield](#aws-shield) · [AWS WAF](#aws-web-application-firewall-waf) · [AWS Firewall Manager](#aws-firewall-manager) · [AWS Network Firewall](#aws-network-firewall) · [Route 53 Resolver DNS Firewall](#route-53-resolver-dns-firewall)
+- **Detecção, postura e investigação:** [Amazon Inspector](#amazon-inspector) · [Amazon GuardDuty](#amazon-guardduty) · [AWS Security Hub](#aws-security-hub) · [Amazon Detective](#amazon-detective) · [Amazon Security Lake](#amazon-security-lake)
+- **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
+
+## AWS CloudTrail
 
 O AWS CloudTrail fornece **governança, auditoria e compliance** para a sua conta AWS. Ele vem **habilitado por padrão** em todas as contas e registra o histórico de **eventos e chamadas de API** feitas na conta, a partir de origens como:
 
@@ -113,8 +143,9 @@ Como os logs do CloudTrail são a base da auditoria, eles também precisam ser p
 - "Fazer consultas **SQL** nos eventos" → **Athena** sobre o S3 ou **CloudTrail Lake**.
 - "Impedir que as member accounts desativem o CloudTrail" → **Organization trail** e/ou **SCP**.
 
+[↑ Índice](#índice)
 
-## AWS KMS (Key Management Service)
+## AWS Key Management Service (KMS)
 
 O AWS Key Management Service (KMS) é o serviço gerenciado para **criar e controlar as chaves criptográficas** usadas para proteger os dados. Ele é integrado à grande maioria dos serviços da AWS (S3, EBS, RDS, DynamoDB, Secrets Manager, CloudTrail etc.), o que torna a criptografia de dados em repouso praticamente transparente.
 
@@ -254,7 +285,9 @@ Para requisitos de compliance que exigem **controle total do hardware** onde as 
 - "`ThrottlingException` no KMS com muitas requisições ao S3" → **S3 Bucket Keys** (ou data key caching / aumento de quota).
 - "Evitar perder dados ao excluir uma chave" → **desabilitar** em vez de excluir, ou usar o **período de espera** + alarme de uso.
 
-## AWS SSM Parameter Store
+[↑ Índice](#índice)
+
+## AWS Systems Manager (SSM) Parameter Store
 
 O AWS Systems Manager Parameter Store é um serviço **serverless** para **armazenar de forma centralizada e segura** dados de **configuração** e **secrets** (ex: URLs de endpoints, nomes de buckets, feature flags, senhas de banco de dados, API keys). Ele faz parte do **AWS Systems Manager (SSM)**.
 
@@ -359,6 +392,8 @@ Permitem definir regras de ciclo de vida para um parâmetro:
 - "Sempre usar a **AMI mais recente** do Amazon Linux no CloudFormation" → **public parameter** `/aws/service/ami-amazon-linux-latest/...`.
 - "`ThrottlingException` ao ler parâmetros com alto volume" → habilitar **higher throughput** ou fazer **cache** dos valores na aplicação.
 - "Compartilhar parâmetros com outras contas" → **Advanced tier** + **AWS RAM**.
+
+[↑ Índice](#índice)
 
 ## AWS Secrets Manager
 
@@ -467,7 +502,9 @@ Um secret pode ser **replicado para outras regiões**. O Secrets Manager mantém
 - "Gerar a senha do banco no **CloudFormation** sem expô-la no template" → `GenerateSecretString` + **dynamic reference**.
 - "Armazenar configurações **simples e baratas**, sem rotação" → **Parameter Store**, e não Secrets Manager.
 
-## AWS Certificate Manager - ACM
+[↑ Índice](#índice)
+
+## AWS Certificate Manager (ACM)
 
 O AWS Certificate Manager (ACM) é o serviço para **provisionar, gerenciar e implantar certificados SSL/TLS** usados para habilitar **HTTPS** (criptografia em trânsito) nos serviços da AWS.
 
@@ -555,7 +592,9 @@ Depois, cria-se um registro **CNAME ou Alias (A)** no Route 53 apontando para o 
 - "Compartilhar a CA privada com **outras contas** da organização" → **AWS RAM**.
 - "Criptografia em trânsito **até a instância**" → TLS também entre o LB e os targets (end-to-end), não apenas a terminação no LB.
 
-## CloudHSM
+[↑ Índice](#índice)
+
+## AWS CloudHSM
 
 O AWS CloudHSM fornece **HSMs (Hardware Security Modules) dedicados** na nuvem AWS, usados para **gerar, armazenar e usar chaves criptográficas** em hardware validado no **FIPS 140 nível 3**.
 
@@ -631,8 +670,9 @@ O controle de acesso às chaves é feito **dentro do HSM**, com usuários própr
 - "Chaves armazenadas **fora da AWS** (on-premises)" → **External Key Store (XKS)** do KMS, e não CloudHSM.
 - "Criptografia gerenciada com **menor custo e esforço operacional**" → **KMS**, e não CloudHSM.
 
+[↑ Índice](#índice)
 
-## S3 Security
+## Amazon S3 Security
 
 A segurança no S3 combina vários mecanismos: **controle de acesso** (quem pode fazer o quê), **criptografia** (em repouso e em trânsito), **controles de rede** (de onde o acesso pode vir), **proteção de dados** (contra exclusão ou alteração) e **auditoria/monitoramento**.
 
@@ -721,7 +761,7 @@ Cada access point tem **nome, DNS e policy próprios**, apontando para um bucket
 - A bucket policy pode **delegar** o controle de acesso para os access points (condition `s3:DataAccessPointAccount`).
 - **Multi-Region Access Points:** endpoint global que roteia para buckets em várias regiões (com replicação), com failover.
 
-> **Obs:** Mais detalhes na seção [S3 Access Points](#s3-access-points).
+> **Obs:** Mais detalhes na seção [Amazon S3 Access Points](#amazon-s3-access-points).
 
 #### Pre-signed URLs
 
@@ -859,7 +899,9 @@ O **CORS** (Cross-Origin Resource Sharing) é uma configuração do bucket que p
 - "Registrar **quem acessou cada objeto**" → **CloudTrail data events** (ou Server Access Logs).
 - "Criptografar **objetos já existentes** após mudar a default encryption" → **S3 Batch Operations**.
 
-## S3 Access Points
+[↑ Índice](#índice)
+
+## Amazon S3 Access Points
 
 Os S3 Access Points são **pontos de acesso nomeados** associados a um bucket, cada um com **policy, configurações de rede e Block Public Access próprios**. O objetivo é **simplificar o gerenciamento de acesso** a buckets compartilhados por muitas aplicações, times ou contas.
 
@@ -971,6 +1013,60 @@ Um **Object Lambda Access Point** invoca uma **função Lambda** para **transfor
 - "**Failover** do S3 entre regiões em minutos, **sem alterar a aplicação**" → **MRAP com failover controls** (ativo/passivo).
 - "Remover **PII** dos objetos para algumas aplicações **sem manter cópias** dos dados" → **S3 Object Lambda Access Point**.
 - "Dar acesso a dados do S3 para **usuários do diretório corporativo** em escala" → **S3 Access Grants**, e não access points.
+
+[↑ Índice](#índice)
+
+## Amazon Macie
+
+O Amazon Macie é o serviço de **descoberta e proteção de dados sensíveis** no **Amazon S3**. Ele usa **machine learning** e **pattern matching** para encontrar dados como **PII** (informações pessoais), dados **financeiros** e **credenciais** armazenados em buckets, e avalia continuamente a **postura de segurança** desses buckets.
+
+- É um serviço **regional**, sem agentes, habilitado com **um clique**.
+- **Período de avaliação gratuito de 30 dias**.
+- Analisa **somente o S3**. Para outros armazenamentos (RDS, DynamoDB, EBS), seria preciso exportar os dados para o S3 primeiro.
+- É um controle **detectivo**: gera **findings**, mas **não bloqueia** o acesso nem altera os objetos. A resposta é implementada com **EventBridge** e automação.
+
+### Funcionalidades
+
+**Inventário e postura dos buckets** (sempre ativo, sem custo extra de scan):
+
+- Lista todos os buckets da conta (ou da Organization) com informações de segurança: **acesso público**, **compartilhamento** com outras contas, **criptografia padrão** e replicação.
+- Gera **policy findings** quando a configuração de um bucket piora (ex: `Policy:IAMUser/S3BlockPublicAccessDisabled`, `Policy:IAMUser/S3BucketPublic`, `Policy:IAMUser/S3BucketEncryptionDisabled`).
+
+**Descoberta de dados sensíveis** (cobrada pelo volume analisado):
+
+- **Automated sensitive data discovery:** o Macie **amostra objetos** continuamente em todos os buckets e mostra um **mapa de sensibilidade** do ambiente. É a opção de **menor custo** para ter visibilidade ampla.
+- **Sensitive data discovery jobs:** varredura **completa** de buckets específicos, **única** ou **agendada** (diária, semanal, mensal). Pode filtrar por prefixo, tags, tamanho e data dos objetos.
+- Os jobs geram **sensitive data findings** (ex: `SensitiveData:S3Object/Personal`, `SensitiveData:S3Object/Financial`, `SensitiveData:S3Object/Credentials`).
+
+**Identificação dos dados:**
+
+- **Managed data identifiers:** padrões prontos da AWS para vários países e tipos de dado (cartão de crédito, passaporte, CPF, chaves de acesso AWS, chaves privadas etc.).
+- **Custom data identifiers:** padrões próprios definidos por **regex** e, opcionalmente, **palavras-chave** próximas (ex: código de funcionário `EMP-[0-9]{6}`).
+- **Allow lists:** textos ou padrões que **não devem** gerar findings (ex: um telefone público da empresa).
+
+> **Obs:** Os **discovery results** (registro detalhado de cada objeto analisado) precisam ser armazenados em um **bucket S3** configurado pelo usuário, criptografado com uma chave **KMS**. Para analisar objetos criptografados com **SSE-KMS** usando chaves gerenciadas pelo cliente, a **key policy** precisa permitir o uso pela service-linked role do Macie. Objetos com **SSE-C** não podem ser analisados.
+
+![Diagrama Amazon Macie - Funcionamento](./img/amazon-macie/amazon-macie-01.png)
+
+### Integrações e multi-account
+
+- **EventBridge:** cada finding gera um evento, que pode acionar Lambda ou SSM Automation (ex: bloquear o acesso público, aplicar tags, mover o objeto para um bucket restrito, notificar o time).
+- **Security Hub:** os findings são enviados automaticamente para a visão consolidada.
+- **AWS Organizations:** a management account define uma **conta administradora delegada**, que habilita o Macie e executa jobs nas contas membro, vendo os findings de toda a Organization. Como é **regional**, precisa ser configurado em **cada região**.
+- Os findings ficam disponíveis por **90 dias**.
+
+### Dicas para a prova
+
+- "Descobrir **PII**, dados financeiros ou credenciais armazenados no **S3**" → **Amazon Macie**.
+- "Visibilidade contínua de dados sensíveis em **todos os buckets** com **menor custo**" → **automated sensitive data discovery**.
+- "Escanear um bucket específico **periodicamente**" → **sensitive data discovery job** agendado.
+- "Detectar um **identificador próprio** da empresa (ex: código de cliente)" → **custom data identifier** (regex + palavras-chave).
+- "Alertar quando um bucket se tornar **público** ou perder a **criptografia**" → **policy findings** do Macie (ou AWS Config / Security Hub).
+- "**Remediar automaticamente** ao encontrar dados sensíveis" → **EventBridge** + **Lambda / SSM Automation**.
+- "Encontrar dados sensíveis no **RDS ou DynamoDB**" → o Macie só analisa **S3**: exportar os dados para o S3 primeiro.
+- "Detectar **malware** em arquivos do S3" → **GuardDuty Malware Protection for S3**, não Macie.
+
+[↑ Índice](#índice)
 
 ## DDoS Attacks
 
@@ -1088,6 +1184,8 @@ As boas práticas de resiliência a DDoS da AWS seguem alguns princípios:
 - "Evitar **aumento de custo** causado por um ataque DDoS" → **Shield Advanced** (cost protection).
 - "Precisa de **suporte especializado 24/7** durante um ataque" → **Shield Advanced** + **Shield Response Team (SRT)**.
 
+[↑ Índice](#índice)
+
 ## AWS Shield
 
 O AWS Shield é o serviço gerenciado de **proteção contra ataques DDoS** da AWS. Ele tem dois níveis: **Shield Standard**, gratuito e automático para todos os clientes, e **Shield Advanced**, pago, com proteções e suporte adicionais.
@@ -1173,6 +1271,8 @@ Serviço pago que adiciona proteção mais sofisticada, visibilidade e suporte e
 - "Proteger uma aplicação em **EC2 exposta diretamente** (sem ELB/CloudFront)" → Shield Advanced no **Elastic IP** da instância.
 - "**Visibilidade e métricas** detalhadas sobre ataques DDoS" → **Shield Advanced** + métricas no **CloudWatch**.
 - "O SRT precisa **criar regras no WAF** em nome da empresa" → conceder uma **IAM role** de acesso ao SRT.
+
+[↑ Índice](#índice)
 
 ## AWS Web Application Firewall (WAF)
 
@@ -1327,6 +1427,7 @@ Em ambientes **multi-account**, o **AWS Firewall Manager** permite criar **polí
 - "Analisar os logs do WAF com **SQL**" → logs no **S3** + **Athena**. "Enviar para um **SIEM**" → **Data Firehose**.
 - "Retornar uma **página customizada** quando a requisição é bloqueada" → **custom response** na ação Block.
 
+[↑ Índice](#índice)
 
 ## AWS Firewall Manager
 
@@ -1430,6 +1531,110 @@ Três tipos:
 - "Times diferentes devem administrar **tipos de política diferentes**" → **várias contas administradoras** com escopos administrativos.
 - "Avaliar o **impacto** de uma política antes de aplicá-la" → política sem **remediação automática** (apenas identificação).
 
+[↑ Índice](#índice)
+
+## AWS Network Firewall
+
+O AWS Network Firewall é um **firewall de rede gerenciado**, **stateful**, com **IDS/IPS**, para proteger **VPCs** nas camadas **3 a 7**. Ele inspeciona o tráfego que **entra**, **sai** e **circula entre** VPCs (incluindo tráfego vindo de VPN e Direct Connect), com escalabilidade automática e alta disponibilidade gerenciada pela AWS.
+
+- O motor de inspeção é baseado no **Suricata** (open source), e as regras podem ser escritas no formato do Suricata.
+- É implantado em uma **subnet dedicada** (*firewall subnet*) em cada AZ, onde a AWS cria um **firewall endpoint** (um Gateway Load Balancer endpoint gerenciado).
+- O tráfego só passa pelo firewall se as **route tables** apontarem para o firewall endpoint. **Errar o roteamento** (ex: tráfego assimétrico) é a principal causa de problemas.
+
+### Componentes
+
+- **Firewall:** o recurso associado à VPC e às firewall subnets.
+- **Firewall policy:** define o comportamento, referenciando **rule groups**, a ordem de avaliação e as ações padrão.
+- **Rule groups:**
+  - **Stateless:** avaliam cada pacote **isoladamente**, como uma NACL (5-tupla). Ações: **pass**, **drop** ou **forward** para o motor stateful.
+  - **Stateful:** consideram o **contexto da conexão**. Tipos:
+    - **5-tupla:** IP de origem/destino, portas e protocolo.
+    - **Domain list:** permite ou bloqueia **domínios** (ex: `.amazonaws.com`, `.github.com`) com base no **SNI** (HTTPS) ou no header **Host** (HTTP). Útil para **filtrar o tráfego de saída** (*egress filtering*).
+    - **Regras Suricata:** assinaturas de **IPS**, inspeção de payload e protocolos.
+  - **Managed rule groups** da AWS: listas de ameaças e assinaturas de IPS mantidas pela AWS (ex: botnets, malware, domínios maliciosos).
+- **TLS inspection:** **descriptografa** o tráfego TLS (com certificados do **ACM**), inspeciona e **criptografa novamente**, permitindo aplicar regras sobre o conteúdo de conexões HTTPS.
+
+**Logs:** alert logs, flow logs e TLS logs, enviados para **S3**, **CloudWatch Logs** ou **Kinesis Data Firehose**.
+
+### Modelos de implantação
+
+**Distribuído:** um firewall **em cada VPC**. O IGW usa uma **route table com edge association** para enviar o tráfego de entrada ao firewall endpoint antes de chegar à public subnet, e a public subnet envia o tráfego de saída ao firewall endpoint antes do IGW.
+
+![Diagrama AWS Network Firewall - Implantação distribuída](./img/aws-network-firewall/aws-network-firewall-01.png)
+
+**Centralizado:** uma **inspection VPC** conectada a um **Transit Gateway**. Todas as VPCs enviam o tráfego para o TGW, que o encaminha ao firewall antes de seguir para outra VPC (tráfego **leste-oeste**) ou para a **egress VPC** com NAT Gateway (tráfego **norte-sul**).
+
+- O attachment da inspection VPC no TGW precisa ter o **appliance mode** habilitado, para garantir que os dois sentidos de uma conexão passem pelo **mesmo firewall endpoint** (mesma AZ) e o tráfego não seja descartado por assimetria.
+- Reduz custo e esforço operacional: **um firewall** e **uma política** para todas as VPCs.
+
+![Diagrama AWS Network Firewall - Inspeção centralizada com Transit Gateway](./img/aws-network-firewall/aws-network-firewall-02.png)
+
+> **Obs:** Em ambientes multi-account, o **AWS Firewall Manager** pode implantar e manter as políticas do Network Firewall em todas as contas e VPCs da Organization. O firewall também pode ser **compartilhado via AWS RAM**.
+
+### Network Firewall vs. outras opções
+
+| Opção | Camada | Escopo | Uso típico |
+|---|---|---|---|
+| **Security groups** | 3/4, stateful | Instância/ENI | Controle de acesso por recurso (só regras de **permitir**) |
+| **NACLs** | 3/4, stateless | Subnet | **Bloquear IPs** específicos, regras de negar |
+| **AWS WAF** | 7 (HTTP/HTTPS) | CloudFront, ALB, API Gateway, AppSync | SQLi, XSS, rate limiting em **aplicações web** |
+| **Network Firewall** | 3 a 7 | VPC (todo o tráfego) | **IPS**, filtro de **domínios** na saída, inspeção centralizada |
+| **Route 53 Resolver DNS Firewall** | DNS | Consultas DNS da VPC | Bloquear a **resolução** de domínios maliciosos |
+| **Gateway Load Balancer** | 3 | VPC | Inserir **appliances de terceiros** (Palo Alto, Fortinet) de forma transparente |
+
+### Dicas para a prova
+
+- "Filtrar o tráfego de **saída** para a Internet por **nome de domínio** (FQDN)" → **Network Firewall** com **domain list** (stateful).
+- "**IDS/IPS** gerenciado para o tráfego das VPCs" → **Network Firewall** (regras Suricata / managed rule groups).
+- "Inspecionar o tráfego **entre VPCs** e para a Internet em um **ponto central**" → **inspection VPC** + **Transit Gateway** (com **appliance mode**).
+- "Tráfego descartado de forma intermitente na inspeção centralizada" → **roteamento assimétrico**: habilitar o **appliance mode** no attachment do TGW.
+- "Inspecionar o tráfego de **entrada** antes de chegar ao ALB/instâncias" → firewall subnet + **IGW route table** (edge association).
+- "Inspecionar o **conteúdo** de conexões HTTPS" → **TLS inspection** do Network Firewall.
+- "Usar **appliances de firewall de terceiros**" → **Gateway Load Balancer** (não o Network Firewall).
+- "Aplicar regras do Network Firewall em **todas as contas** da Organization" → **Firewall Manager**.
+
+[↑ Índice](#índice)
+
+## Route 53 Resolver DNS Firewall
+
+O Route 53 Resolver DNS Firewall **filtra as consultas DNS** feitas pelos recursos da VPC ao **Route 53 Resolver** (o DNS padrão da VPC, `AmazonProvidedDNS`, no endereço VPC+2). Ele impede que instâncias **resolvam** domínios maliciosos ou não autorizados, bloqueando o ataque antes de qualquer conexão ser aberta.
+
+- Protege contra **exfiltração de dados via DNS** (*DNS tunneling*), comunicação com servidores de **command & control** e acesso a domínios de malware.
+- É **regional** e associado às **VPCs**.
+- Só filtra consultas que passam pelo **Route 53 Resolver**. Se a instância usar um **servidor DNS próprio** ou externo (ex: `8.8.8.8`), o DNS Firewall **não atua**. Para impedir isso, bloquear a porta 53 de saída com security groups, NACLs ou Network Firewall.
+
+### Componentes
+
+- **Domain lists:** listas de domínios (aceita wildcard, ex: `*.example.com`).
+  - **Próprias:** criadas pelo time.
+  - **AWS managed domain lists:** domínios de **malware**, **botnets** e **command & control** mantidos pela AWS.
+- **Rule groups:** conjuntos de regras, cada uma com uma domain list e uma **ação**:
+  - **ALLOW:** permite a consulta.
+  - **BLOCK:** bloqueia, respondendo com **NODATA**, **NXDOMAIN** ou **OVERRIDE** (devolve outro domínio, ex: uma página interna de aviso).
+  - **ALERT:** permite, mas **registra** a consulta nos logs (útil para testar regras antes de bloquear).
+- Os rule groups são **associados às VPCs** com uma **prioridade**. Podem ser compartilhados via **AWS RAM** ou gerenciados em toda a Organization pelo **Firewall Manager**.
+- **Fail open / fail closed:** define o comportamento se o DNS Firewall não conseguir avaliar a consulta: **fail closed** (padrão) prioriza a **segurança**, bloqueando; **fail open** prioriza a **disponibilidade**, permitindo.
+
+**Modelos de uso:**
+
+- **Block list:** bloquear domínios maliciosos conhecidos (managed lists + listas próprias) e permitir o resto.
+- **Allow list (walled garden):** permitir **somente** os domínios aprovados (ex: `*.amazonaws.com`, domínios da empresa) e bloquear todo o resto (`*`). Comum em ambientes altamente regulados.
+
+**Logs:** as consultas são registradas pelos **Route 53 Resolver query logs** (CloudWatch Logs, S3 ou Firehose). O **GuardDuty** também analisa esses logs para detectar ameaças.
+
+![Diagrama Route 53 Resolver DNS Firewall](./img/route53-dns-firewall/route53-dns-firewall-01.png)
+
+### Dicas para a prova
+
+- "Impedir que instâncias **resolvam** domínios maliciosos" → **Route 53 Resolver DNS Firewall**.
+- "Prevenir **exfiltração de dados via DNS**" → **DNS Firewall** (o GuardDuty **detecta**, o DNS Firewall **bloqueia**).
+- "Permitir **apenas** domínios aprovados" → DNS Firewall com **allow list** + regra **BLOCK** para `*`.
+- "Testar regras de bloqueio sem impacto" → ação **ALERT**.
+- "Priorizar a **disponibilidade** da resolução DNS se o firewall falhar" → **fail open**.
+- "Aplicar as mesmas regras de DNS em **todas as contas e VPCs**" → **Firewall Manager** (ou compartilhar via RAM).
+- "DNS Firewall vs. Network Firewall com domain list" → o DNS Firewall bloqueia a **resolução**; o Network Firewall bloqueia a **conexão** (SNI/Host), inclusive quando o IP foi obtido por outro meio.
+
+[↑ Índice](#índice)
 
 ## Amazon Inspector
 
@@ -1530,6 +1735,8 @@ O padrão mais comum combina **EventBridge** com outros serviços:
 - "Habilitar o Inspector em **todas as contas** da Organization, inclusive nas novas" → **admin delegado** + ativação automática.
 - "Visão **centralizada** de findings do Inspector, GuardDuty e Macie" → **Security Hub**.
 - "Detectar **comportamento malicioso** (ex: instância minerando criptomoedas)" → **GuardDuty**, e não Inspector.
+
+[↑ Índice](#índice)
 
 ## AWS Config
 
@@ -1689,6 +1896,7 @@ Nos dois tipos, é possível escolher **todas as regiões** (incluindo regiões 
 - "Garantir que todos os recursos tenham **tags obrigatórias**" → managed rule **`required-tags`** (para impedir a criação sem tags: **tag policies** + SCP).
 - "**Reduzir o custo** do AWS Config" → gravar apenas os **tipos de recurso necessários** ou usar a gravação **diária**.
 
+[↑ Índice](#índice)
 
 ## Amazon GuardDuty
 
@@ -1873,6 +2081,8 @@ Também é possível filtrar pelo **tipo** do finding, por exemplo `"type": [{ "
 - "**Testar** as regras de resposta automatizada sem um ataque real" → **sample findings** (`CreateSampleFindings`).
 - "Runtime Monitoring não recebe dados das instâncias/containers" → verificar o **VPC endpoint** do GuardDuty (e se uma SCP bloqueou a criação) e o **SSM Agent** nas instâncias EC2.
 
+[↑ Índice](#índice)
+
 ## AWS Security Hub
 
 O AWS Security Hub é o serviço de **gerenciamento da postura de segurança** (*CSPM — Cloud Security Posture Management*) e de **centralização de findings** da AWS. Ele faz duas coisas:
@@ -2025,6 +2235,8 @@ Remediação automática de findings de controles com falha e severidade alta ou
 - "**Investigar** a causa raiz de um finding visto no Security Hub" → **Amazon Detective**.
 - "Centralizar **logs** de segurança em formato aberto para análise e retenção" → **Security Lake** (o Security Hub centraliza **findings**, não logs).
 
+[↑ Índice](#índice)
+
 ## Amazon Detective
 
 O Amazon Detective é o serviço de **investigação de incidentes de segurança** da AWS. A partir de um finding (ex: do GuardDuty), ele ajuda a responder **qual a causa raiz**, **qual o alcance** do incidente e **o que mais foi afetado**, usando **machine learning**, **análise estatística** e **teoria dos grafos** sobre os logs da conta.
@@ -2107,3 +2319,131 @@ O Amazon Detective é o serviço de **investigação de incidentes de segurança
 - "Não é possível habilitar o Detective" → o **GuardDuty** não está habilitado.
 - "**Detectar** ameaças" → **GuardDuty**, não Detective. "**Bloquear**" → nenhum dos dois (WAF, NACL, Network Firewall via automação).
 - "Investigar findings de **todas as contas** da Organization em um único lugar" → **admin delegado** do Detective (de preferência o mesmo do GuardDuty e do Security Hub).
+
+[↑ Índice](#índice)
+
+## Amazon Security Lake
+
+O Amazon Security Lake **centraliza automaticamente os logs e eventos de segurança** de contas AWS, de ambientes on-premises e de fontes de terceiros em um **data lake** construído em buckets **S3 na sua própria conta**. Os dados são normalizados no formato aberto **OCSF** (*Open Cybersecurity Schema Framework*), o que facilita a análise com várias ferramentas sem lock-in.
+
+- Os dados ficam armazenados em **Apache Parquet**, particionados, nos buckets da conta do administrador (normalmente a conta de **Log Archive** ou de segurança).
+- Usa o **AWS Lake Formation** e o **Glue Data Catalog** para catalogar as tabelas e controlar o acesso.
+- **Multi-account:** integração com **Organizations** via **admin delegado**, coletando dados de todas as contas.
+- **Rollup regions:** os dados de várias regiões podem ser **consolidados** em uma região, atendendo também a requisitos de **residência de dados** (cada região pode manter sua cópia).
+- **Retenção:** configurada por região, com transição entre **classes de armazenamento** do S3 e expiração.
+
+### Fontes e subscribers
+
+**Fontes nativas:** CloudTrail (management events e data events de S3 e Lambda), VPC Flow Logs, Route 53 Resolver query logs, findings do Security Hub, EKS audit logs e logs do AWS WAF.
+
+**Custom sources:** qualquer fonte que grave dados em **OCSF** (parceiros de segurança, ferramentas on-premises, SaaS).
+
+**Subscribers** (quem consome os dados):
+
+- **Data access subscriber:** recebe **notificações** (via SQS ou endpoint HTTPS) quando novos objetos chegam e **lê os objetos** diretamente do S3. Comum para **SIEMs** (Splunk, IBM QRadar etc.).
+- **Query access subscriber:** **consulta** as tabelas via Lake Formation, com **Athena**, Redshift Spectrum ou ferramentas compatíveis, inclusive a partir de outra conta.
+- **Amazon OpenSearch Service:** integração para busca, dashboards e análise.
+
+![Diagrama Amazon Security Lake - Funcionamento](./img/amazon-security-lake/amazon-security-lake-01.png)
+
+### Security Lake vs. outros serviços
+
+| Serviço | O que centraliza |
+|---|---|
+| **Security Lake** | **Logs e eventos brutos** de segurança, em OCSF, por longo prazo, para análise e SIEM |
+| **Security Hub** | **Findings** e postura de segurança, com priorização e automação |
+| **CloudTrail Lake** | **Eventos do CloudTrail** (e algumas fontes externas), consultáveis com SQL |
+| **Bucket S3 central de logs** | Logs no formato **original** de cada serviço, sem normalização |
+
+### Dicas para a prova
+
+- "Centralizar logs de segurança de **várias contas e regiões** em **formato padronizado / aberto**" → **Security Lake** (OCSF).
+- "Fornecer dados de segurança a um **SIEM de terceiros** com o **menor esforço operacional**" → Security Lake + **data access subscriber**.
+- "Analisar logs de segurança com **SQL**" → Security Lake + **query access** (Athena via Lake Formation).
+- "Requisito de **residência de dados** por região, com visão consolidada" → **rollup regions** respeitando as regiões permitidas.
+- "Ingerir logs de **ferramentas on-premises** ou de parceiros junto com os logs da AWS" → **custom sources** em OCSF.
+
+[↑ Índice](#índice)
+
+## AWS Audit Manager
+
+O AWS Audit Manager **automatiza a coleta de evidências** para **auditorias** e avaliações de **compliance**. Ele mapeia o uso da AWS para os controles de um **framework** e gera **relatórios prontos para o auditor**, reduzindo o trabalho manual de juntar prints, logs e configurações.
+
+- **Frameworks prontos:** CIS, PCI DSS, HIPAA, SOC 2, GDPR, NIST 800-53, ISO 27001, **AWS Control Tower Guardrails**, entre outros. Também é possível criar **frameworks e controles customizados**.
+- **Assessments:** aplicam um framework a um **escopo** (contas e serviços) e coletam evidências **continuamente**.
+- **Fontes de evidência:**
+  - **AWS Config:** resultado das regras (conformidade dos recursos);
+  - **Security Hub:** resultado dos controles;
+  - **CloudTrail:** atividade de usuários (ex: quem alterou uma policy);
+  - **chamadas de API:** snapshots da configuração (ex: lista de usuários IAM);
+  - **evidências manuais:** documentos enviados pelo time (ex: política de senha da empresa).
+- **Assessment reports:** relatórios com as evidências selecionadas, armazenados em um bucket **S3** para entrega ao auditor.
+- **Delegação:** o responsável pelo compliance pode **delegar** a revisão de controles a especialistas.
+- **Multi-account:** suporta **Organizations** com **admin delegado**.
+
+> **Obs:** O Audit Manager **não avalia** a conformidade por conta própria: ele **coleta e organiza evidências** geradas por outros serviços (principalmente Config e Security Hub). Também **não garante** compliance: a decisão final é do auditor.
+
+### Dicas para a prova
+
+- "**Coletar evidências** automaticamente para uma **auditoria** (PCI DSS, HIPAA, SOC 2)" → **AWS Audit Manager**.
+- "Gerar **relatórios para auditores** com o menor esforço" → **assessment reports** do Audit Manager.
+- "Baixar os **relatórios de compliance da própria AWS** (SOC, ISO, PCI da infraestrutura AWS)" → **AWS Artifact**, não Audit Manager.
+- "Avaliar continuamente se os **recursos** estão em conformidade" → **AWS Config** / **Security Hub** (o Audit Manager usa os resultados deles como evidência).
+
+[↑ Índice](#índice)
+
+## Revisão: qual serviço usar
+
+Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas seções de cada serviço.
+
+### Detecção, postura e investigação
+
+| Pergunta do cenário | Serviço |
+|---|---|
+| Há **atividade maliciosa** acontecendo (instância comprometida, credencial vazada, mineração)? | [GuardDuty](#amazon-guardduty) |
+| Meu software tem **vulnerabilidades conhecidas** (CVEs) em EC2, ECR ou Lambda? | [Inspector](#amazon-inspector) |
+| Há **dados sensíveis** (PII, cartões, credenciais) no S3? | [Macie](#amazon-macie) |
+| As **configurações** dos recursos estão em conformidade? Qual o **histórico** de configuração? | [Config](#aws-config) |
+| **Quem fez** a chamada de API, quando e de onde? | [CloudTrail](#aws-cloudtrail) |
+| Onde vejo **todos os findings** e a **postura** de segurança consolidada? | [Security Hub](#aws-security-hub) |
+| Qual a **causa raiz** e o **alcance** de um incidente? | [Detective](#amazon-detective) |
+| Onde **armazeno logs de segurança** em formato padronizado para SIEM e análise? | [Security Lake](#amazon-security-lake) |
+| Como **coleto evidências** para uma auditoria? | [Audit Manager](#aws-audit-manager) |
+| Quais recursos estão **compartilhados externamente**? Quais permissões **não são usadas**? | IAM Access Analyzer (em [identity-and-federation.md](./identity-and-federation.md#iam-access-analyzer)) |
+
+> **Lembrete:** GuardDuty, Inspector, Macie, Config, Security Hub e Detective são **detectivos**: nenhum deles **bloqueia** nada. A resposta é sempre via **EventBridge** + Lambda / SSM Automation / Step Functions.
+
+### Proteção de rede, borda e DDoS
+
+| Pergunta do cenário | Serviço |
+|---|---|
+| Proteção contra **DDoS** nas camadas 3/4, sem custo | [Shield Standard](#aws-shield) (automático) |
+| DDoS com **suporte do SRT**, **proteção de custos** e mitigação automática de L7 | [Shield Advanced](#aws-shield) |
+| Bloquear **SQLi, XSS**, bots ou aplicar **rate limiting** em aplicações web | [WAF](#aws-web-application-firewall-waf) (CloudFront, ALB, API Gateway, AppSync) |
+| Aplicar WAF, Shield, SGs e firewalls em **todas as contas** da Organization | [Firewall Manager](#aws-firewall-manager) |
+| **IPS** e filtro de **domínios** no tráfego das VPCs; inspeção **centralizada** | [Network Firewall](#aws-network-firewall) |
+| Impedir a **resolução DNS** de domínios maliciosos / exfiltração via DNS | [DNS Firewall](#route-53-resolver-dns-firewall) |
+| Bloquear um **IP específico** em uma subnet | **NACL** |
+
+### Criptografia, certificados e segredos
+
+| Pergunta do cenário | Serviço |
+|---|---|
+| Chaves de criptografia gerenciadas e integradas aos serviços AWS | [KMS](#aws-key-management-service-kms) |
+| HSM **dedicado**, **single-tenant**, controle **exclusivo** das chaves (FIPS 140 nível 3) | [CloudHSM](#aws-cloudhsm) (ou KMS custom key store) |
+| Certificados **TLS** para CloudFront, ALB, API Gateway | [ACM](#aws-certificate-manager-acm) (`us-east-1` para CloudFront) |
+| Guardar configurações e segredos simples, **sem rotação** nativa, com menor custo | [Parameter Store](#aws-systems-manager-ssm-parameter-store) |
+| Segredos com **rotação automática** (ex: senhas de RDS) e replicação entre regiões | [Secrets Manager](#aws-secrets-manager) |
+
+### Proteção de dados no S3
+
+| Pergunta do cenário | Serviço / recurso |
+|---|---|
+| Impedir que buckets fiquem **públicos** | [S3 Block Public Access](#amazon-s3-security) (nível conta ou Organization) |
+| **Auditoria** do uso da chave a cada acesso aos objetos | [SSE-KMS](#amazon-s3-security) |
+| Dados **imutáveis** (WORM) por compliance | [S3 Object Lock](#amazon-s3-security) |
+| Simplificar o acesso de **muitas aplicações/times** a um bucket compartilhado | [S3 Access Points](#amazon-s3-access-points) |
+| Encontrar **dados sensíveis** nos buckets | [Macie](#amazon-macie) |
+| Detectar **malware** em arquivos enviados | [GuardDuty Malware Protection for S3](#amazon-guardduty) |
+
+[↑ Índice](#índice)

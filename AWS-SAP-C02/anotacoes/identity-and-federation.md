@@ -9,7 +9,7 @@ servicos:
   - Amazon Cognito
   - AWS Directory Service
 criado-em: 2026-08-23
-atualizado-em: 2026-08-23
+atualizado-em: 2026-11-02
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
 tags: [sap-c02, identity, federation, security]
 ---
@@ -124,6 +124,40 @@ Serviços como **EC2 e RDS não possuem** resource-based policies — nesses cas
 Serviço dentro do IAM Console que permite localizar quais recursos estão sendo compartilhados externamente. Definimos as "Zones of Trust" que podem ser aplicadas às AWS Accounts ou AWS Organizations. Quaisquer acessos fora dessas zonas de segurança serão apontados como "findings".
 
 Além disso, essa funcionalidade também é capaz de realizar a validação de policies e também gerar policies com base nos logs que são gerados via CloudTrail. Por exemplo: podemos ter uma lambda que acessa um bucket s3 e realiza chamada ao kinesis. O IAM Access Analyzer Policy Generation então é capaz de analisar os logs do cloudtrail nos últimos 90 dias para gerar uma policy com base nos acessos que a lambda executa.
+
+### Tipos de analyzer
+
+| Analyzer | O que encontra | Exemplo de finding |
+|---|---|---|
+| **External access** | Recursos acessíveis por **principals fora da zona de confiança** (conta ou Organization) | Bucket S3 compartilhado com outra conta, role assumível por conta externa, chave KMS com acesso público |
+| **Internal access** | Quais principals **dentro** da conta/Organization têm acesso a recursos críticos selecionados | Roles da Organization que conseguem ler um bucket com dados sensíveis |
+| **Unused access** | **Permissões não usadas**: roles, access keys e senhas sem uso, ações e serviços concedidos mas nunca usados | Role sem uso há 90 dias, policy com `s3:*` usando só `s3:GetObject` |
+
+- **Recursos analisados (external access):** buckets S3 (e diretórios S3 Express), IAM roles (trust policy), chaves KMS, funções Lambda, filas SQS, segredos do Secrets Manager, tópicos SNS, snapshots EBS e RDS, repositórios ECR, file systems EFS, streams do Kinesis e tabelas do DynamoDB, entre outros.
+- A análise é baseada em **raciocínio automatizado** (*automated reasoning*, lógica matemática) sobre as **resource-based policies**, e não em tráfego real: o finding indica que o acesso **é possível**, mesmo que nunca tenha acontecido.
+- **Archive rules:** arquivam automaticamente findings de acessos **esperados** (ex: compartilhamento intencional com uma conta parceira).
+- O analyzer de external access é **regional** (um por região). Com **Organizations**, um **admin delegado** cria analyzers com a Organization como zona de confiança.
+- Os findings vão para o **Security Hub** e geram eventos no **EventBridge**.
+
+### Validação e verificação de policies
+
+- **Policy validation:** verifica policies contra a gramática e as boas práticas (mais de 100 checks), apontando **erros**, **avisos de segurança** e sugestões. Disponível no editor de policies e via API (útil em pipelines CI/CD).
+- **Custom policy checks:** verificam, **antes do deploy**, se uma policy nova:
+  - **concede acesso novo** em relação a uma versão de referência (`CheckNoNewAccess`);
+  - permite **ações críticas** específicas, como `iam:PassRole` ou `s3:DeleteBucket` (`CheckAccessNotGranted`);
+  - torna um recurso **público** (`CheckNoPublicAccess`).
+
+  Integrados a pipelines (ex: CodePipeline, GitHub Actions, CloudFormation hooks) para bloquear mudanças perigosas.
+- **Preview access:** antes de salvar a policy de um bucket, role ou chave KMS, mostra quais findings de acesso externo a mudança **geraria**.
+
+### Dicas para a prova
+
+- "Identificar recursos **compartilhados com contas externas** ou **públicos**" → **IAM Access Analyzer** (external access) com a Organization como zona de confiança.
+- "Encontrar **roles, usuários e permissões não usadas** para aplicar o **least privilege**" → **unused access analyzer**.
+- "Gerar uma policy de **least privilege** com base na atividade real de uma role" → **policy generation** (baseada no CloudTrail).
+- "Impedir no **pipeline** que uma policy conceda **acesso novo** ou público" → **custom policy checks** (`CheckNoNewAccess`, `CheckNoPublicAccess`).
+- "Compartilhamento externo **intencional** gerando findings" → **archive rules**.
+- "Visão consolidada junto com os demais findings de segurança" → integração com o **Security Hub**.
 
 ## AWS Security Token Service (STS)
 
