@@ -44,6 +44,8 @@ tags: [sap-c02, security]
 - **Detecção, postura e investigação:** [Amazon Inspector](#amazon-inspector) · [Amazon GuardDuty](#amazon-guardduty) · [AWS Security Hub](#aws-security-hub) · [Amazon Detective](#amazon-detective) · [Amazon Security Lake](#amazon-security-lake)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
+> **Mapa mental:** [visão geral dos temas no NotebookLM](https://notebooklm.link.google/mowcmvSZCfvD) (requer login no Google).
+
 ## AWS CloudTrail
 
 O AWS CloudTrail fornece **governança, auditoria e compliance** para a sua conta AWS. Ele vem **habilitado por padrão** em todas as contas e registra o histórico de **eventos e chamadas de API** feitas na conta, a partir de origens como:

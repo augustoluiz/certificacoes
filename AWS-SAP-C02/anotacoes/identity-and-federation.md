@@ -30,6 +30,8 @@ tags: [sap-c02, identity, federation, security]
 - **Multi-account:** [AWS Organizations](#aws-organizations) · [AWS Control Tower](#aws-control-tower) · [AWS RAM](#aws-resource-access-manager-ram)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
+> **Mapa mental:** [visão geral dos temas no NotebookLM](https://notebooklm.link.google/05lkBN3Pa88m) (requer login no Google).
+
 ## AWS Identity and Access Management (IAM)
 
 - **Usuários na AWS ->** possuem "long term credentials". Isso significa dizer que as credenciais dos usuários não possuem prazo de expiração e, uma vez criadas, permanecem válidas até que ocorra a sua desativação;
