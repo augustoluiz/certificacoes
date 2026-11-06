@@ -3,8 +3,14 @@ titulo: Compute and Load Balancing
 certificacao: AWS Certified Solutions Architect - Professional (SAP-C02)
 servicos:
   - Amazon EC2
+  - AWS ParallelCluster
+  - AWS Parallel Computing Service (PCS)
+  - AWS Batch
+  - Amazon FSx for Lustre
+  - Amazon File Cache
+  - Amazon DCV
 criado-em: 2026-11-05
-atualizado-em: 2026-11-05
+atualizado-em: 2026-11-06
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
 tags: [sap-c02, compute, load-balancing]
 ---
@@ -17,7 +23,7 @@ tags: [sap-c02, compute, load-balancing]
 
 ## Índice
 
-- **Compute:** [Amazon EC2](#amazon-elastic-compute-cloud-ec2)
+- **Compute:** [Amazon EC2](#amazon-elastic-compute-cloud-ec2) · [High Performance Computing (HPC)](#high-performance-computing-hpc)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## Amazon Elastic Compute Cloud (EC2)
@@ -279,7 +285,7 @@ Os recursos de desempenho só importam para cargas que trafegam **muitos dados e
 
 - **Elastic Network Interface (ENI):** placa de rede virtual com IPs privados, IP público/Elastic IP, MAC e security groups. Pode ser **movida** entre instâncias da mesma AZ, o que permite **failover** rápido de IP (padrão comum em appliances e licenças atreladas ao MAC).
 - **Elastic IP:** IPv4 público **fixo**, associado à conta até ser liberado. Desde 2024, **todo IPv4 público é cobrado**, inclusive Elastic IPs em uso.
-- **Enhanced networking (ENA):** usa **SR-IOV** (a instância acessa a placa de rede física quase diretamente, sem passar pelo hypervisor a cada pacote) para maior **largura de banda** (até centenas de Gbps nas instâncias maiores), mais **PPS** e menor latência. Habilitado por padrão nas instâncias Nitro.
+- **Enhanced networking (ENA):** o recurso de rede de alto desempenho das instâncias, implementado pela placa **ENA** (*Elastic Network Adapter*). Usa **SR-IOV** (a instância acessa a placa de rede física quase diretamente, sem passar pelo hypervisor a cada pacote) para maior **largura de banda** (até centenas de Gbps nas instâncias maiores), mais **PPS** e menor latência. Habilitado por padrão nas instâncias Nitro.
 - **Elastic Fabric Adapter (EFA):** ENA com **OS-bypass** (no Linux), em que a aplicação fala direto com a placa de rede, **sem passar pelo kernel** do sistema operacional. Isso permite que aplicações **HPC** e de **ML distribuído** se comuniquem com latência muito baixa. Essas aplicações usam bibliotecas como **MPI** e **NCCL**, que coordenam muitos processos rodando em paralelo em várias máquinas. Usado com **cluster placement groups**.
 - **Jumbo frames:** o **MTU** é o tamanho máximo de um pacote de rede. Pacotes maiores significam menos pacotes para transferir o mesmo volume de dados, o que aumenta o throughput. O MTU é de **9001** dentro da VPC, no VPC peering **na mesma região** e no Direct Connect (VIF privada). O Transit Gateway suporta **8500**. Tráfego para a **Internet**, peering **entre regiões** e **Site-to-Site VPN** usam **1500** ou menos. Quando o pacote passa por um caminho com MTU menor, ele precisa ser fragmentado ou descartado, o que reduz o desempenho.
 
@@ -421,6 +427,341 @@ A AWS limita quantos recursos cada conta pode usar por região. Isso protege con
 
 [↑ Índice](#índice)
 
+## High Performance Computing (HPC)
+
+**HPC** (*High Performance Computing*, computação de alto desempenho) é usar **muitos computadores trabalhando juntos** para resolver um problema grande demais para uma máquina só. O problema é dividido em milhares de pedaços, cada núcleo calcula um pedaço, e os resultados são combinados no final. Exemplos: previsão do tempo, simulação de colisão de carros, aerodinâmica (**CFD**, *Computational Fluid Dynamics*), sequenciamento genômico, descoberta de medicamentos, análise sísmica, risco financeiro e renderização de filmes.
+
+HPC não é um serviço da AWS, e sim um **tipo de carga de trabalho** que combina vários serviços: instâncias EC2 otimizadas, rede de baixa latência (EFA), sistemas de arquivos paralelos (FSx for Lustre) e orquestradores de jobs (ParallelCluster, PCS, Batch). On-premises, um cluster HPC é caro, fica **ocioso** entre projetos e cria **filas de espera** nos picos. Na AWS, o cluster cresce para milhares de núcleos quando há jobs na fila e volta a **zero** quando a fila esvazia.
+
+> **Paralelo com o Lambda:** você provavelmente já faz uma forma de HPC: dividir um trabalho grande em muitos pedaços **independentes** e processá-los em paralelo, com Lambda + SQS ou com o **Step Functions Distributed Map**. Isso é HPC **fracamente acoplado**. O que o serverless não atende são as cargas em que os pedaços precisam **conversar entre si o tempo todo**, que exigem máquinas fixas, fisicamente próximas e com rede especial. Também não atende tarefas que passam de **15 minutos** ou que precisam de **GPU**.
+
+### Como funciona um cluster HPC
+
+Antes dos serviços, vale entender como um cluster HPC **tradicional** funciona. Eles existem há décadas em universidades, centros de pesquisa e indústrias, e os serviços da AWS reproduzem exatamente essa estrutura. Um cluster tem cinco componentes:
+
+1. **Login/head node:** a "porta de entrada". Os usuários se conectam a ele por SSH, preparam os arquivos e **submetem jobs**. Ninguém roda cálculos pesados ali.
+2. **Job scheduler** (agendador): roda no head node e funciona como um **maître de restaurante**. Recebe os pedidos (jobs), coloca-os em **fila**, decide a ordem de acordo com prioridades e cotas de cada grupo, e reserva os nós para cada job. O mais usado é o **Slurm**.
+3. **Compute nodes:** dezenas a milhares de servidores **idênticos**, que só executam jobs. Cada job recebe nós **exclusivos** enquanto roda.
+4. **Interconnect:** a **rede especial** que liga os compute nodes, com latência muito menor do que a de uma rede comum. On-premises, a tecnologia clássica é o **InfiniBand**; na AWS, é o **EFA**.
+5. **Sistema de arquivos paralelo:** um storage **compartilhado** que todos os nós enxergam como uma pasta comum e que aguenta milhares de leituras e escritas simultâneas. O clássico é o **Lustre**; na AWS, é o **FSx for Lustre**.
+
+**O ciclo de vida de um job:**
+
+1. O usuário escreve um **script de job**, que diz o que rodar e quantos recursos usar (ex: 16 nós, 64 núcleos cada, por até 12 horas), e o submete.
+2. O job entra na **fila** e espera.
+3. O agendador **reserva** os nós quando há recursos livres e chega a vez do job.
+4. O programa roda em todos os nós ao mesmo tempo, lendo e gravando no sistema de arquivos compartilhado e trocando mensagens pelo interconnect.
+5. Ao terminar, os nós são **liberados** para o próximo job.
+
+**O que muda na nuvem:** on-premises, o número de nós é **fixo**. Quando a fila cresce, os jobs esperam dias; quando ela esvazia, máquinas caras ficam paradas. Na AWS, o passo 3 muda: em vez de esperar um nó livre, o agendador **cria** as instâncias necessárias e as **destrói** quando o job termina. A fila praticamente desaparece, e o custo acompanha o uso.
+
+![Diagrama HPC - Anatomia de um cluster HPC e equivalentes na AWS](./img/aws-hpc/aws-hpc-04.png)
+
+| Componente do cluster | Equivalente na AWS |
+|---|---|
+| Login/head node + scheduler | Instância EC2 com Slurm (**ParallelCluster**), controlador gerenciado (**PCS**) ou fila gerenciada (**Batch**) |
+| Compute nodes | Instâncias EC2 (**Hpc**, C, P/G), criadas e destruídas conforme a fila |
+| Interconnect (InfiniBand) | **EFA** + **cluster placement group** |
+| Sistema de arquivos paralelo (Lustre) | **FSx for Lustre**, ligado ao **S3** |
+| Arquivos de usuário (home) | **EFS** ou FSx for NetApp ONTAP/OpenZFS |
+| Estação de visualização | Instância com GPU + **Amazon DCV** |
+
+**Por que levar HPC para a nuvem, e o que pesa contra:**
+
+- **A favor:** sem fila de espera, hardware sempre atualizado, nenhum investimento inicial (CapEx), capacidade para picos (ex: entrega de projeto) e a possibilidade de rodar **vários experimentos em paralelo** em clusters separados.
+- **Contra, ou o que exige planejamento:**
+  - **gravidade dos dados**: mover petabytes leva tempo e custa;
+  - **licenças** de software comercial que dependem de um servidor de licenças on-premises;
+  - cargas que rodam **24×7** a 100% de uso, para as quais um cluster próprio já amortizado pode ser mais barato.
+
+[↑ Índice](#índice)
+
+### Conceitos básicos
+
+#### Como um problema é dividido
+
+Imagine simular o ar passando em volta de um carro. O espaço ao redor dele é dividido em uma **malha** com milhões de pequenas células. Em cada **passo de tempo** (ex: um milésimo de segundo simulado), o programa calcula a pressão e a velocidade do ar em cada célula, com base nas **células vizinhas**. Essa conta é feita milhares de vezes até cobrir alguns segundos de simulação.
+
+Uma máquina só levaria semanas. Por isso, a malha é dividida em pedaços (**decomposição de domínio**), e cada processo, em um núcleo, cuida de um pedaço. Surge então um problema: as células na **borda** de cada pedaço dependem de células que estão **no pedaço de outro nó**. Por isso, cada passo da simulação segue sempre o mesmo ciclo:
+
+1. **Calcular:** cada processo atualiza as células do seu pedaço.
+2. **Trocar bordas:** cada processo envia aos vizinhos os valores da sua borda e recebe os deles (*halo exchange*). Essa troca é feita com **MPI**.
+3. **Sincronizar:** ninguém começa o próximo passo até **todos** terminarem a troca. Isso é uma **barreira**.
+
+O ponto crítico está no passo 3: **o processo mais lento dita o ritmo de todos**. Se um nó demora mais para receber uma mensagem, os outros milhares de núcleos ficam **parados esperando**. Por isso, em HPC fortemente acoplado, a rede precisa de latência **baixa** e também **consistente**, todos os nós devem ser **iguais** e não pode haver "vizinho barulhento" disputando recursos. Isso explica as escolhas de arquitetura: núcleos físicos dedicados (SMT desligado), cluster placement group, EFA, uma única AZ e um único tipo de instância.
+
+Já em uma carga **fracamente acoplada**, como renderizar frames de um filme, cada tarefa é independente: não há troca de bordas nem barreira. Um nó lento atrasa só a própria tarefa. Por isso essas cargas aceitam Spot, várias AZs e tipos de instância misturados.
+
+![Diagrama HPC - Decomposição de domínio, troca de bordas e sincronização](./img/aws-hpc/aws-hpc-05.png)
+
+#### Escalabilidade: mais nós nem sempre é mais rápido
+
+Dobrar o número de nós dobra a capacidade de cálculo, mas cada nó fica com um pedaço **menor** da malha. A conta de cada passo fica mais rápida, e a troca de bordas **não diminui na mesma proporção**. A partir de certo ponto, o tempo de comunicação domina e adicionar nós **não acelera mais**, ou até piora. É a [Lei de Amdahl](https://pt.wikipedia.org/wiki/Lei_de_Amdahl) aplicada à rede. Duas formas de medir:
+
+- **Strong scaling:** o **mesmo problema** com mais nós. Mede quanto o resultado sai mais rápido.
+- **Weak scaling:** um **problema maior** (malha mais fina) com mais nós, mantendo o mesmo trabalho por nó. Mede se dá para resolver problemas maiores no mesmo tempo.
+
+Na nuvem, isso vira uma decisão de **custo**. Um job em 64 nós por 1 hora custa o mesmo que em 128 nós por 30 minutos, **se** a escala for perfeita. Se não for, os nós extras são dinheiro gasto em núcleos esperando a rede. Testar o ponto de escala ideal antes de rodar a produção é uma boa prática.
+
+#### Fortemente vs. fracamente acoplado
+
+A distinção mais importante em HPC é entre cargas **fortemente** e **fracamente acopladas**, porque ela define toda a arquitetura:
+
+| | **Fortemente acoplado** (*tightly coupled*) | **Fracamente acoplado** (*loosely coupled*, *embarrassingly parallel*) |
+|---|---|---|
+| Como funciona | Os nós **trocam dados o tempo todo** durante o cálculo: cada pedaço depende dos vizinhos | Cada tarefa é **independente** e não conversa com as outras |
+| Exemplo | Simulação de clima ou de CFD: cada região do modelo depende das vizinhas a cada passo | Renderizar 10.000 frames, analisar 1 milhão de genomas, simulação de Monte Carlo |
+| Gargalo | **Latência de rede** entre os nós | Quantidade de CPU disponível e vazão de leitura dos dados |
+| Comunicação | **MPI** | Nenhuma: uma fila de tarefas basta |
+| Se um nó cai | O job **inteiro** para (ou volta ao último checkpoint) | Só aquela tarefa é refeita |
+| Arquitetura na AWS | **Cluster placement group** + **EFA** + **FSx for Lustre** em **uma AZ**, com ParallelCluster ou PCS | **AWS Batch** com **Spot**, em **várias AZs** e com vários tipos de instância |
+
+#### Glossário
+
+- **MPI** (*Message Passing Interface*): o padrão de biblioteca que os programas HPC usam para trocar mensagens entre processos rodando em máquinas diferentes. É o "idioma" das cargas fortemente acopladas. Implementações comuns: Open MPI e Intel MPI. Em ML distribuído, o papel equivalente é da **NCCL** (NVIDIA), entre GPUs.
+- **Rank:** cada processo de um programa MPI recebe um número, o *rank* (0, 1, 2...), usado para saber qual pedaço do problema é dele e com quem trocar mensagens. Normalmente há **um rank por núcleo físico**.
+- **Core-hours** (núcleo-hora): a unidade de consumo em HPC. 1.000 núcleos por 1 hora = 1.000 core-hours. Centros de pesquisa distribuem cotas nessa unidade, e alguns softwares comerciais de simulação são **licenciados por núcleo**.
+- **Interconnect:** a rede entre os compute nodes de um cluster. InfiniBand on-premises, EFA na AWS.
+- **POSIX:** o padrão de sistema de arquivos do Unix/Linux: pastas, `open`/`read`/`write`, permissões e travas (locks). Programas HPC esperam um sistema de arquivos POSIX, e o S3 não é um.
+- **Job:** uma unidade de trabalho submetida ao cluster, por exemplo "rodar esta simulação com 1.024 núcleos".
+- **Job scheduler** (agendador): o software que recebe os jobs, coloca-os em **fila** e decide quando e em quais nós cada um roda. O mais usado em HPC é o **Slurm**.
+- **Head node** (nó principal): a máquina que roda o agendador e onde os usuários entram para submeter jobs. Os **compute nodes** (nós de computação) executam os jobs.
+- **Checkpoint:** um "save game" periódico do estado da simulação em disco. Se algo falhar, o job continua do último checkpoint em vez de recomeçar. É o que torna viável usar Spot em jobs longos.
+- **Scratch:** armazenamento **temporário** e rápido, usado durante o job e descartado depois.
+
+[↑ Índice](#índice)
+
+### Computação
+
+Escolher a máquina para HPC é diferente de escolher para uma aplicação web. Quatro características pesam mais do que o número de vCPUs:
+
+- **Núcleos físicos dedicados:** cada rank MPI quer um núcleo inteiro. Duas threads SMT no mesmo núcleo disputam recursos e criam exatamente o "nó mais lento" que trava todos os outros.
+- **Largura de banda de memória:** muitos códigos de simulação (CFD, clima) passam mais tempo **buscando dados na memória** do que calculando. São chamados de *memory-bound*. Para eles, colocar mais núcleos em um nó não ajuda se a memória não acompanha. Às vezes, usar **menos núcleos por nó** em mais nós é mais rápido.
+- **Rede:** a largura de banda e o suporte a EFA definem o quanto o job escala para muitos nós.
+- **GPU ou CPU:** códigos reescritos para GPU (dinâmica molecular, alguns solvers de CFD, ML) podem rodar muitas vezes mais rápido. Código que não foi portado para GPU não ganha nada com ela.
+
+Há também o fator **licença**. Softwares comerciais de simulação costumam ser licenciados **por núcleo**. Nesse caso, compensa usar **menos núcleos, mais rápidos**, mesmo pagando mais pela instância.
+
+- **Famílias de instância:**
+  - **Hpc** (ex: `hpc7g` com Graviton, `hpc7a` com AMD, `hpc6id` com disco NVMe local): feitas para HPC fortemente acoplado. Têm muitos núcleos físicos, **SMT desligado**, EFA de alta largura de banda e o melhor preço por núcleo para essas cargas. Estão disponíveis em poucas regiões e AZs.
+  - **C** (compute optimized): alternativa geral para HPC, com mais opções de tamanho e de região.
+  - **P e G** (GPUs NVIDIA) e **Trn/Inf** (chips da AWS para ML): simulações aceleradas por GPU e treinamento de modelos.
+  - **R e X** (memory optimized): simulações que precisam de muita memória por núcleo, como bancos genômicos e análise de elementos finitos.
+- **SMT desligado:** em HPC, normalmente cada processo MPI deve ter um núcleo físico **só para ele**. Nas famílias que usam SMT, desliga-se com **Optimize CPUs** (`ThreadsPerCore = 1`). As Hpc e o Graviton já vêm assim. Ver [O que é uma vCPU](#o-que-é-uma-vcpu).
+- **Modelo de compra:**
+  - **Fracamente acoplado:** **Spot**, porque uma tarefa interrompida é apenas refeita.
+  - **Fortemente acoplado:** **On-Demand**, porque perder um nó derruba o job inteiro. Para garantir que todos os nós vão subir juntos na mesma AZ, usar **On-Demand Capacity Reservations**. Spot só é viável com **checkpoints** frequentes.
+  - **Cluster ligado o ano todo:** **Savings Plans**.
+  - **GPUs para treinamentos de dias ou semanas:** **Capacity Blocks for ML**.
+- **Quotas:** clusters HPC usam milhares de vCPUs de uma vez. Pedir aumento de quota antes de um projeto grande. Ver [Quotas](#quotas).
+
+[↑ Índice](#índice)
+
+### Rede: ENA e Elastic Fabric Adapter (EFA)
+
+Uma rede tem duas medidas de desempenho, e é comum confundi-las:
+
+- **Latência:** quanto tempo uma mensagem leva para **chegar** do outro lado, mesmo que seja minúscula. É o tempo de entrega de uma carta.
+- **Largura de banda:** quanto dado passa **por segundo**. É o tamanho do caminhão.
+
+Uma aplicação web ou um backup precisam de **largura de banda**: são poucos arquivos grandes. Já a troca de bordas em uma simulação gera **milhões de mensagens pequenas**, uma por vizinho a cada passo, e cada passo só termina quando a **última** mensagem chega (ver [Como um problema é dividido](#como-um-problema-é-dividido)). Por isso, em HPC fortemente acoplado, importam a **latência** e, principalmente, a sua **consistência**. Uma única mensagem atrasada (*tail latency*) deixa todos os núcleos esperando.
+
+Em uma rede comum, cada mensagem passa pela pilha TCP/IP do kernel do sistema operacional, o que acrescenta atraso e variação. Clusters on-premises resolvem isso com **InfiniBand**, uma rede especializada em que a aplicação fala direto com a placa. Na AWS, há dois níveis de interface de rede, e é importante saber quando cada um basta.
+
+#### Enhanced networking (ENA)
+
+É o mesmo **enhanced networking** descrito na seção [Rede do EC2](#rede). *Enhanced networking* é o nome do recurso, e o **ENA** (*Elastic Network Adapter*) é a placa de rede virtual que o implementa. Ele vem habilitado por padrão em todas as instâncias atuais (Nitro). Com **SR-IOV**, a instância acessa a placa de rede quase diretamente, sem o hypervisor no caminho de cada pacote. Isso entrega muita largura de banda (de alguns Gbps nas instâncias pequenas a centenas de Gbps nas maiores), muitos pacotes por segundo e latência baixa **para uma rede TCP/IP**. Mas o tráfego continua passando pelo **kernel** do sistema operacional. O diagrama daquela seção mostra as camadas que o ENA e o EFA contornam.
+
+Para HPC, o ENA é suficiente em vários casos:
+
+- **Cargas fracamente acopladas:** as tarefas não conversam entre si, e a rede serve só para ler e gravar dados (S3, FSx).
+- **Acesso ao storage:** a leitura e a escrita no FSx for Lustre passam pelo ENA, e é aqui que a **largura de banda** da instância importa.
+- **Jobs MPI pequenos ou pouco sensíveis à latência:** poucos nós, ou códigos que trocam mensagens com pouca frequência.
+
+**Limites de banda por fluxo:** a banda anunciada de uma instância (ex: 100 Gbps) é o **total** da placa, não o de uma única conexão. Um único **fluxo TCP** (uma conexão entre dois IPs e portas) é limitado a cerca de **5 Gbps**, ou cerca de **10 Gbps** dentro de um **cluster placement group**. Para usar toda a banda, a aplicação precisa abrir **várias conexões em paralelo**, como fazem o AWS CLI no S3, o DataSync e os clientes Lustre. Esse limite costuma aparecer em questões do tipo "a instância tem 100 Gbps, mas a cópia não passa de 5 Gbps".
+
+**ENA Express:** um recurso do ENA que usa o protocolo **SRD** (o mesmo do EFA, descrito abaixo) para o tráfego **TCP e UDP comum**, sem mudar a aplicação. Ele aumenta a banda de um **único fluxo** (até cerca de 25 Gbps) e reduz a latência de cauda (*tail latency*). Funciona apenas entre instâncias compatíveis na **mesma AZ** e precisa ser habilitado nas duas pontas. É útil para aplicações que não usam MPI, mas sofrem com o limite por fluxo, como replicação de bancos de dados, transferência de arquivos grandes e storage distribuído.
+
+#### EFA (Elastic Fabric Adapter)
+
+O **EFA** é um ENA com uma capacidade a mais: o **OS-bypass**. Ele é a resposta da AWS ao InfiniBand e o nível necessário para MPI fortemente acoplado em escala:
+
+- **OS-bypass:** a biblioteca MPI ou NCCL fala **direto com a placa de rede**, sem passar pelo kernel do sistema operacional. Isso corta boa parte da latência de cada mensagem. Funciona por meio da biblioteca **libfabric**, que as implementações de MPI já suportam.
+- **SRD** (*Scalable Reliable Datagram*): o protocolo de transporte do EFA, criado pela AWS. Ele espalha os pacotes por **vários caminhos** da rede ao mesmo tempo e retransmite rapidamente o que se perder. Isso dá latência baixa e **consistente**, mesmo com milhares de nós.
+- O EFA também funciona como uma **ENA comum** para o tráfego TCP/IP normal (SSH, acesso ao storage, internet).
+
+| | **ENA** | **ENA Express** | **EFA** |
+|---|---|---|---|
+| O que é | Interface padrão (enhanced networking, SR-IOV) | ENA + transporte SRD para TCP/UDP | ENA + OS-bypass + SRD para MPI/NCCL |
+| Passa pelo kernel? | Sim | Sim | **Não** (no tráfego MPI/NCCL) |
+| Muda a aplicação? | Não | Não (só habilitar nas duas pontas) | Usa MPI/NCCL com libfabric |
+| Alcance | Qualquer destino | Mesma AZ | **Mesma subnet** |
+| Uso típico em HPC | Fracamente acoplado, acesso ao storage | Transferências grandes entre instâncias | MPI fortemente acoplado, ML distribuído |
+
+**Restrições que caem na prova:**
+
+- O tráfego **OS-bypass** do EFA **não é roteável**: ele só funciona entre instâncias na **mesma subnet**, e portanto na **mesma AZ**. Um cluster MPI que precisa de EFA não pode ser distribuído entre AZs.
+- O **security group** precisa permitir **todo o tráfego de entrada e saída para ele mesmo** (uma regra que referencia o próprio security group). Sem isso, o EFA não funciona.
+- Só alguns tipos de instância suportam EFA (em geral, os tamanhos maiores das famílias C, M, R, Hpc, P e Trn), e o EFA precisa ser **anexado no lançamento** da instância.
+- Combinar com **cluster placement group**, para colocar os nós fisicamente próximos.
+
+> **Obs:** Para HPC fortemente acoplado, **uma única AZ** é a resposta certa, mesmo que isso pareça contradizer as boas práticas de alta disponibilidade. A latência entre AZs prejudica o MPI, e o EFA nem funciona entre subnets. A resiliência vem de **checkpoints** no S3 ou no FSx e da possibilidade de **recriar o cluster** em outra AZ, e não de distribuir os nós.
+
+[↑ Índice](#índice)
+
+### Armazenamento para HPC
+
+Um job HPC típico tem três fases de dados: **ler** um grande volume de entrada (malhas de simulação, genomas, imagens), **escrever** resultados intermediários e checkpoints durante a execução, e **gravar** a saída final. Milhares de núcleos lendo e escrevendo ao mesmo tempo esgotam rapidamente um storage comum. Por isso, HPC usa **sistemas de arquivos paralelos**, em que os dados ficam espalhados por muitos servidores e cada cliente lê de vários deles ao mesmo tempo.
+
+**Por que um NFS comum não basta:** em um servidor de arquivos tradicional (NFS), **um único servidor** atende todos os clientes. Ele funciona bem para dezenas de máquinas, mas com mil nós lendo os mesmos arquivos de entrada no início de um job, esse servidor vira um **funil**. Os nós ficam esperando dados em vez de calcular.
+
+**Como um sistema de arquivos paralelo resolve isso:** o Lustre separa duas funções e distribui os dados.
+
+- **Servidor de metadados (MDS):** guarda os **nomes**, as pastas, as permissões e o **mapa** de onde está cada pedaço de cada arquivo. É consultado só ao abrir o arquivo.
+- **Servidores de armazenamento (OSS), com seus discos (OSTs):** guardam os **dados** de fato.
+- **Striping:** cada arquivo grande é **fatiado** em blocos (*stripes*) espalhados por vários servidores de armazenamento, como um RAID 0 em rede. Para ler um arquivo de 100 GB, o cliente busca as fatias em **vários servidores ao mesmo tempo**, e mil clientes se distribuem por todos eles.
+- **Resultado:** a vazão total cresce com o número de servidores, e é por isso que o desempenho do FSx for Lustre **cresce com a capacidade provisionada**. Mais TB significa mais servidores por trás e mais GB/s.
+
+![Diagrama HPC - NFS tradicional vs. sistema de arquivos paralelo (Lustre)](./img/aws-hpc/aws-hpc-06.png)
+
+Os programas veem tudo isso como uma **pasta comum** (POSIX), por exemplo `/fsx/projeto/malha.dat`, sem saber que o arquivo está fatiado em dezenas de servidores.
+
+**Amazon FSx for Lustre:** o Lustre é o sistema de arquivos paralelo mais usado em supercomputadores. O FSx for Lustre é a versão **gerenciada** dele, com throughput de centenas de GB/s, milhões de IOPS e latência abaixo de 1 ms. Os pontos-chave são:
+
+- **Tipos de implantação:**
+  - **Scratch:** sem replicação, mais barato, para dados **temporários** de jobs curtos. Se um servidor de arquivos falhar, os dados se perdem.
+  - **Persistent:** os dados são **replicados dentro da AZ** e o servidor com falha é substituído automaticamente. Para armazenamento de longa duração ou jobs longos.
+- **Integração com o S3 (*data repository association*):** o sistema de arquivos é **ligado a um bucket S3**. Os arquivos do bucket aparecem no Lustre como se estivessem lá, mas são carregados **sob demanda** no primeiro acesso (*lazy loading*). Os resultados podem ser **exportados** de volta para o S3, automaticamente ou com um comando. Assim, o S3 guarda os dados de forma durável e barata, e o Lustre é só a camada rápida enquanto o job roda. Um padrão comum é criar o FSx scratch no início do projeto e **apagá-lo** no fim.
+- O FSx for Lustre fica em **uma única AZ**, a mesma do cluster.
+
+| Storage | Papel em HPC |
+|---|---|
+| **Amazon S3** | Repositório **durável** de entradas e saídas. Barato, mas não é um sistema de arquivos POSIX: os programas HPC não o leem diretamente com bom desempenho |
+| **FSx for Lustre** | Sistema de arquivos **paralelo** de alto desempenho para o processamento, ligado ao S3 |
+| **Instance store NVMe** (ex: `hpc6id`) | Scratch **local** de cada nó: o mais rápido, mas efêmero e não compartilhado |
+| **Amazon EFS** | Diretórios **home** dos usuários, scripts e software compartilhado. Não é feito para o throughput de um job HPC |
+| **EBS** | Disco de sistema do head node e dos nós |
+
+> **Paralelo com o Lambda:** o padrão "S3 como fonte da verdade + uma camada rápida temporária" é o mesmo de uma função que baixa um arquivo do S3 para o `/tmp`, processa e envia o resultado de volta ao S3. A diferença é que o FSx for Lustre faz isso de forma **compartilhada** entre milhares de núcleos, e de forma transparente para o programa.
+
+[↑ Índice](#índice)
+
+### Orquestração: ParallelCluster, PCS e Batch
+
+Em um cluster compartilhado por dezenas de pesquisadores, alguém precisa decidir **qual job roda onde e quando**. Esse é o papel do **agendador** (*job scheduler*), que:
+
+- mantém **filas** (no Slurm, *partitions*), por exemplo uma para nós com GPU e outra para nós com muita memória;
+- aplica **prioridades** e cotas por grupo (*fair-share*), para que um usuário não monopolize o cluster;
+- **reserva nós inteiros** para cada job, já que jobs MPI precisam de todos os nós ao mesmo tempo;
+- faz ***backfill***: encaixa jobs pequenos nos "buracos" enquanto um job grande espera nós suficientes ficarem livres.
+
+O usuário descreve o job em um script e o envia com `sbatch`:
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=simulacao-asa
+#SBATCH --partition=hpc7g        # fila (tipo de nó)
+#SBATCH --nodes=16               # 16 nós
+#SBATCH --ntasks-per-node=64     # 64 ranks MPI por nó = 1.024 núcleos
+#SBATCH --time=12:00:00          # tempo máximo
+srun ./solver /fsx/projeto/malha.dat   # roda o programa MPI em todos os nós
+```
+
+Na nuvem, o agendador ganha mais uma função: **criar e destruir as instâncias** conforme a fila. Quando esse job chega, 16 instâncias `hpc7g` são lançadas; quando termina, são encerradas. A AWS oferece três caminhos para isso:
+
+- **AWS ParallelCluster:** ferramenta **open source** (CLI e interface web) que cria um cluster HPC "tradicional" a partir de um arquivo **YAML**. Ela gera a infraestrutura com **CloudFormation**: head node, compute nodes, rede, storage compartilhado e agendador **Slurm**. Os compute nodes **escalam automaticamente**, de zero até o máximo, conforme a fila de jobs. É gratuita (paga-se só pelos recursos), mas **você** opera o cluster: atualizações, versões e o head node.
+- **AWS Parallel Computing Service (PCS):** serviço **gerenciado** de Slurm. A AWS opera o controlador do Slurm (o equivalente ao head node), as atualizações e a disponibilidade. Você define **grupos de nós** de computação e **filas**. É o caminho para quem quer Slurm **sem gerenciar** a ferramenta.
+- **AWS Batch:** serviço **gerenciado** de filas de jobs, **sem Slurm**. Você define **job definitions** (uma imagem de container + recursos), **job queues** e **compute environments** (EC2 On-Demand, **Spot** ou **Fargate**). O Batch escolhe as instâncias, executa os containers e escala até zero. Recursos importantes:
+  - **Array jobs:** um único envio cria até **10.000 jobs filhos**. Cada um recebe um índice (`AWS_BATCH_JOB_ARRAY_INDEX`) para saber qual pedaço dos dados processar. É o padrão do fracamente acoplado.
+  - **Multi-node parallel jobs:** um job que usa **vários nós ao mesmo tempo**, com suporte a MPI e EFA. Permite rodar cargas fortemente acopladas no Batch.
+  - **Dependências** entre jobs e integração com **Step Functions** para montar pipelines (ex: alinhar genomas → chamar variantes → gerar relatório).
+
+| Critério | ParallelCluster | PCS | Batch |
+|---|---|---|---|
+| Modelo | Ferramenta open source; você opera | Slurm gerenciado | Filas de jobs gerenciadas, com containers |
+| Agendador | Slurm | Slurm | Próprio do Batch |
+| Público típico | Equipes de HPC que já usam Slurm on-premises e querem controle total | Equipes de HPC que usam Slurm e querem menos operação | Desenvolvedores e pipelines de dados; cargas fracamente acopladas |
+| Força | Flexibilidade e personalização | Menor esforço operacional com Slurm | Integração com containers, Spot e Step Functions |
+
+> **Paralelo com o Lambda:** o **AWS Batch** é o mais próximo do serverless: você envia um container, não gerencia servidores e só paga enquanto os jobs rodam. Pense nele como um "Lambda para jobs longos". Ele não tem limite de 15 minutos, aceita GPU e muita memória, e tem uma fila nativa. Para tarefas curtas e muito numerosas, **Step Functions Distributed Map + Lambda** continua sendo uma opção, com até 10.000 execuções em paralelo.
+
+[↑ Índice](#índice)
+
+### Arquiteturas de referência
+
+**HPC fortemente acoplado com Slurm:**
+
+- **Acesso:** os usuários entram no **head node**, que fica na subnet pública ou atrás de um **Session Manager**/**DCV**, e submetem jobs ao Slurm.
+- **Computação:** os **compute nodes** (Hpc ou C, com **EFA**) ficam em uma subnet privada, em um **cluster placement group**, e são criados conforme a fila.
+- **Storage:** o **FSx for Lustre** fica ligado ao **S3**.
+- **Orquestração:** tudo é criado pelo **ParallelCluster**, ou gerenciado pelo **PCS**.
+
+![Diagrama HPC - Fortemente acoplado com ParallelCluster/PCS, EFA e FSx for Lustre](./img/aws-hpc/aws-hpc-01.png)
+
+**HPC fracamente acoplado com AWS Batch:**
+
+1. A chegada dos dados no S3, ou um agendamento, dispara um pipeline no **Step Functions** ou no **EventBridge**.
+2. O pipeline envia um **array job** ao **Batch**.
+3. O Batch distribui os jobs filhos em um compute environment **Spot** com **vários tipos de instância** e **várias AZs**.
+4. Cada filho lê seu pedaço no S3 e grava o resultado de volta no S3.
+
+![Diagrama HPC - Fracamente acoplado com AWS Batch e Spot](./img/aws-hpc/aws-hpc-02.png)
+
+[↑ Índice](#índice)
+
+### HPC híbrido e migração
+
+Muitas empresas já têm um cluster HPC on-premises e não vão abandoná-lo. O cenário típico de prova é o **cloud bursting**: usar a AWS **só quando a fila local fica grande**, por exemplo antes de um prazo de projeto.
+
+Levar jobs para a nuvem é a parte fácil. Os desafios de um ambiente híbrido estão em volta dele:
+
+- **Dados:** os jobs precisam dos arquivos de entrada, que estão on-premises. É preciso decidir entre **copiar antes** (DataSync, Snowball) ou **acessar sob demanda** (File Cache), e trazer os resultados de volta.
+- **Licenças:** softwares comerciais costumam consultar um **servidor de licenças** (ex: FlexLM) on-premises. Os nós na nuvem precisam alcançá-lo pela rede privada, ou o servidor precisa de uma cópia na AWS com uma ENI fixa (ver [Rede](#rede)).
+- **Identidade:** os usuários e grupos Linux (UIDs/GIDs) precisam ser **os mesmos** nos dois lados, ou as permissões de arquivo quebram. A solução comum é integrar os nós da nuvem ao mesmo **Active Directory/LDAP**, via **AWS Directory Service** ou AD Connector.
+- **Rede:** um link estável e com banda suficiente para dados e controle, ou seja, **Direct Connect**.
+
+- **Rede:** **Direct Connect** (ou VPN) entre o data center e a VPC.
+- **Movimentação de dados:**
+  - **AWS DataSync:** copia dados do storage on-premises (NFS, SMB, HDFS) para S3, EFS ou FSx de forma agendada e incremental, com verificação de integridade.
+  - **Snowball Edge:** para volumes muito grandes (centenas de TB ou PB) quando a rede não comporta a transferência no prazo.
+  - **Amazon File Cache:** um cache de alto desempenho, baseado em Lustre, na AWS. Ele apresenta aos nós da nuvem os dados de um **NFS on-premises** (ou do S3) **sem copiar tudo antes**: os arquivos são carregados sob demanda e as alterações podem ser escritas de volta na origem.
+- **Agendamento:** o Slurm on-premises pode ser configurado para enviar jobs a uma partição na AWS, criada com **ParallelCluster** ou **PCS**.
+- **Visualização remota:** o **Amazon DCV** (antigo NICE DCV) transmite a tela de uma instância com GPU para o computador do engenheiro. Ele vê e manipula modelos 3D e resultados de simulação **sem baixar** os arquivos, que podem ter centenas de GB. Não há custo de licença do DCV em instâncias EC2.
+
+![Diagrama HPC - Cloud bursting a partir de um cluster on-premises](./img/aws-hpc/aws-hpc-03.png)
+
+[↑ Índice](#índice)
+
+### Otimização de custo
+
+- **Escalar até zero:** ParallelCluster, PCS e Batch removem os nós quando a fila esvazia. Só o head node fica ligado, e no PCS nem ele é seu.
+- **Spot** para cargas fracamente acopladas e para jobs com **checkpoint**, com vários tipos de instância (ex: `c6i`, `c7i`, `c7a`, `c7g`) para ter mais pools disponíveis.
+- **Graviton** (`hpc7g`, `c7g`, `c8g`): melhor preço por núcleo, se o software compilar para ARM64.
+- **FSx for Lustre scratch** apagado no fim do projeto, com os dados permanentes no **S3**. Aplicar **lifecycle** do S3 para mover resultados antigos para classes mais baratas.
+- **Savings Plans** para a base de uso constante e **Capacity Blocks** para picos planejados de GPU.
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Simulação com **MPI**, comunicação **intensa entre nós**, **latência** mínima" → **cluster placement group** + **EFA** + instâncias **Hpc**/C, em **uma única AZ e subnet**.
+- "Instância de 100 Gbps, mas uma cópia entre duas instâncias **não passa de ~5 Gbps**" → limite **por fluxo** do ENA: usar **várias conexões em paralelo**, **cluster placement group** (~10 Gbps por fluxo) ou **ENA Express** (mesma AZ).
+- "Reduzir latência e aumentar a banda de um fluxo TCP **sem alterar a aplicação**" → **ENA Express**. "MPI em escala" → **EFA**.
+- "EFA configurado, mas os nós não se comunicam" → **security group** sem a regra de **todo o tráfego** para ele mesmo, ou nós em **subnets diferentes**.
+- "Milhares de tarefas **independentes** com o **menor custo**" → **AWS Batch** (array jobs) com **Spot**, vários tipos de instância e AZs.
+- "Tarefas independentes **curtas** (< 15 min) em grande volume" → **Step Functions Distributed Map** + **Lambda**.
+- "Sistema de arquivos **paralelo** de alto desempenho para HPC, com os dados no **S3**" → **FSx for Lustre** com **data repository association**.
+- "Armazenamento temporário mais barato para um job curto" → FSx for Lustre **scratch**. "Jobs longos, dados que precisam sobreviver a falhas" → FSx for Lustre **persistent**.
+- "Equipe que usa **Slurm** on-premises quer levar o cluster para a AWS" → **ParallelCluster** (controle total) ou **PCS** (gerenciado, **menor esforço operacional**).
+- "Pipeline de jobs em containers, com dependências e sem gerenciar agendador" → **AWS Batch** + **Step Functions**.
+- "Usar a nuvem só quando o cluster **on-premises** fica sobrecarregado" → **cloud bursting** com **Direct Connect** + ParallelCluster/PCS, e **DataSync** ou **File Cache** para os dados.
+- "Acessar os dados on-premises a partir da nuvem **sem copiar tudo antes**" → **Amazon File Cache**.
+- "Engenheiros precisam visualizar resultados 3D **sem baixar** os arquivos" → **Amazon DCV** em instâncias com GPU.
+- "Job longo e fortemente acoplado precisa sobreviver a falhas" → **checkpoints** periódicos no FSx ou no S3.
+- "Garantir que **todos** os nós do cluster consigam subir juntos" → **On-Demand Capacity Reservation** (ou **Capacity Blocks** para GPU).
+
+[↑ Índice](#índice)
+
 ## Revisão: qual serviço usar
 
 Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas seções de cada serviço.
@@ -443,5 +784,18 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Latência mínima entre nós (HPC) | [Cluster placement group](#placement-groups) + EFA |
 | Poucas instâncias críticas isoladas umas das outras | [Spread placement group](#placement-groups) |
 | Sistemas distribuídos com consciência de rack (HDFS, Cassandra, Kafka) | [Partition placement group](#placement-groups) |
+
+### High Performance Computing
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Simulação MPI fortemente acoplada, latência mínima | [Cluster placement group + EFA](#rede-ena-e-elastic-fabric-adapter-efa) + Hpc/C em uma AZ |
+| Milhares de tarefas independentes, menor custo | [AWS Batch](#orquestração-parallelcluster-pcs-e-batch) (array jobs) + Spot |
+| Cluster Slurm com controle total | [AWS ParallelCluster](#orquestração-parallelcluster-pcs-e-batch) |
+| Slurm com menor esforço operacional | [AWS PCS](#orquestração-parallelcluster-pcs-e-batch) |
+| Sistema de arquivos paralelo ligado ao S3 | [FSx for Lustre](#armazenamento-para-hpc) |
+| Dados on-premises acessados da nuvem sem cópia prévia | [Amazon File Cache](#hpc-híbrido-e-migração) |
+| Usar a nuvem quando o cluster local fica sobrecarregado | [Cloud bursting](#hpc-híbrido-e-migração) |
+| Visualização remota de resultados 3D | [Amazon DCV](#hpc-híbrido-e-migração) |
 
 [↑ Índice](#índice)
