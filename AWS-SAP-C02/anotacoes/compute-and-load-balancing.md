@@ -27,7 +27,7 @@ tags: [sap-c02, compute, load-balancing]
 
 ## Índice
 
-- **Compute:** [Amazon EC2](#amazon-elastic-compute-cloud-ec2) · [Amazon EC2 Auto Scaling](#amazon-ec2-auto-scaling) · [Auto Scaling Update Strategies](#auto-scaling-update-strategies) · [High Performance Computing (HPC)](#high-performance-computing-hpc)
+- **Compute:** [Amazon EC2](#amazon-elastic-compute-cloud-ec2) · [Amazon EC2 Auto Scaling](#amazon-ec2-auto-scaling) · [Auto Scaling Update Strategies](#auto-scaling-update-strategies) · [Spot Instances & Spot Fleet](#spot-instances--spot-fleet) · [High Performance Computing (HPC)](#high-performance-computing-hpc)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## Amazon Elastic Compute Cloud (EC2)
@@ -171,7 +171,7 @@ Hoje, a AWS recomenda Savings Plans no lugar das RIs para EC2, porque dão o mes
 
 #### Spot
 
-Você usa a **capacidade ociosa** da AWS com desconto de até ~90%, mas a AWS pode **retomar** a instância com **2 minutos de aviso**. Não há compromisso: o preço varia com a oferta e a demanda, e você paga o preço Spot vigente. Os detalhes estão na seção [Spot Instances](#spot-instances).
+Você usa a **capacidade ociosa** da AWS com desconto de até ~90%, mas a AWS pode **retomar** a instância com **2 minutos de aviso**. Não há compromisso: o preço varia com a oferta e a demanda, e você paga o preço Spot vigente. Os detalhes estão na seção [Spot Instances](#spot-instances--spot-fleet).
 
 - **Como pensar:** é comprar uma passagem de avião de última hora com desconto em um voo com lugares vagos. É barato, mas você pode ser remanejado se a companhia precisar do assento.
 
@@ -228,32 +228,7 @@ Permitem **reservar instâncias com GPU** (ex: família P, com GPUs NVIDIA de al
 
 ### Spot Instances
 
-A AWS precisa manter capacidade sobrando em cada AZ para atender picos de demanda dos clientes On-Demand. Em vez de deixar esses servidores parados, ela os **vende com grande desconto** como instâncias **Spot**. O preço baixo vem com uma condição: quando a AWS precisar dessa capacidade de volta, ela **interrompe** a sua instância. Por isso, Spot é ideal para trabalho que pode ser **pausado, repetido ou distribuído**, como processar um lote de arquivos, renderizar vídeos ou rodar testes. Não serve para algo que precisa ficar no ar sem interrupção, como um banco de dados único.
-
-Cada combinação de **tipo de instância + AZ** forma um **pool de capacidade Spot** separado. Se um pool fica sem capacidade, as instâncias dele são interrompidas, mas os outros pools não são afetados. Daí vem a principal boa prática: **diversificar** entre muitos pools.
-
-> **Paralelo com o Lambda:** pense em uma carga que você faria com Lambda + SQS. Ela é **idempotente**, processa mensagens de uma fila e, se uma execução falhar, a mensagem volta para a fila e outra execução a processa. Esse mesmo desenho é o que torna uma carga **segura para Spot**: um worker interrompido apenas deixa a mensagem voltar para a fila. Se o processamento passar de 15 minutos ou precisar de GPU, workers em Spot consumindo a fila são a alternativa natural ao Lambda.
-
-- A AWS pode **recuperar** uma instância Spot quando precisa da capacidade, com um aviso de **2 minutos** (*Spot Instance Interruption Warning*), entregue via **instance metadata** e **EventBridge**.
-- A **EC2 Instance Rebalance Recommendation** avisa **antes**, quando a instância está com **risco elevado** de interrupção, dando mais tempo para reagir.
-- O comportamento na interrupção pode ser **terminate** (padrão), **stop** ou **hibernate**.
-- O preço Spot muda **gradualmente** conforme a oferta e a demanda de longo prazo. Não há mais leilão: paga-se o preço Spot vigente, limitado opcionalmente por um preço máximo.
-
-O diagrama abaixo mostra o processo completo. O ASG pede capacidade em vários pools (①) e a estratégia de alocação escolhe os mais disponíveis (②). A instância roda pagando o preço Spot (③). Quando o pool fica sob pressão, a AWS primeiro emite a **rebalance recommendation** (④), depois o **aviso de 2 minutos** (⑤) e, por fim, interrompe a instância (⑥). Os dois avisos chegam pelo **IMDS**, de dentro da instância, e pelo **EventBridge**, de fora dela. O ASG repõe a capacidade **antes** da interrupção, se o Capacity Rebalancing estiver ligado, ou **depois** dela.
-
-![Diagrama Amazon EC2 - Ciclo de vida de uma instância Spot](./img/amazon-ec2/amazon-ec2-06.png)
-
-**Boas práticas:**
-
-- Ser **flexível**: usar **vários tipos de instância** e **várias AZs** para acessar mais **pools de capacidade Spot**. Ferramenta útil: **attribute-based instance type selection** (escolher por vCPU e memória, em vez de listar tipos).
-- Usar a allocation strategy **`price-capacity-optimized`** (recomendada): escolhe os pools com **maior capacidade disponível** e menor preço, reduzindo interrupções.
-- Combinar **On-Demand** (capacidade base) e **Spot** (escala) no mesmo Auto Scaling group com uma **mixed instances policy**.
-- Habilitar o **Capacity Rebalancing** no ASG: ao receber a rebalance recommendation, o ASG lança uma substituta **antes** da interrupção.
-- Projetar a aplicação para ser **stateless** ou fazer **checkpoints** do processamento (S3, DynamoDB).
-
-**Spot Fleet vs. EC2 Fleet vs. Auto Scaling group:** o **Auto Scaling group** com mixed instances policy é a forma recomendada para a maioria dos casos. **EC2 Fleet** atende a lançamentos únicos (`instant`) ou mantém uma capacidade-alvo combinando On-Demand e Spot; o **Spot Fleet** é a API mais antiga.
-
-![Diagrama Amazon EC2 - Spot com Auto Scaling](./img/amazon-ec2/amazon-ec2-02.png)
+Instâncias que usam a **capacidade ociosa** da AWS com desconto de até ~90%, mas que podem ser **interrompidas** com 2 minutos de aviso. São ideais para cargas **tolerantes a falhas** e **flexíveis**. O funcionamento do mercado Spot, as interrupções, os tipos de pedido, o **Spot Fleet**, o **EC2 Fleet** e as estratégias de alocação estão na seção [Spot Instances & Spot Fleet](#spot-instances--spot-fleet).
 
 ### Placement groups
 
@@ -592,7 +567,7 @@ Quando o launch template muda (nova AMI, novo tipo de instância), as instância
 
 ### Outros recursos importantes
 
-- **Mixed instances policy e Spot:** um ASG pode combinar **vários tipos de instância** e **On-Demand + Spot**, com **Capacity Rebalancing**. Ver [Spot Instances](#spot-instances).
+- **Mixed instances policy e Spot:** um ASG pode combinar **vários tipos de instância** e **On-Demand + Spot**, com **Capacity Rebalancing**. Ver [Spot Instances](#spot-instances--spot-fleet).
 - **Attribute-based instance type selection:** em vez de listar tipos, você informa requisitos (ex: 4–8 vCPUs, 16–32 GiB), e o ASG usa qualquer tipo compatível, inclusive gerações futuras.
 - **Suspender processos:** é possível pausar processos específicos do ASG (`Launch`, `Terminate`, `HealthCheck`, `ReplaceUnhealthy`, `AZRebalance`, `AlarmNotification`, `ScheduledActions`, `AddToLoadBalancer`...), por exemplo para investigar uma instância com problema sem que ela seja substituída.
 - **Notificações:** eventos de lançamento, encerramento e falha vão para o **EventBridge** ou para o **SNS**.
@@ -787,6 +762,197 @@ Na prática, raramente se faz isso à mão. Os serviços abaixo automatizam as e
 - "CodeDeploy no EC2 **sem alterar** as instâncias existentes" → deploy **blue/green** (cópia do ASG). "Atualizar o código nas instâncias atuais" → **in-place**.
 - "Beanstalk: deploy sem perda de capacidade e com rollback rápido criando instâncias novas" → **immutable**. "Canary no Beanstalk" → **traffic splitting**.
 - "Durante o deploy, a versão nova quebra porque o banco mudou" → mudanças de schema **compatíveis com as duas versões** (expand/contract).
+
+[↑ Índice](#índice)
+
+## Spot Instances & Spot Fleet
+
+A AWS precisa manter capacidade sobrando em cada AZ para atender picos de demanda dos clientes On-Demand. Em vez de deixar esses servidores parados, ela os **vende com grande desconto**, de até ~90% em relação ao On-Demand, como instâncias **Spot**. O preço baixo vem com uma condição: quando a AWS precisar dessa capacidade de volta, ela **interrompe** a sua instância com **2 minutos** de aviso.
+
+Uma instância Spot é uma instância EC2 **idêntica** a uma On-Demand: mesmo hardware, mesmo desempenho, mesmas AMIs. Só o **modelo de compra** muda. Por isso, a pergunta não é "Spot é pior?", e sim "**minha carga aguenta perder uma instância a qualquer momento?**". Se sim, Spot é a forma mais barata de rodar EC2. Exemplos de cargas que aguentam: processar um lote de arquivos, renderizar vídeos, rodar testes de CI ou atender requisições web em uma frota stateless. Não servem: um banco de dados de instância única, ou um processo longo sem checkpoints.
+
+Pedir **uma** instância Spot é simples. O desafio é manter **uma frota** de instâncias Spot estável, mesmo com interrupções. É para isso que existem o **Spot Fleet**, o **EC2 Fleet** e a mixed instances policy do **Auto Scaling group**. Eles pedem capacidade em **muitos pools ao mesmo tempo** e **repõem** o que é interrompido.
+
+> **Paralelo com o Lambda:** pense em uma carga que você faria com Lambda + SQS. Ela é **idempotente**, processa mensagens de uma fila e, se uma execução falhar, a mensagem volta para a fila e outra execução a processa. Esse mesmo desenho é o que torna uma carga **segura para Spot**: um worker interrompido apenas deixa a mensagem voltar para a fila. Se o processamento passar de 15 minutos ou precisar de GPU, workers em Spot consumindo a fila são a alternativa natural ao Lambda. E se você quer Spot sem gerenciar servidores, existe o **Fargate Spot**, para containers.
+
+### Como funciona o mercado Spot
+
+- **Pool de capacidade Spot:** cada combinação de **tipo de instância + AZ** (ex: `m7i.large` em us-east-1a) é um **pool** separado, com oferta, preço e risco de interrupção próprios. Se um pool fica sem capacidade, só as instâncias **dele** são interrompidas. Daí vem a regra de ouro do Spot: **diversificar** entre muitos pools.
+- **Preço:** cada pool tem um **preço Spot** que muda **gradualmente**, conforme a oferta e a demanda de longo prazo. Não existe mais leilão nem disputa de lances. Você paga o preço vigente do pool, por segundo, como no On-Demand.
+- **Preço máximo (*max price*):** é opcional, e o padrão é o preço On-Demand. A AWS **não recomenda** defini-lo, porque um valor baixo só aumenta as interrupções e não reduz o que você paga.
+- **Por que uma instância é interrompida:**
+  - **capacidade**, o motivo principal: a AWS precisa do servidor para On-Demand;
+  - **preço**: o preço do pool passou do seu *max price*, se você definiu um;
+  - **restrições** do pedido não atendidas, como lançar todas as instâncias juntas na mesma AZ.
+- **Ferramentas para escolher pools:**
+  - **Spot Instance Advisor:** mostra, por tipo de instância e região, a **frequência histórica de interrupção** (faixas como <5%, 5–10%... >20%) e a economia média.
+  - **Spot placement score:** dá uma nota de 1 a 10 para a chance de um pedido de capacidade (ex: 500 vCPUs com estes tipos) ser atendido em cada **região** ou **AZ**. É útil para decidir **onde** rodar uma carga flexível.
+  - **Histórico de preços Spot**, no console e na API.
+
+[↑ Índice](#índice)
+
+### Interrupções: avisos e comportamento
+
+Uma instância Spot recebe até dois avisos antes de ser interrompida:
+
+1. **EC2 Instance Rebalance Recommendation:** um aviso **antecipado**, sem prazo fixo, de que a instância está com **risco elevado** de interrupção. É a melhor hora para reagir com calma: lançar uma substituta em outro pool, terminar o trabalho em andamento ou não aceitar trabalho novo.
+2. **Spot Instance Interruption Warning:** a instância **será** interrompida em **2 minutos**.
+
+Os dois avisos chegam por dois caminhos:
+- **de dentro da instância**, pelo **IMDS** (`/latest/meta-data/events/recommendations/rebalance` e `/latest/meta-data/spot/instance-action`), que a aplicação pode consultar periodicamente;
+- **de fora dela**, por eventos no **EventBridge**, que podem acionar Lambda, SNS ou SSM.
+
+**O que acontece na interrupção** (*interruption behavior*):
+
+- **Terminate** (padrão): a instância é encerrada.
+- **Stop:** a instância é parada, mantendo o volume EBS, e reiniciada automaticamente quando houver capacidade. Exige um pedido **persistente** ou uma frota do tipo *maintain*.
+- **Hibernate:** grava a memória no EBS e retoma de onde parou quando houver capacidade. Tem as mesmas exigências do stop.
+
+**O que fazer nos 2 minutos:** retirar a instância do load balancer, salvar um **checkpoint** (S3, DynamoDB, EFS), devolver o trabalho em andamento à fila (não apagar a mensagem SQS) e enviar os logs.
+
+**Testar antes de acontecer:** o **AWS Fault Injection Service (FIS)** tem uma ação que **envia avisos de interrupção** a instâncias Spot de verdade. Assim, dá para validar que a aplicação reage corretamente sem esperar uma interrupção real.
+
+O diagrama abaixo mostra o processo completo:
+1. O ASG pede capacidade em vários pools.
+2. A estratégia de alocação escolhe os pools mais disponíveis.
+3. A instância roda pagando o preço Spot.
+4. Quando o pool fica sob pressão, a AWS emite a **rebalance recommendation**.
+5. Depois vem o **aviso de 2 minutos**.
+6. Por fim, a instância é interrompida.
+
+O ASG repõe a capacidade **antes** da interrupção, se o Capacity Rebalancing estiver ligado, ou **depois** dela.
+
+![Diagrama Amazon EC2 - Ciclo de vida de uma instância Spot](./img/amazon-ec2/amazon-ec2-06.png)
+
+[↑ Índice](#índice)
+
+### Pedidos Spot: one-time e persistent
+
+A forma mais simples de usar Spot é lançar a instância com a opção de mercado Spot. Pelo console, pelo `RunInstances` com `InstanceMarketOptions` ou pelo launch template, ela vira um **pedido Spot** (*Spot Instance request*). O pedido tem um tipo:
+
+- **One-time:** o pedido é atendido uma vez. Se a instância for interrompida, o pedido **fecha** e nada é relançado.
+- **Persistent:** o pedido **continua aberto** depois de uma interrupção. Quando a capacidade volta, uma nova instância é lançada, ou a instância parada/hibernada é reiniciada. Isso se repete até o pedido ser cancelado ou expirar (*valid until*).
+
+O pedido passa pelos estados **open** (esperando capacidade), **active** (instância rodando), **closed**, **cancelled** e **failed**.
+
+> **Obs:** Para encerrar de vez instâncias de um pedido **persistent**, a ordem importa: **primeiro cancelar o pedido**, **depois terminar as instâncias**. Se você só terminar as instâncias, o pedido continua aberto e **lança outras** no lugar. E cancelar o pedido **não** encerra as instâncias que já estão rodando. Esse detalhe costuma aparecer em questões.
+
+![Diagrama Spot - Ciclo de vida dos pedidos one-time e persistent](./img/amazon-ec2-spot/amazon-ec2-spot-01.png)
+
+[↑ Índice](#índice)
+
+### Spot Fleet
+
+Uma instância isolada não basta para uma carga de produção. O **Spot Fleet** é um pedido de **frota**: você diz **quanta capacidade** quer e **em quais pools** aceita rodar, e ele lança e mantém o conjunto de instâncias que atende ao pedido.
+
+- **Launch specifications** (ou launch templates com *overrides*): a lista de opções aceitáveis, ou seja, os tipos de instância e as subnets/AZs. Cada combinação é um pool candidato. Quanto **mais opções**, mais estável a frota.
+- **Target capacity:** a capacidade-alvo, em **instâncias**, **vCPUs**, **memória** ou **unidades personalizadas**.
+- **Instance weighting** (peso por tipo): define quanto cada tipo "vale". Por exemplo, com `c7i.large` = peso 2 e `c7i.xlarge` = peso 4, uma capacidade-alvo de **20 unidades** pode ser atendida com 10 `large`, com 5 `xlarge` ou com uma mistura dos dois. O preço é comparado **por unidade**, o que permite trocar instâncias grandes por pequenas conforme o preço e a disponibilidade.
+- **Allocation strategy:** como a frota escolhe os pools. Ver [Estratégias de alocação](#estratégias-de-alocação).
+- **Tipo de pedido:**
+  - **request:** atende a capacidade **uma vez**. As instâncias interrompidas **não** são repostas.
+  - **maintain:** **mantém** a capacidade-alvo e repõe automaticamente o que for interrompido, em outros pools se necessário.
+- **Parte On-Demand:** a frota pode incluir uma **capacidade On-Demand** fixa (a base) e completar o resto com Spot.
+- **Proteções de custo:** *max total price*, um teto de gasto por hora para a frota inteira, além de datas de validade (*valid from* / *valid until*).
+- **Capacity Rebalancing:** como no ASG, lança uma substituta ao receber a rebalance recommendation.
+
+![Diagrama Spot - Anatomia de um Spot Fleet](./img/amazon-ec2-spot/amazon-ec2-spot-02.png)
+
+> **Obs:** O Spot Fleet (`RequestSpotFleet`) é uma API **antiga**. A própria AWS desencoraja seu uso em projetos novos e recomenda o **EC2 Fleet** ou, na maioria dos casos, o **Auto Scaling group** com mixed instances policy. Ele continua aparecendo na prova pelo nome e pelos conceitos (pools, pesos, *maintain*, estratégias de alocação), que são os mesmos nas três opções.
+
+[↑ Índice](#índice)
+
+### EC2 Fleet
+
+O **EC2 Fleet** é a evolução do Spot Fleet. Em **uma única chamada de API**, ele lança uma frota que combina **On-Demand**, **Spot** e até **Reserved Instances/Capacity Reservations**, em vários tipos de instância e AZs. Ele tem três tipos:
+
+- **instant:** a chamada é **síncrona**. Ela tenta lançar a capacidade e **devolve na hora** as instâncias criadas e os erros, sem manter nada depois. Ideal para ferramentas que precisam de "N instâncias agora", como um orquestrador de jobs batch ou de CI.
+- **request:** assíncrono, atende **uma vez** e não repõe.
+- **maintain:** **mantém** a capacidade-alvo e repõe interrupções.
+
+Outros recursos são a estratégia de alocação também para a **parte On-Demand** (`lowest-price` ou `prioritized`, para respeitar uma ordem de preferência de tipos) e a opção de **usar primeiro as Capacity Reservations** da conta.
+
+[↑ Índice](#índice)
+
+### Estratégias de alocação
+
+A estratégia de alocação é a regra que a frota usa para escolher **em quais pools** lançar as instâncias Spot. Ela vale para o ASG, o EC2 Fleet e o Spot Fleet. A escolha é sempre uma troca entre **preço** e **risco de interrupção**:
+
+| Estratégia | Como escolhe | Quando usar |
+|---|---|---|
+| **price-capacity-optimized** | Primeiro os pools com **mais capacidade disponível**; entre eles, os de **menor preço** | **Recomendada** para a maioria das cargas. Bom equilíbrio entre custo e interrupções |
+| **capacity-optimized** | Só pela **maior capacidade disponível**, ignorando o preço | Cargas em que uma interrupção é **muito cara**: jobs longos, CI com builds demorados, renderização |
+| **capacity-optimized-prioritized** | Como a anterior, mas respeitando uma **ordem de preferência** de tipos de instância, sempre que possível | Quando há tipos preferidos (ex: uma geração específica), sem abrir mão da capacidade |
+| **lowest-price** | Os pools **mais baratos**, distribuindo entre os N mais baratos (`InstancePoolsToUseCount`) | **Não recomendada**: os pools mais baratos costumam ser os mais disputados e interrompem mais. Era o padrão antigamente |
+| **diversified** | Distribui **igualmente** entre **todos** os pools da lista | Frotas grandes e de longa duração, em que nenhum pool pode concentrar a capacidade |
+
+![Diagrama Spot - O que cada estratégia de alocação escolhe](./img/amazon-ec2-spot/amazon-ec2-spot-03.png)
+
+[↑ Índice](#índice)
+
+### Spot Fleet vs. EC2 Fleet vs. Auto Scaling group
+
+| | **Spot Fleet** | **EC2 Fleet** | **Auto Scaling group** |
+|---|---|---|---|
+| Situação | API antiga, desencorajada para projetos novos | API atual para frotas "puras" | **Recomendado** para a maioria dos casos |
+| On-Demand + Spot | Sim | Sim | Sim (mixed instances policy) |
+| Lançamento síncrono (*instant*) | Não | **Sim** | Não |
+| Escala por métricas (target tracking etc.) | Sim (via Application Auto Scaling) | Não | **Sim**, nativo |
+| Health checks, ELB, lifecycle hooks, instance refresh, warm pools | Limitado | Não | **Sim** |
+| Uso típico | Legado | Ferramentas que precisam de N instâncias agora | Aplicações web, workers, filas: qualquer carga contínua |
+
+**Regra prática:** para uma aplicação que escala e precisa de load balancer e health checks, use **ASG com mixed instances policy**. Para um lote de instâncias de uma vez, em uma ferramenta própria, use **EC2 Fleet `instant`**. O **Spot Fleet** aparece em arquiteturas antigas e em questões que usam o nome.
+
+O diagrama abaixo mostra o padrão recomendado: um ASG com base On-Demand e escala em Spot, distribuída em vários tipos e AZs, com tratamento dos avisos pelo EventBridge.
+
+![Diagrama Amazon EC2 - Spot com Auto Scaling](./img/amazon-ec2/amazon-ec2-02.png)
+
+[↑ Índice](#índice)
+
+### Onde usar Spot (e onde não usar)
+
+**Boas cargas para Spot:**
+
+- **Processamento em lote e big data:** AWS Batch com compute environments Spot. No **EMR**, os nós de **task**, que não guardam dados do HDFS, podem ser Spot, enquanto o nó **master** e os nós **core** ficam em On-Demand.
+- **Containers:** **ECS** com *capacity providers* Spot, **EKS** com managed node groups Spot ou **Karpenter**, e o **Fargate Spot**, em que a task recebe um `SIGTERM` 2 minutos antes de ser interrompida.
+- **Aplicações web stateless** atrás de um ALB, em ASG com base On-Demand e escala em Spot.
+- **CI/CD**, testes, ambientes de desenvolvimento.
+- **HPC fracamente acoplado** e **treinamento de ML** com checkpoints, como no **SageMaker Managed Spot Training**.
+
+**Más cargas para Spot:**
+
+- Bancos de dados e sistemas com **estado em uma única instância**.
+- Jobs **longos sem checkpoint**, em que uma interrupção perde horas de trabalho.
+- HPC **fortemente acoplado** sem checkpoint, em que perder um nó derruba o job inteiro (ver [HPC](#high-performance-computing-hpc)).
+- Cargas com **prazo rígido** e sem plano B em On-Demand.
+
+**Boas práticas:**
+
+- **Diversificar ao máximo:** muitos tipos de instância, de várias famílias e gerações, e todas as AZs. A **attribute-based instance type selection** (ex: "2–8 vCPUs, 4–32 GiB") faz isso automaticamente.
+- **price-capacity-optimized** como estratégia de alocação.
+- **Capacity Rebalancing** ligado no ASG ou na frota.
+- **Base On-Demand** (ou coberta por Savings Plans) para o mínimo necessário, e Spot para o resto.
+- Aplicação **stateless**, com **checkpoints** e trabalho **idempotente**.
+- **Testar interrupções** com o AWS FIS.
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Menor custo para uma carga **tolerante a interrupções**" → **Spot**. Com "base que não pode cair" → **On-Demand/Savings Plans para a base + Spot** para o resto (ASG com mixed instances policy).
+- "Reduzir as interrupções das instâncias Spot" → **diversificar** tipos e AZs + **price-capacity-optimized** (ou **capacity-optimized**).
+- "Escolher a estratégia de alocação para o **menor preço**" → cuidado: **lowest-price** aumenta as interrupções. A resposta recomendada costuma ser **price-capacity-optimized**.
+- "Reagir **antes** do aviso de 2 minutos" → **rebalance recommendation** + **Capacity Rebalancing**.
+- "Detectar a interrupção e salvar o estado" → consultar o **IMDS** (`spot/instance-action`) ou uma regra do **EventBridge** → Lambda.
+- "Instância Spot deve **retomar de onde parou** quando a capacidade voltar" → pedido **persistent** com comportamento **stop** ou **hibernate**.
+- "Terminei as instâncias Spot, mas outras foram lançadas no lugar" → pedido **persistent** ainda aberto: **cancelar o pedido primeiro**, depois terminar as instâncias.
+- "Frota Spot que mantém a capacidade e **repõe** interrupções" → Spot Fleet/EC2 Fleet do tipo **maintain**, ou ASG.
+- "Capacidade-alvo em **vCPUs** ou unidades, com tipos de tamanhos diferentes" → **instance weighting**.
+- "Ferramenta precisa de **N instâncias imediatamente**, com resposta síncrona" → **EC2 Fleet `instant`**.
+- "Escolher a **região/AZ** com mais chance de conseguir capacidade Spot" → **Spot placement score**.
+- "Testar se a aplicação aguenta interrupções Spot" → **AWS Fault Injection Service**.
+- "EMR com o menor custo sem perder dados" → **task nodes em Spot**, master e core em On-Demand.
+- "Containers com Spot sem gerenciar servidores" → **Fargate Spot**.
 
 [↑ Índice](#índice)
 
@@ -1135,10 +1301,22 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 |---|---|
 | Carga constante, máxima flexibilidade (família, região, Fargate, Lambda) | [Compute Savings Plan](#opções-de-compra) |
 | Carga constante em uma família e região, maior desconto | [EC2 Instance Savings Plan / Standard RI](#opções-de-compra) |
-| Carga tolerante a interrupções, menor custo | [Spot](#spot-instances) |
+| Carga tolerante a interrupções, menor custo | [Spot](#spot-instances--spot-fleet) |
 | Garantir capacidade em uma AZ sem compromisso longo | [On-Demand Capacity Reservation](#opções-de-compra) |
 | Licenças por socket/core (BYOL) | [Dedicated Hosts](#opções-de-compra) |
 | Carga curta, imprevisível ou de teste | [On-Demand](#opções-de-compra) |
+
+### Spot
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Reduzir interrupções Spot | [Diversificar + price-capacity-optimized](#estratégias-de-alocação) |
+| Retomar de onde parou quando a capacidade voltar | [Pedido persistent + stop/hibernate](#pedidos-spot-one-time-e-persistent) |
+| Instâncias relançadas depois de terminadas | [Cancelar o pedido persistent antes](#pedidos-spot-one-time-e-persistent) |
+| Frota que repõe interrupções | [Spot Fleet / EC2 Fleet maintain ou ASG](#spot-fleet-vs-ec2-fleet-vs-auto-scaling-group) |
+| N instâncias imediatamente, resposta síncrona | [EC2 Fleet instant](#ec2-fleet) |
+| Capacidade em vCPUs/unidades com tamanhos mistos | [Instance weighting](#spot-fleet) |
+| Escolher região/AZ com mais capacidade Spot | [Spot placement score](#como-funciona-o-mercado-spot) |
 
 ### Posicionamento das instâncias
 
