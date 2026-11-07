@@ -3,6 +3,10 @@ titulo: Compute and Load Balancing
 certificacao: AWS Certified Solutions Architect - Professional (SAP-C02)
 servicos:
   - Amazon EC2
+  - Amazon EC2 Auto Scaling
+  - Application Auto Scaling
+  - AWS CodeDeploy
+  - AWS Elastic Beanstalk
   - AWS ParallelCluster
   - AWS Parallel Computing Service (PCS)
   - AWS Batch
@@ -23,7 +27,7 @@ tags: [sap-c02, compute, load-balancing]
 
 ## Índice
 
-- **Compute:** [Amazon EC2](#amazon-elastic-compute-cloud-ec2) · [High Performance Computing (HPC)](#high-performance-computing-hpc)
+- **Compute:** [Amazon EC2](#amazon-elastic-compute-cloud-ec2) · [Amazon EC2 Auto Scaling](#amazon-ec2-auto-scaling) · [Auto Scaling Update Strategies](#auto-scaling-update-strategies) · [High Performance Computing (HPC)](#high-performance-computing-hpc)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## Amazon Elastic Compute Cloud (EC2)
@@ -427,6 +431,365 @@ A AWS limita quantos recursos cada conta pode usar por região. Isso protege con
 
 [↑ Índice](#índice)
 
+## Amazon EC2 Auto Scaling
+
+O **Amazon EC2 Auto Scaling** mantém **a quantidade certa de instâncias EC2 rodando**, aumentando ou diminuindo o número de instâncias conforme a demanda e **substituindo** automaticamente as que falham. Ele resolve dois problemas ao mesmo tempo:
+
+- **Elasticidade:** sem Auto Scaling, você dimensiona para o **pico** e paga por máquinas ociosas o resto do tempo, ou dimensiona para a **média** e a aplicação cai no pico. O Auto Scaling acompanha a curva de demanda.
+- **Autorrecuperação** (*self-healing*): se uma instância falha, ou se uma AZ inteira cai, o Auto Scaling percebe e cria outra para manter a capacidade definida. Mesmo uma aplicação com **uma única instância** ganha com isso: um ASG com mínimo e máximo de 1 recria a instância automaticamente se ela morrer.
+
+O serviço é **gratuito**: paga-se só pelas instâncias e pelos recursos que ele cria.
+
+> **Paralelo com o Lambda:** no Lambda, a escala é automática e invisível. Cada requisição nova ganha um ambiente de execução em milissegundos, e um ambiente com defeito é simplesmente descartado. O Auto Scaling é a forma de ter esse comportamento no EC2, com três diferenças:
+> - a escala é em **instâncias inteiras**, e não por requisição;
+> - cada instância nova leva **minutos** para ficar pronta, enquanto um cold start leva segundos;
+> - **você** define as regras de quando escalar.
+>
+> Boa parte do trabalho de arquitetura com ASG é compensar esse atraso: escalar **antes** da demanda chegar e deixar instâncias **pré-aquecidas**.
+
+### Conceitos básicos
+
+- **Auto Scaling group (ASG):** o conjunto de instâncias gerenciadas juntas. Ele define **onde** as instâncias rodam (as **subnets**, em uma ou mais AZs), **como** elas são criadas (o **launch template**, ver [AMIs, launch templates e user data](#amis-launch-templates-e-user-data)) e **quantas** devem existir.
+- **Capacidade mínima, desejada e máxima:**
+  - **Mínima:** o ASG nunca fica com menos instâncias que isso, mesmo sem nenhum tráfego. Define a disponibilidade base.
+  - **Máxima:** o teto. Protege contra custos descontrolados (ex: um ataque ou um bug que gera carga infinita).
+  - **Desejada:** quantas instâncias o ASG deve ter **agora**. As políticas de escala **mudam a desejada**, sempre entre a mínima e a máxima, e o ASG lança ou encerra instâncias até a quantidade real bater com ela.
+  - **Como pensar:** é um **termostato**. A mínima e a máxima são os limites do aparelho, a desejada é a temperatura programada no momento, e o ASG é o mecanismo que liga e desliga o ar para chegar nela.
+- **Distribuição entre AZs:** o ASG distribui as instâncias **igualmente** entre as AZs configuradas. Se uma AZ fica desbalanceada (ex: depois de uma falha), o processo **AZRebalance** lança instâncias na AZ com menos instâncias **antes** de encerrar as da AZ com mais. Para isso, ele pode passar temporariamente da capacidade máxima em até 10%.
+- **Integração com load balancer:** o ASG é associado a um **target group** do ELB. Cada instância nova é **registrada** automaticamente no load balancer, e cada instância encerrada é **retirada** dele, esperando as conexões em andamento terminarem (*deregistration delay*).
+
+![Diagrama EC2 Auto Scaling - Componentes e capacidade](./img/amazon-ec2-auto-scaling/amazon-ec2-auto-scaling-01.png)
+
+> **Paralelo com o Lambda:** a **capacidade mínima** lembra a **provisioned concurrency**: capacidade sempre pronta, paga mesmo sem uso. A **capacidade máxima** lembra a **reserved concurrency** usada como teto, que limita quanto a função pode escalar para proteger o orçamento ou um banco de dados downstream.
+
+[↑ Índice](#índice)
+
+### Health checks e substituição de instâncias
+
+O ASG verifica periodicamente se cada instância está **saudável**. Se não está, ele a **encerra e cria outra** no lugar. O ponto que mais cai na prova é **qual** verificação ele usa:
+
+- **EC2 status checks** (padrão): só detectam problemas de **infraestrutura**: a instância parou, o hardware falhou, o sistema operacional não responde. Uma instância com o SO funcionando e a **aplicação travada** continua "saudável" para esse check.
+- **ELB health checks** (precisa ser habilitado no ASG): o load balancer faz requisições periódicas a uma rota da aplicação (ex: `/health`). Se ela não responde corretamente, o ASG considera a instância não saudável e a substitui. É a opção certa quando o ASG está atrás de um load balancer.
+- **Health checks personalizados:** um script ou sistema externo marca a instância como não saudável pela API (`SetInstanceHealth`).
+- **VPC Lattice** e **EBS** health checks também podem ser habilitados.
+
+Uma instância recém-criada pode demorar para ficar pronta, porque ainda está fazendo boot, rodando o user data e aquecendo o cache. Dois parâmetros evitam que ela seja considerada não saudável, ou que distorça as métricas, antes da hora:
+
+- **Health check grace period:** quanto tempo depois do lançamento o ASG **espera** antes de começar a avaliar a saúde da instância.
+- **Default instance warmup:** quanto tempo a instância nova leva para começar a **contribuir para as métricas**. Até lá, as métricas dela não entram nas decisões de escala, o que evita escalar de novo porque as instâncias novas ainda estão "frias".
+
+> **Obs:** "As instâncias estão com a aplicação travada, mas o ASG não as substitui" é um cenário clássico. A causa é o ASG usar apenas os **EC2 status checks**. A solução é habilitar os **ELB health checks** no ASG.
+
+> **Paralelo com o Lambda:** no Lambda, uma execução que falha não deixa sequelas: o próximo evento pode cair em outro ambiente, e a AWS recicla ambientes com problemas. No EC2, uma instância "doente" continua recebendo tráfego até que alguém a tire de circulação. O health check do ASG é esse "alguém".
+
+[↑ Índice](#índice)
+
+### Políticas de escala
+
+As políticas de escala decidem **quando** e **quanto** mudar a capacidade desejada. Há duas famílias:
+- as **reativas**, que respondem a uma métrica que já mudou;
+- as **proativas**, que mudam a capacidade **antes** da demanda chegar.
+
+| Política | Como funciona | Quando usar |
+|---|---|---|
+| **Target tracking** | Você escolhe uma métrica e um **valor-alvo** (ex: CPU média em 50%). O ASG cria e gerencia os alarmes do CloudWatch e ajusta a capacidade para manter a métrica perto do alvo, como um termostato | **Primeira opção** na maioria dos casos. Simples e eficiente |
+| **Step scaling** | Você define alarmes e **degraus** de ajuste: CPU entre 60% e 80% → +2 instâncias; acima de 80% → +4 | Reações **proporcionais** ao tamanho do desvio, com controle fino |
+| **Simple scaling** | Um alarme → um ajuste, e depois espera o **cooldown** (padrão 300 s) antes de reagir de novo | Legado. Hoje, step scaling ou target tracking são preferidos |
+| **Scheduled actions** | Muda mínima, máxima e desejada em **horários definidos** (ex: dias úteis às 8h → mínimo 10; às 20h → mínimo 2) | Padrões **conhecidos** e previsíveis: horário comercial, campanhas, fechamento de mês |
+| **Predictive scaling** | Usa **machine learning** sobre o histórico do ASG para **prever** a demanda das próximas 48 horas e lançar instâncias **antes** do pico | Carga com padrão **cíclico** (diário ou semanal) e aplicações com boot demorado. Precisa de pelo menos 24 h de histórico; pode começar em modo **só previsão** para validar |
+
+**Combinações comuns:** predictive ou scheduled para preparar a **base** do dia, e target tracking por cima para absorver variações **inesperadas**. Quando várias políticas estão ativas ao mesmo tempo, o ASG aplica a que resulta na **maior** capacidade, tanto para escalar para cima quanto para baixo, privilegiando a disponibilidade.
+
+![Diagrama EC2 Auto Scaling - Políticas de escala ao longo do dia](./img/amazon-ec2-auto-scaling/amazon-ec2-auto-scaling-02.png)
+
+**Qual métrica usar:**
+
+- **CPU média** (`CPUUtilization`): a mais comum, boa para aplicações limitadas por processamento.
+- **Requisições por instância** (`ALBRequestCountPerTarget`): boa para aplicações web atrás de um ALB, porque acompanha a demanda **diretamente**.
+- **Tráfego de rede** (`NetworkIn`/`NetworkOut`): aplicações limitadas por rede.
+- **Métricas personalizadas** publicadas no CloudWatch. O caso clássico é o de **workers que consomem uma fila SQS**, em que a métrica certa é o **backlog por instância**: o número de mensagens visíveis na fila dividido pelo número de instâncias. O valor-alvo é calculado assim:
+  - **Alvo = latência aceitável ÷ tempo de processamento de uma mensagem.** Por exemplo: cada mensagem leva 0,1 s e a fila pode atrasar no máximo 10 s, então o alvo é 100 mensagens por instância.
+  - Escalar só pelo **tamanho da fila** é um erro comum. 1.000 mensagens com 2 instâncias e 1.000 mensagens com 50 instâncias são situações muito diferentes.
+
+![Diagrama EC2 Auto Scaling - Workers SQS escalando pelo backlog por instância](./img/amazon-ec2-auto-scaling/amazon-ec2-auto-scaling-03.png)
+
+> **Paralelo com o Lambda:** com Lambda + SQS, o *event source mapping* aumenta sozinho o número de execuções conforme a fila cresce. Com EC2, você monta esse mecanismo: publica a métrica de backlog por instância e cria uma política de target tracking sobre ela. Quando a carga é por fila, vale perguntar se o processamento cabe no Lambda (menos de 15 min, sem GPU) antes de montar workers em EC2.
+
+[↑ Índice](#índice)
+
+### Ciclo de vida da instância e lifecycle hooks
+
+Cada instância de um ASG passa por estados. Os principais são:
+- **Pending:** sendo lançada;
+- **InService:** em operação, recebendo tráfego;
+- **Terminating:** sendo encerrada;
+- **Terminated:** encerrada.
+
+Os **lifecycle hooks** criam uma **pausa** nesses momentos de transição para você executar ações:
+
+- **Hook de lançamento** (`Pending:Wait`): a instância já existe, mas ainda **não entra em serviço**. Usado para instalar software, baixar configuração, registrar a instância em um sistema externo ou rodar testes antes de ela receber tráfego.
+- **Hook de encerramento** (`Terminating:Wait`): a instância vai ser encerrada, mas **ainda está viva**. Usado para copiar logs, terminar o processamento em andamento, fazer backup de dados locais ou retirar a instância de um cluster.
+- **Como funciona:** o hook gera um evento no **EventBridge**, ou uma notificação em SNS ou SQS, que aciona uma **Lambda**, um **SSM Run Command** ou um script. Ao terminar, a ação chama `CompleteLifecycleAction` com `CONTINUE` ou `ABANDON`. Se ninguém responder, a instância segue o caminho padrão depois do **timeout**, que é de 1 hora por padrão e pode ser estendido com *heartbeats*.
+
+Há também estados manuais:
+- **Standby:** tira a instância de serviço **temporariamente**, para manutenção ou diagnóstico, sem que o ASG a substitua;
+- **Detach:** remove a instância do ASG, mantendo-a viva.
+
+![Diagrama EC2 Auto Scaling - Ciclo de vida e lifecycle hooks](./img/amazon-ec2-auto-scaling/amazon-ec2-auto-scaling-04.png)
+
+> **Paralelo com o Lambda:** o hook de lançamento lembra o código de **inicialização** fora do handler, e o hook de encerramento lembra a fase **Shutdown** das *Lambda extensions*, usada para enviar os últimos logs antes de o ambiente sumir. A diferença é que, no ASG, a pausa é explícita e pode durar minutos ou horas.
+
+[↑ Índice](#índice)
+
+### Qual instância é encerrada primeiro (termination policies)
+
+Quando a capacidade desejada diminui, o ASG precisa escolher **quais** instâncias encerrar. A **política padrão** segue esta ordem:
+
+1. Escolhe a **AZ com mais instâncias**, para manter o balanceamento entre AZs.
+2. Nessa AZ, prefere as instâncias que mantêm a **estratégia de alocação** (ex: a proporção On-Demand/Spot).
+3. Depois, as instâncias com o **launch template ou a configuração mais antiga**.
+4. Depois, a mais próxima da **próxima hora de cobrança**.
+5. Por último, escolhe aleatoriamente.
+
+Outras políticas podem ser configuradas: `OldestInstance` (útil para renovar a frota aos poucos), `NewestInstance` (útil para testar uma nova versão e voltar atrás), `OldestLaunchTemplate`, `ClosestToNextInstanceHour`, ou uma **função Lambda** com regras próprias.
+
+- **Scale-in protection:** marca instâncias que **não podem** ser encerradas por uma redução de capacidade, por exemplo uma instância processando um job longo. Ela continua podendo ser substituída por falha de saúde.
+- **Maximum instance lifetime:** encerra e substitui instâncias com mais de N dias (mínimo de 1 dia). Força a renovação da frota, útil para aplicar patches ou por compliance.
+
+[↑ Índice](#índice)
+
+### Warm pools: instâncias pré-aquecidas
+
+Algumas aplicações levam **muitos minutos** para ficar prontas: uma aplicação Java grande, um servidor que carrega gigabytes de cache, um software que precisa ser instalado. Quando o pico chega, o target tracking reage, mas as instâncias novas só ajudam muito depois.
+
+O **warm pool** mantém um conjunto de instâncias **já inicializadas**, que passaram pelo boot, pelo user data e pelo hook de lançamento, esperando **fora** do ASG. Quando o ASG precisa escalar, ele puxa instâncias do warm pool em vez de criar do zero. Elas podem esperar em três estados:
+
+| Estado no warm pool | Custo enquanto espera | Tempo para entrar em serviço |
+|---|---|---|
+| **Stopped** | Só o volume EBS | Rápido: só o *start* |
+| **Hibernated** | EBS (com a RAM gravada nele) | Rápido, e a memória volta como estava (ex: cache carregado) |
+| **Running** | Instância inteira | Imediato |
+
+- As instâncias do warm pool **não contam** na capacidade desejada nem recebem tráfego.
+- Na redução de capacidade, as instâncias podem **voltar** ao warm pool (*instance reuse policy*) em vez de serem encerradas.
+- Alternativas para reduzir o tempo até a instância ficar pronta: uma **golden AMI** com tudo pré-instalado, e o **predictive scaling**, que lança as instâncias antes do pico.
+
+> **Paralelo com o Lambda:** é a mesma ideia da **provisioned concurrency** e do **SnapStart**: pagar um pouco para ter ambientes já inicializados e eliminar o cold start nos picos.
+
+[↑ Índice](#índice)
+
+### Atualizar as instâncias: instance refresh
+
+Quando o launch template muda (nova AMI, novo tipo de instância), as instâncias que já estão rodando **não mudam**. O **instance refresh** substitui a frota aos poucos:
+
+- **Minimum healthy percentage:** quantas instâncias precisam continuar saudáveis durante a troca (ex: 90% troca de 10% em 10%). O **maximum healthy percentage** (até 200%) permite lançar as novas **antes** de encerrar as antigas, sem perder capacidade.
+- **Checkpoints:** pausam a troca em percentuais definidos (ex: 10%, 50%) para validar a nova versão, como um **canary**.
+- **Skip matching:** não substitui instâncias que já estão na configuração desejada.
+- **Rollback automático:** se o refresh falhar, ou se **alarmes do CloudWatch** indicarem problema, o ASG volta à configuração anterior.
+- **Outras estratégias**, como blue/green com dois ASGs, canary com pesos no ALB ou troca via Route 53, estão em [Auto Scaling Update Strategies](#auto-scaling-update-strategies).
+
+[↑ Índice](#índice)
+
+### Outros recursos importantes
+
+- **Mixed instances policy e Spot:** um ASG pode combinar **vários tipos de instância** e **On-Demand + Spot**, com **Capacity Rebalancing**. Ver [Spot Instances](#spot-instances).
+- **Attribute-based instance type selection:** em vez de listar tipos, você informa requisitos (ex: 4–8 vCPUs, 16–32 GiB), e o ASG usa qualquer tipo compatível, inclusive gerações futuras.
+- **Suspender processos:** é possível pausar processos específicos do ASG (`Launch`, `Terminate`, `HealthCheck`, `ReplaceUnhealthy`, `AZRebalance`, `AlarmNotification`, `ScheduledActions`, `AddToLoadBalancer`...), por exemplo para investigar uma instância com problema sem que ela seja substituída.
+- **Notificações:** eventos de lançamento, encerramento e falha vão para o **EventBridge** ou para o **SNS**.
+- **Instance maintenance policy:** define se, ao substituir instâncias (por falha de saúde ou rebalanceamento), o ASG lança a nova **antes** de encerrar a antiga ou o contrário.
+
+[↑ Índice](#índice)
+
+### EC2 Auto Scaling, Application Auto Scaling e AWS Auto Scaling
+
+São três nomes parecidos para coisas diferentes, e a prova usa isso:
+
+| Serviço | O que escala |
+|---|---|
+| **Amazon EC2 Auto Scaling** | **Instâncias EC2**, em Auto Scaling groups. É o assunto desta seção |
+| **Application Auto Scaling** | **Outros serviços**, com as mesmas ideias de target tracking, step e scheduled: tasks de **ECS**, capacidade de **DynamoDB**, réplicas do **Aurora**, **provisioned concurrency do Lambda**, Spot Fleet, EMR, endpoints do SageMaker, entre outros |
+| **AWS Auto Scaling** (*scaling plans*) | Um console unificado para criar planos de escala para **vários recursos** de uma aplicação ao mesmo tempo (ASGs, ECS, DynamoDB, Aurora). Hoje, a AWS recomenda configurar cada recurso diretamente, com o predictive scaling nativo do ASG |
+
+> **Paralelo com o Lambda:** se você já configurou **provisioned concurrency** com escala por horário ou por utilização, já usou o **Application Auto Scaling**.
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Aplicação travada, mas o ASG não substitui as instâncias" → habilitar **ELB health checks** no ASG.
+- "Manter a CPU média em torno de X%" ou "escalar de forma simples" → **target tracking**.
+- "Pico **todo dia** no mesmo horário" → **scheduled actions** ou **predictive scaling**. "Padrão cíclico + aplicação com **boot demorado**" → **predictive scaling**.
+- "Escalar workers que leem uma **fila SQS**" → target tracking sobre a métrica personalizada **backlog por instância**, e não sobre o tamanho da fila.
+- "Instâncias levam **muito tempo** para ficar prontas e o pico chega rápido" → **warm pool** (de preferência *stopped* ou *hibernated*), **golden AMI** e/ou **predictive scaling**.
+- "Executar uma ação **antes** de a instância entrar em serviço ou **antes** de ser encerrada" (ex: copiar logs, drenar jobs) → **lifecycle hooks** + EventBridge + Lambda/SSM.
+- "Não encerrar a instância que está processando um job longo na redução de capacidade" → **scale-in protection**.
+- "Investigar uma instância com problema sem que o ASG a substitua" → colocar em **Standby** ou **suspender** o processo `ReplaceUnhealthy`/`HealthCheck`.
+- "Trocar a AMI de toda a frota sem indisponibilidade, com validação gradual e rollback" → **instance refresh** com **checkpoints** e **rollback automático**. "Rollback instantâneo" → **blue/green** com dois ASGs.
+- "Alta disponibilidade para uma aplicação de **uma instância** só" → ASG com **mínimo = máximo = 1** em várias AZs.
+- "Escalar tasks ECS, DynamoDB ou provisioned concurrency do Lambda" → **Application Auto Scaling**.
+- "O ASG passou temporariamente da capacidade máxima" → **AZRebalance** (até +10%) ou instance refresh com *maximum healthy percentage* acima de 100%.
+
+[↑ Índice](#índice)
+
+## Auto Scaling Update Strategies
+
+Uma aplicação rodando em um ASG atrás de um load balancer precisa, de tempos em tempos, de uma **nova versão**: código novo, uma golden AMI com patches de segurança, outro tipo de instância, uma configuração diferente. A pergunta é **como trocar a frota inteira sem derrubar a aplicação**, e com que nível de risco. Não existe uma resposta única. Cada estratégia troca **velocidade**, **custo** e **segurança** de um jeito diferente, e a SAP-C02 costuma descrever um requisito ("rollback imediato", "sem custo extra", "testar com 10% dos usuários") e pedir a estratégia que o atende.
+
+> **Paralelo com o Lambda:** você provavelmente já conhece esses conceitos pelo Lambda. Ao publicar uma **versão** nova e mudar o **alias** com pesos (ex: 90% na v1 e 10% na v2), você faz um **canary**. O **CodeDeploy** automatiza isso com configurações como `Canary10Percent5Minutes` ou `Linear10PercentEvery1Minute`, e faz rollback automático por alarmes. No EC2, a ideia é a mesma. A diferença é que o "alias" passa a ser um **load balancer**, um **target group** ou um **registro DNS**, e as "versões" passam a ser **grupos de instâncias** que levam minutos para subir.
+
+### Conceitos básicos
+
+**Mutável vs. imutável:**
+
+- **Atualização mutável** (*in-place*): as instâncias existentes são **alteradas** com um novo pacote da aplicação, um patch aplicado por SSM ou um `git pull`. É rápida e barata, mas cada instância acumula mudanças ao longo do tempo (*configuration drift*), e um erro no meio da atualização deixa a frota em um estado misto e difícil de reverter.
+- **Atualização imutável:** as instâncias **nunca são alteradas**. Uma versão nova significa **novas instâncias**, criadas a partir de uma nova AMI ou de um novo launch template, e as antigas são descartadas. Rollback significa voltar a usar as instâncias, ou a AMI, anteriores. É o modelo recomendado na AWS e o que combina com Auto Scaling: as instâncias são **descartáveis**.
+
+> **Paralelo com o Lambda:** uma versão publicada do Lambda é **imutável**: você não altera a v5, publica a v6. As estratégias imutáveis no EC2 seguem a mesma filosofia.
+
+**Vocabulário de deploy:**
+
+- **All at once** (tudo de uma vez): troca todas as instâncias ao mesmo tempo. É rápido, mas há **indisponibilidade** e todos os usuários são afetados se a versão tiver problema.
+- **Rolling** (em lotes): troca as instâncias **em lotes** (ex: 20% por vez). Não há indisponibilidade, mas a capacidade fica temporariamente reduzida, a não ser que se lance antes de encerrar, e as **duas versões convivem** durante o deploy.
+- **Canary:** manda uma **pequena parte** do tráfego (ex: 10%) para a versão nova, observa as métricas e só depois libera o resto. O nome vem dos canários que mineiros levavam para detectar gás antes que afetasse as pessoas.
+- **Linear:** aumenta o tráfego da versão nova em **degraus iguais** (ex: +10% a cada 5 minutos).
+- **Blue/green:** mantém **dois ambientes completos**: o *blue*, com a versão atual, e o *green*, com a nova. O tráfego é **trocado** de um para o outro. O rollback é tão rápido quanto apontar de volta para o blue, mas a infraestrutura **dobra** durante a troca.
+
+**O que comparar ao escolher uma estratégia:**
+
+| Critério | Pergunta |
+|---|---|
+| **Disponibilidade** | Há indisponibilidade durante o deploy? |
+| **Capacidade** | A frota fica menor durante a troca? |
+| **Custo** | É preciso pagar por instâncias extras durante o deploy? |
+| **Raio de impacto** (*blast radius*) | Quantos usuários são afetados se a versão nova tiver um bug? |
+| **Velocidade do rollback** | Voltar atrás leva segundos (mudar um peso) ou minutos (recriar instâncias)? |
+| **Convivência de versões** | As duas versões atendem usuários ao mesmo tempo? Se sim, a aplicação e o **banco de dados** precisam ser compatíveis com as duas |
+
+![Diagrama Auto Scaling Update Strategies - Como o tráfego migra em cada estratégia](./img/amazon-ec2-auto-scaling/amazon-ec2-auto-scaling-05.png)
+
+[↑ Índice](#índice)
+
+### As quatro estratégias com ASG
+
+As quatro arquiteturas abaixo vão da mais simples e barata à mais isolada e cara.
+
+![Diagrama Auto Scaling Update Strategies - Quatro arquiteturas de atualização](./img/amazon-ec2-auto-scaling/amazon-ec2-auto-scaling-06.png)
+
+#### 1. Rolling update no mesmo ASG (instance refresh)
+
+Um **único ASG**, com um **único target group**. O launch template recebe uma nova versão, e as instâncias são substituídas **em lotes**, normalmente com o **instance refresh** (ver [Atualizar as instâncias: instance refresh](#atualizar-as-instâncias-instance-refresh)).
+
+- **Como funciona:** com *minimum healthy percentage* de 90%, o ASG encerra 10% das instâncias antigas, lança 10% de novas, espera elas ficarem saudáveis e passa para o próximo lote. Com *maximum healthy percentage* acima de 100%, ele **lança antes de encerrar**, e a capacidade não diminui.
+- **Controle de risco:** **checkpoints** pausam a troca (ex: em 10% e em 50%) para validar a versão nova, e o **rollback automático** por alarmes do CloudWatch volta à configuração anterior se as métricas piorarem.
+- **Prós:** é o mais simples, não exige infraestrutura extra e é nativo do ASG.
+- **Contras:** o rollback é **lento**, porque também troca instâncias em lotes. As duas versões convivem durante todo o deploy. A divisão do tráfego segue o número de instâncias, sem controle fino.
+
+![Diagrama Auto Scaling Update Strategies - Instance refresh com checkpoint e rollback](./img/amazon-ec2-auto-scaling/amazon-ec2-auto-scaling-07.png)
+
+#### 2. Segundo ASG no mesmo target group (canary por capacidade)
+
+Um **segundo ASG**, com o launch template da versão nova, é registrado **no mesmo target group** do ASG atual. O ALB distribui as requisições entre **todas** as instâncias do target group. Por isso, a fatia de tráfego da versão nova é proporcional ao **número de instâncias** dela.
+
+- **Como funciona:** com 9 instâncias v1 e 1 v2, cerca de 10% do tráfego vai para a v2. Para avançar, aumenta-se a capacidade do ASG novo e reduz-se a do antigo. No fim, o ASG antigo é removido.
+- **Rollback:** reduzir o ASG novo a **zero**. É rápido, porque as instâncias v1 continuam lá.
+- **Prós:** canary simples, sem mudar o load balancer.
+- **Contras:** o percentual de tráfego depende do número de instâncias: com 4 instâncias, o menor passo é 25%. Não dá para testar a versão nova **isoladamente** antes de ela receber tráfego real, e os usuários podem alternar entre versões a cada requisição, a menos que haja *sticky sessions*.
+
+#### 3. Blue/green com dois target groups e pesos no ALB
+
+Dois ASGs, cada um no **seu próprio target group** (blue e green), atrás do **mesmo ALB**. A regra do listener usa uma ação de *forward* com **weighted target groups**, ou seja, pesos para cada target group (ex: blue 90, green 10).
+
+- **Como funciona:**
+  1. O green sobe com **peso 0**. Ele já pode ser **testado isoladamente** por uma regra separada do listener (ex: um header `X-Version: green` ou uma porta de teste), sem receber tráfego real.
+  2. Os pesos mudam aos poucos: 10% → 50% → 100%.
+  3. Depois de um período de observação, o ASG blue é removido.
+- **Rollback:** voltar o peso do blue para 100%. É **imediato** e não depende de DNS.
+- **Consistência por usuário:** com **stickiness no nível do target group**, um usuário que caiu no green continua no green durante a sessão.
+- **Prós:** controle fino do percentual, testes isolados antes de liberar e rollback em segundos.
+- **Contras:** a capacidade do green precisa estar pronta antes de receber tráfego, o que significa custo duplicado durante a transição e mais componentes para gerenciar.
+
+#### 4. Blue/green com ambientes completos e Route 53
+
+Dois **ambientes completos**, cada um com seu próprio **ALB + ASG**. Às vezes eles ficam em contas ou regiões diferentes. A troca é feita por **registros ponderados** (*weighted*) do **Route 53**.
+
+- **Quando usar:** quando a mudança vai além das instâncias. Por exemplo, um ALB novo, outra configuração de rede, outra VPC, conta ou região. Ou quando se quer **isolamento total** entre as versões.
+- **O problema do DNS:** a troca depende do **TTL** dos registros e de clientes e resolvedores que **ignoram o TTL** e guardam a resposta em cache por mais tempo. A migração não é precisa, alguns clientes continuam no blue por minutos ou horas, e o **rollback também não é imediato**.
+- **Alternativa sem o problema do DNS:** o **AWS Global Accelerator**, com seus IPs fixos e o ajuste de pesos por endpoint (*traffic dials* e *endpoint weights*), muda o tráfego **sem depender de cache DNS**.
+- **Prós:** isolamento máximo, e permite mudar qualquer coisa na infraestrutura.
+- **Contras:** é o mais caro, porque duplica tudo, e o mais lento e impreciso para trocar e para voltar atrás.
+
+#### Comparação
+
+| | **1. Rolling (instance refresh)** | **2. Segundo ASG, mesmo TG** | **3. Dois TGs com pesos no ALB** | **4. Ambientes completos + Route 53** |
+|---|---|---|---|---|
+| Infraestrutura extra | Nenhuma (ou só alguns % com max healthy > 100%) | Um ASG | Um ASG + um TG | ALB + ASG (+ VPC/conta) |
+| Controle do % de tráfego | Pelo nº de instâncias trocadas | Pelo nº de instâncias | **Pesos precisos** | Pesos DNS (impreciso por cache) |
+| Testar a versão nova sem tráfego real | Não | Não | **Sim** (regra de teste) | Sim (endpoint próprio) |
+| Velocidade do rollback | Lenta (novo refresh) | Rápida (ASG novo → 0) | **Imediata** (peso) | Lenta (TTL e cache DNS) |
+| Isolamento entre versões | Baixo | Baixo | Médio | **Total** |
+| Custo durante o deploy | Menor | Médio | Médio/alto | Maior |
+
+[↑ Índice](#índice)
+
+### Ferramentas que implementam essas estratégias
+
+Na prática, raramente se faz isso à mão. Os serviços abaixo automatizam as estratégias, e a prova costuma citá-los pelo nome:
+
+**AWS CloudFormation: `UpdatePolicy` do ASG.** Define o que acontece quando a stack muda o launch template do ASG:
+
+- **`AutoScalingRollingUpdate`:** **rolling** no mesmo ASG, em lotes. Os parâmetros são `MaxBatchSize` (quantas por vez), `MinInstancesInService` (quantas ficam em serviço) e `PauseTime`. Com `WaitOnResourceSignals`, cada instância nova precisa enviar um sinal de sucesso (`cfn-signal`, normalmente ao fim do user data) antes de o lote seguinte começar. Se os sinais não chegam, a stack faz **rollback**.
+- **`AutoScalingReplacingUpdate`** (`WillReplace: true`): cria um **ASG novo inteiro**. Só depois que ele está saudável, o antigo é removido. Se algo falha, o rollback é **rápido**, porque o ASG antigo ainda existe. É o equivalente imutável/blue-green dentro do CloudFormation.
+- **`AutoScalingScheduledAction`:** evita que um update da stack desfaça a capacidade ajustada por scheduled actions.
+
+**AWS CodeDeploy (EC2/on-premises):**
+
+- **In-place:** para a aplicação em cada instância, instala a versão nova e reinicia. É feito em lotes definidos pela *deployment configuration* (`OneAtATime`, `HalfAtATime`, `AllAtOnce` ou personalizada), com **hooks** no `appspec.yml` (ex: `BeforeInstall`, `ValidateService`). É uma estratégia **mutável**.
+- **Blue/green:** o CodeDeploy **copia o ASG** (ou usa instâncias já existentes), instala a versão nova nele, redireciona o load balancer para as instâncias novas e encerra as antigas depois de um tempo de espera configurável. É uma estratégia **imutável**.
+- **Rollback automático** por falha do deploy ou por alarmes do CloudWatch.
+- No EC2, as configurações são por **lotes de instâncias**. As configurações **canary** e **linear** por percentual de tráfego existem para **Lambda** e **ECS**.
+
+**AWS Elastic Beanstalk:** tem as estratégias prontas como *deployment policies*:
+
+| Política | O que faz |
+|---|---|
+| **All at once** | Atualiza todas as instâncias de uma vez, com indisponibilidade |
+| **Rolling** | Em lotes, com capacidade reduzida durante o deploy |
+| **Rolling with additional batch** | Lança um lote extra antes, mantendo a capacidade total |
+| **Immutable** | Cria um **ASG temporário** com instâncias novas e só depois as move para o ASG original, descartando as antigas |
+| **Traffic splitting** | Canary: uma parte do tráfego vai para instâncias novas por um período de avaliação |
+| **Blue/green** | Um **ambiente novo** e a troca de URL (*swap environment URLs*), que é uma troca de **DNS** com as mesmas ressalvas da estratégia 4 |
+
+[↑ Índice](#índice)
+
+### Boas práticas para qualquer estratégia
+
+- **Preferir o imutável:** **golden AMI** versionada (Image Builder) + nova versão do launch template, em vez de atualizar instâncias em execução.
+- **Health checks do ELB no ASG**, para que instâncias com a versão quebrada sejam detectadas, e um endpoint `/health` que teste dependências reais.
+- **Deregistration delay** (*connection draining*) no target group, para que as requisições em andamento terminem antes de a instância antiga sair.
+- **Rollback automático por alarmes:** taxa de erros 5xx, latência e métricas de negócio, no instance refresh, no CodeDeploy ou no CloudFormation.
+- **Sessões fora das instâncias** (ElastiCache, DynamoDB): sem isso, trocar a instância do usuário derruba a sessão dele.
+- **Banco de dados compatível com as duas versões:** em qualquer estratégia sem indisponibilidade, v1 e v2 rodam **ao mesmo tempo** contra o mesmo banco. Mudanças de schema devem ser feitas em etapas (*expand/contract*): primeiro **adicionar** colunas e tabelas de um jeito que a v1 ignore, fazer o deploy da v2, e só depois **remover** o que a v1 usava.
+- **Feature flags** (ex: **AWS AppConfig**): separar o **deploy** do código da **ativação** da funcionalidade, o que permite desligar uma funcionalidade sem novo deploy.
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Atualizar a AMI da frota **sem infraestrutura extra**, de forma gradual" → **instance refresh** (rolling), com checkpoints e rollback automático.
+- "Atualizar **sem reduzir a capacidade** durante o deploy" → instance refresh com **maximum healthy percentage > 100%**, *rolling with additional batch* (Beanstalk) ou blue/green.
+- "Rollback **imediato**, sem depender de DNS" → **blue/green com dois target groups e pesos no ALB** (weighted target groups).
+- "Enviar **10% do tráfego** para a versão nova e aumentar aos poucos" → **weighted target groups** no ALB (precisão) ou um segundo ASG no mesmo TG (proporcional ao nº de instâncias).
+- "**Testar** a versão nova em produção **antes** de ela receber tráfego de usuários" → green com **peso 0** e uma **regra de listener** de teste (header, path ou porta).
+- "Usuários alternando entre versões e perdendo a sessão durante o canary" → **stickiness no target group** e sessão em ElastiCache/DynamoDB.
+- "Blue/green via **Route 53**, mas parte dos clientes continua no ambiente antigo" → **cache DNS/TTL**. Usar **pesos no ALB** ou **Global Accelerator** (traffic dials).
+- "A mudança envolve um **ALB novo**, outra VPC, conta ou região" → blue/green com **ambientes completos** + Route 53 weighted (ou Global Accelerator).
+- "CloudFormation: criar um ASG **novo** e só remover o antigo se o novo estiver saudável" → **`AutoScalingReplacingUpdate`**. "Em lotes, no mesmo ASG, esperando sinal das instâncias" → **`AutoScalingRollingUpdate`** + `WaitOnResourceSignals`/`cfn-signal`.
+- "CodeDeploy no EC2 **sem alterar** as instâncias existentes" → deploy **blue/green** (cópia do ASG). "Atualizar o código nas instâncias atuais" → **in-place**.
+- "Beanstalk: deploy sem perda de capacidade e com rollback rápido criando instâncias novas" → **immutable**. "Canary no Beanstalk" → **traffic splitting**.
+- "Durante o deploy, a versão nova quebra porque o banco mudou" → mudanças de schema **compatíveis com as duas versões** (expand/contract).
+
+[↑ Índice](#índice)
+
 ## High Performance Computing (HPC)
 
 **HPC** (*High Performance Computing*, computação de alto desempenho) é usar **muitos computadores trabalhando juntos** para resolver um problema grande demais para uma máquina só. O problema é dividido em milhares de pedaços, cada núcleo calcula um pedaço, e os resultados são combinados no final. Exemplos: previsão do tempo, simulação de colisão de carros, aerodinâmica (**CFD**, *Computational Fluid Dynamics*), sequenciamento genômico, descoberta de medicamentos, análise sísmica, risco financeiro e renderização de filmes.
@@ -784,6 +1147,31 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Latência mínima entre nós (HPC) | [Cluster placement group](#placement-groups) + EFA |
 | Poucas instâncias críticas isoladas umas das outras | [Spread placement group](#placement-groups) |
 | Sistemas distribuídos com consciência de rack (HDFS, Cassandra, Kafka) | [Partition placement group](#placement-groups) |
+
+### Auto Scaling
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Manter uma métrica perto de um alvo | [Target tracking](#políticas-de-escala) |
+| Pico previsível em horário conhecido | [Scheduled actions](#políticas-de-escala) |
+| Padrão cíclico + boot demorado, escalar antes do pico | [Predictive scaling](#políticas-de-escala) |
+| Workers consumindo uma fila SQS | [Target tracking sobre backlog por instância](#políticas-de-escala) |
+| Aplicação travada não é substituída | [ELB health checks no ASG](#health-checks-e-substituição-de-instâncias) |
+| Ação antes de entrar em serviço ou de ser encerrada | [Lifecycle hooks](#ciclo-de-vida-da-instância-e-lifecycle-hooks) |
+| Instâncias demoram a ficar prontas | [Warm pool](#warm-pools-instâncias-pré-aquecidas) |
+| Trocar a AMI da frota de forma gradual | [Instance refresh](#atualizar-as-instâncias-instance-refresh) |
+| Escalar ECS, DynamoDB, Aurora ou provisioned concurrency | [Application Auto Scaling](#ec2-auto-scaling-application-auto-scaling-e-aws-auto-scaling) |
+
+### Atualização de aplicações em ASG
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Atualização gradual sem infraestrutura extra | [Instance refresh (rolling)](#1-rolling-update-no-mesmo-asg-instance-refresh) |
+| Canary simples sem mexer no load balancer | [Segundo ASG no mesmo target group](#2-segundo-asg-no-mesmo-target-group-canary-por-capacidade) |
+| % de tráfego preciso, teste isolado e rollback imediato | [Dois target groups com pesos no ALB](#3-bluegreen-com-dois-target-groups-e-pesos-no-alb) |
+| Mudança de ALB, VPC, conta ou região; isolamento total | [Ambientes completos + Route 53](#4-bluegreen-com-ambientes-completos-e-route-53) |
+| ASG novo no CloudFormation, removendo o antigo só se der certo | [AutoScalingReplacingUpdate](#ferramentas-que-implementam-essas-estratégias) |
+| Deploy imutável no Beanstalk | [Immutable](#ferramentas-que-implementam-essas-estratégias) |
 
 ### High Performance Computing
 
