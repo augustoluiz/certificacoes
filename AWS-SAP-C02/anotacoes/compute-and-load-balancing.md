@@ -7,6 +7,9 @@ servicos:
   - Application Auto Scaling
   - AWS CodeDeploy
   - AWS Elastic Beanstalk
+  - Amazon ECS
+  - AWS Fargate
+  - Amazon ECR
   - AWS ParallelCluster
   - AWS Parallel Computing Service (PCS)
   - AWS Batch
@@ -14,7 +17,7 @@ servicos:
   - Amazon File Cache
   - Amazon DCV
 criado-em: 2026-11-05
-atualizado-em: 2026-11-06
+atualizado-em: 2026-11-11
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
 tags: [sap-c02, compute, load-balancing]
 ---
@@ -28,6 +31,7 @@ tags: [sap-c02, compute, load-balancing]
 ## Índice
 
 - **Compute:** [Amazon EC2](#amazon-elastic-compute-cloud-ec2) · [Amazon EC2 Auto Scaling](#amazon-ec2-auto-scaling) · [Auto Scaling Update Strategies](#auto-scaling-update-strategies) · [Spot Instances & Spot Fleet](#spot-instances--spot-fleet) · [High Performance Computing (HPC)](#high-performance-computing-hpc)
+- **Containers:** [Containers (conceitos)](#containers) · [Amazon ECS](#amazon-elastic-container-service-ecs)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## Amazon Elastic Compute Cloud (EC2)
@@ -956,6 +960,385 @@ O diagrama abaixo mostra o padrão recomendado: um ASG com base On-Demand e esca
 
 [↑ Índice](#índice)
 
+## Containers
+
+Antes dos serviços de containers da AWS (ECS, EKS, Fargate, ECR), vale entender **o que é um container**, **que problema ele resolve** e **por que ele precisa de um orquestrador**. Nenhum desses conceitos é exclusivo da AWS: eles valem para qualquer nuvem e para o data center. Os serviços da AWS são formas diferentes de **guardar**, **executar** e **orquestrar** containers.
+
+> **Paralelo com o Lambda:** no Lambda, a AWS cuida de quase tudo que um container resolve. Ela empacota o runtime (Node, Python, Java), isola cada execução em um ambiente próprio e garante que o código rode igual em todo lugar. Um container é a forma de ter esse **mesmo pacote isolado e portátil** para **qualquer** aplicação: um servidor que fica no ar o tempo todo, um runtime que o Lambda não oferece, um binário legado. Você inclusive já pode ter usado containers sem perceber: o Lambda aceita **container images** (até 10 GB) como pacote de deploy.
+
+### O problema que os containers resolvem
+
+Antes dos containers, colocar uma aplicação em produção significava **preparar o servidor**: instalar a versão certa do runtime, as bibliotecas do sistema, as dependências e os arquivos de configuração. Isso gerava três problemas clássicos:
+
+- **"Na minha máquina funciona":** o notebook do desenvolvedor, o servidor de testes e a produção tinham versões ligeiramente diferentes de tudo. Bugs apareciam só em produção.
+- **Conflito de dependências:** duas aplicações no mesmo servidor precisavam de versões diferentes da mesma biblioteca (ex: Python 3.9 e 3.12). Para evitar conflito, cada aplicação ganhava o **seu próprio servidor ou VM**, que ficava subutilizado.
+- **Deploy lento e frágil:** atualizar significava rodar scripts de instalação em cada servidor, com chance de falhar no meio e deixar a frota em um estado misto.
+
+Um container resolve isso empacotando a aplicação **junto com tudo que ela precisa** em um artefato único, imutável e versionado: a **imagem**. O servidor só precisa saber **rodar containers**. O que está dentro de cada um não importa para ele.
+
+> **Como pensar:** é o **contêiner de navio**. Antes dele, cada carga (sacos, caixas, barris) exigia um jeito diferente de embarcar. Com uma caixa de tamanho padrão, qualquer navio, guindaste ou caminhão transporta qualquer carga sem saber o que tem dentro. O container de software faz o mesmo: qualquer host que roda containers executa qualquer aplicação empacotada.
+
+[↑ Índice](#índice)
+
+### Container vs. máquina virtual
+
+As duas tecnologias isolam aplicações, mas em **camadas diferentes**:
+
+- **Máquina virtual:** o **hypervisor** divide o hardware físico em várias VMs. Cada VM tem um **sistema operacional completo** (kernel incluído), como um computador inteiro. É um isolamento forte, mas pesado: cada VM ocupa gigabytes, consome memória com o próprio SO e leva dezenas de segundos ou minutos para iniciar.
+- **Container:** todos os containers de um host **compartilham o kernel** do sistema operacional desse host. Cada container é só um **processo** (ou grupo de processos) que **enxerga** um ambiente próprio. É leve: imagens de megabytes, início em **segundos ou menos** e dezenas de containers na mesma instância.
+
+Como o kernel isola esses processos:
+
+- **Namespaces:** fazem cada container ver **a sua própria versão** dos recursos do sistema. Ele vê os próprios processos (o processo principal é o PID 1), a própria rede e IP, o próprio sistema de arquivos e o próprio hostname. Ele não enxerga os processos e arquivos dos outros containers.
+- **Cgroups** (*control groups*): **limitam** quanto de CPU e memória cada container pode usar. São eles que fazem valer o "0,5 vCPU e 1 GB" de uma task definition. Um container que passa do limite de memória é encerrado (*OOM kill*), sem afetar os vizinhos.
+
+| | **Máquina virtual** | **Container** |
+|---|---|---|
+| O que isola | Um computador inteiro (hardware virtual + SO completo) | Um processo (sistema de arquivos, rede, processos, limites) |
+| Sistema operacional | Um SO **por VM** | Kernel **compartilhado** com o host |
+| Tamanho típico | Gigabytes | Megabytes a poucos gigabytes |
+| Tempo para iniciar | Dezenas de segundos a minutos | Segundos ou menos |
+| Isolamento | **Forte** (fronteira de hardware virtual) | Mais fraco (o kernel é compartilhado) |
+| Na AWS | Instância EC2 | Task ECS, pod EKS, container no Fargate |
+
+**Containers rodam dentro de VMs.** Na AWS, um container no ECS ou no EKS com EC2 roda **dentro de uma instância EC2**, que é uma VM. Os dois níveis se complementam: a VM isola **clientes e ambientes**, e o container empacota e isola **aplicações** dentro dela. É também por isso que um container precisa de um kernel compatível: imagens **Linux** rodam em hosts Linux, imagens **Windows** em hosts Windows, e imagens **arm64** em processadores ARM, como o Graviton. Imagens **multi-arquitetura** trazem as duas versões, x86 e ARM, sob a mesma tag.
+
+> **Obs:** Como o kernel é compartilhado, o isolamento entre containers no mesmo host é **mais fraco** do que entre VMs. Por isso, o **Lambda** e o **Fargate** não colocam cargas de clientes diferentes apenas em containers lado a lado: cada execução ou task ganha uma camada de virtualização própria. No Lambda, são as **microVMs Firecracker**, VMs mínimas que iniciam em milissegundos. No ECS com EC2, a fronteira de segurança entre aplicações que não confiam umas nas outras deve ser a **instância** ou a **conta**, e não o container.
+
+![Diagrama Containers - Máquina virtual vs. container](./img/aws-containers/aws-containers-01.png)
+
+[↑ Índice](#índice)
+
+### Imagens, camadas e registries
+
+- **Imagem:** o pacote **imutável** a partir do qual os containers são criados: o sistema de arquivos com o runtime, as bibliotecas, o código e os metadados (comando de início, portas, variáveis). Um **container** é uma imagem **em execução**. Da mesma imagem, saem quantos containers você quiser.
+- **Dockerfile:** a "receita" da imagem, um arquivo de texto com os passos para construí-la:
+
+```dockerfile
+FROM public.ecr.aws/docker/library/node:22-slim   # imagem base: SO mínimo + Node.js
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev                            # instala as dependências
+COPY src/ ./src/                                 # copia o código
+EXPOSE 8080
+CMD ["node", "src/server.js"]                    # processo principal do container
+```
+
+- **Camadas** (*layers*): cada instrução do Dockerfile gera uma **camada** somente leitura, empilhada sobre a anterior. Elas são **reaproveitadas**: dez imagens com a mesma base guardam a base uma vez só, e um deploy que só mudou o código baixa só a **última camada**. Por isso, as instruções que mudam pouco (base, dependências) ficam no início do Dockerfile, e o código, que muda sempre, fica no fim.
+- **Camada gravável:** ao iniciar, o container ganha uma camada **gravável** por cima da imagem (*copy-on-write*). Tudo o que ele grava vai para essa camada, que **desaparece quando o container é removido**. Daí vem a regra de que containers são **efêmeros**: estado que precisa durar vai para fora (banco de dados, S3, EFS).
+- **Tags e digests:** a imagem é identificada por um **repositório + tag** (ex: `api:1.4.2`) ou, de forma imutável, pelo **digest** (um hash SHA-256 do conteúdo). Uma tag pode ser **movida** para outra imagem, como acontece com a `latest`. O digest nunca muda. Em produção, use tags de versão, e não a `latest`, ou configure **tag immutability** no registry.
+- **Registry:** o "repositório de pacotes" das imagens. Nele, o CI publica (**push**) e os hosts baixam (**pull**). Pode ser público (Docker Hub, ECR Public) ou privado. Na AWS, é o **Amazon ECR** (ver [Amazon ECR](#amazon-ecr-elastic-container-registry)).
+- **Padrão OCI:** imagens e runtimes seguem a especificação aberta da **Open Container Initiative**. Uma imagem construída com Docker roda no ECS, no EKS, no Lambda ou em qualquer outra plataforma compatível. O "Docker" virou quase sinônimo de container, mas é só uma das ferramentas desse ecossistema (outras: containerd, Podman, BuildKit).
+
+**O ciclo de vida de uma imagem:**
+
+1. **Build:** a imagem é construída a partir do Dockerfile, normalmente no pipeline de CI (CodeBuild, GitHub Actions).
+2. **Scan:** a imagem passa por uma varredura de vulnerabilidades, por exemplo o scanning do ECR com o Inspector.
+3. **Push:** a imagem é publicada no registry com uma tag de versão.
+4. **Pull:** cada host que vai executar a aplicação baixa a imagem do registry, ou só as camadas que ainda não tem.
+5. **Run:** o host cria containers a partir dela.
+
+![Diagrama Containers - Camadas da imagem e ciclo build, push, pull e run](./img/aws-containers/aws-containers-02.png)
+
+> **Paralelo com o Lambda:** a imagem equivale a uma **versão publicada** de uma função: um artefato imutável que você promove de ambiente em ambiente. O ECR equivale ao lugar onde o Lambda guarda o código de cada versão. E a regra "containers são efêmeros, estado vai para fora" é a mesma regra do Lambda, em que o `/tmp` não é confiável entre execuções.
+
+[↑ Índice](#índice)
+
+### Boas práticas para aplicações em containers
+
+A metodologia **twelve-factor app** resume como uma aplicação deve se comportar para rodar bem em containers. Os pontos principais:
+
+- **Stateless:** nada de estado importante no disco ou na memória do container. Sessões, uploads e dados ficam em ElastiCache, DynamoDB, RDS, S3 ou EFS. Assim, qualquer container pode ser destruído e recriado a qualquer momento.
+- **Configuração por ambiente:** a **mesma imagem** vai do desenvolvimento à produção. O que muda entre ambientes (URLs, credenciais, *feature flags*) entra por **variáveis de ambiente** ou por **segredos** injetados na hora de iniciar, e não é gravado na imagem.
+- **Logs no stdout/stderr:** o container escreve os logs na saída padrão, e a plataforma os coleta (ex: CloudWatch Logs). Não escreve em arquivos locais que somem com o container.
+- **Um processo principal por container:** cada container faz uma coisa, como a API ou o worker. Auxiliares, como um agente de logs ou um proxy, vão em containers separados na mesma task ou pod, os **sidecars**.
+- **Início rápido e desligamento gracioso:** ao receber o sinal **SIGTERM**, que é o que o orquestrador envia antes de parar o container (e o que o Fargate Spot envia antes da interrupção), a aplicação termina as requisições em andamento e encerra.
+- **Imagens pequenas e seguras:** imagens base mínimas (`slim`, *distroless*), sem ferramentas desnecessárias, rodando com **usuário não-root**, e reconstruídas com frequência para incluir patches de segurança.
+
+[↑ Índice](#índice)
+
+### Por que é preciso um orquestrador
+
+Rodar **um** container é simples: `docker run`. Rodar **centenas**, de dezenas de serviços, em várias máquinas e AZs, não é. Alguém precisa responder continuamente:
+
+- **Agendamento:** em **qual host** cada container vai rodar, considerando a CPU e a memória livres?
+- **Autorrecuperação:** se um container cai ou um host morre, quem **cria outro** no lugar?
+- **Escala:** quem aumenta e diminui o número de containers conforme a demanda?
+- **Rede:** como os containers recebem endereço, como o load balancer os encontra e como os serviços se encontram entre si (*service discovery*)?
+- **Deploy:** como trocar a versão de todos os containers sem indisponibilidade, e voltar atrás se der errado?
+- **Configuração e segredos:** como entregar a cada container as variáveis e credenciais certas?
+
+O **orquestrador** é o sistema que faz tudo isso. Você **declara** o estado desejado ("quero 6 containers da imagem `api:1.5`, com 1 vCPU cada, atrás deste ALB"), e ele trabalha continuamente para que a realidade bata com a declaração. Os dois orquestradores da AWS são:
+
+- **Amazon ECS:** orquestrador **próprio da AWS**, mais simples e integrado nativamente a IAM, ALB, CloudWatch e Service Connect.
+- **Amazon EKS:** **Kubernetes** gerenciado. É o padrão de mercado, portável entre nuvens e on-premises, com um ecossistema enorme (Helm, operators), mas é mais complexo de operar.
+
+[↑ Índice](#índice)
+
+### Containers na AWS: o mapa
+
+Os serviços de containers da AWS se organizam em **camadas**. Quase toda escolha de arquitetura com containers é uma combinação de uma opção de cada camada:
+
+| Camada | Pergunta | Opções na AWS |
+|---|---|---|
+| **Registry** | Onde guardo as imagens? | **Amazon ECR** (privado e público) |
+| **Orquestração** | Quem decide onde e quantos containers rodam? | **Amazon ECS** ou **Amazon EKS** |
+| **Computação** | Em que máquinas os containers rodam? | **EC2** (você gerencia), **Fargate** (serverless, sem servidores), **ECS Managed Instances / EKS Auto Mode** (EC2 gerenciado pela AWS), **on-premises** (ECS Anywhere, EKS Hybrid Nodes) |
+| **Serviços que usam containers por baixo** | Não quero orquestrar nada | **AWS Lambda** (container images), **AWS Batch** (jobs), **Elastic Beanstalk** (Docker) |
+
+![Diagrama Containers - Containers na AWS: registry, orquestração e computação](./img/aws-containers/aws-containers-03.png)
+
+> **Paralelo com o Lambda:** pense em uma escala de "quanto eu gerencio":
+> 1. **Lambda:** só o código ou a imagem.
+> 2. **ECS/EKS + Fargate:** a imagem, a CPU e a memória de cada task, e a escala.
+> 3. **ECS/EKS + EC2:** tudo isso mais as instâncias: AMI, patches e capacidade do cluster.
+>
+> Quanto mais para baixo nessa escala, mais controle (GPU, tipos de instância, custo em escala) e mais trabalho operacional. Em questões que pedem "menor esforço operacional", a resposta costuma estar o mais alto possível nessa escala.
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Garantir que a aplicação rode igual em desenvolvimento, teste e produção" → **containers** (mesma imagem em todos os ambientes, com configuração por variáveis e segredos).
+- "Modernizar uma aplicação legada com o **mínimo de mudanças**" → **containerizar** a aplicação como está (*lift and shift* para containers) e rodar no **ECS/Fargate**. O **AWS App2Container** gera a imagem e a task definition a partir de aplicações Java e .NET existentes.
+- "Isolar fortemente cargas de clientes diferentes" → separar por **instância** ou **conta**, ou usar **Fargate**, que isola cada task, e não apenas containers lado a lado no mesmo host.
+- "Imagem para instâncias **Graviton**" → imagem **arm64** ou **multi-arquitetura**.
+- "Reduzir o tempo de deploy e de download das imagens" → **imagens pequenas** e Dockerfile ordenado para aproveitar o **cache de camadas**.
+- "Garantir que a tag de produção sempre aponte para a mesma imagem" → **tag immutability** no ECR (ou deploy por **digest**).
+- "Containers perdem os dados ao reiniciar" → estado em serviço externo (**EFS**, **S3**, banco de dados). A camada gravável do container é efêmera.
+- "Containers com o **menor esforço operacional**" → orquestrador gerenciado + **Fargate**. "Equipe já usa **Kubernetes**" → **EKS**.
+
+[↑ Índice](#índice)
+
+## Amazon Elastic Container Service (ECS)
+
+O **Amazon ECS** é o orquestrador de **containers** da AWS. Ele decide **onde** cada container roda, mantém a quantidade certa rodando, substitui os que falham, conecta-os ao load balancer e faz deploy de versões novas. É um serviço **regional**, sem custo próprio: paga-se a computação usada, seja EC2 ou Fargate.
+
+Na SAP-C02, o ECS aparece principalmente em três tipos de questão:
+- **modernização**: levar uma aplicação monolítica ou on-premises para containers;
+- **escolha de computação**: EC2, Fargate ou Lambda;
+- **detalhes de arquitetura**: as roles IAM corretas, a rede, a escala e o deploy sem indisponibilidade.
+
+> **Paralelo com o Lambda:** você já conhece metade do ECS sem saber. O Lambda também roda o seu código em um ambiente isolado que a AWS gerencia, e aceita **container images** como pacote de deploy. A diferença está no **modelo de execução**:
+> - **Lambda:** um handler acionado por evento, que roda no máximo 15 minutos e é cobrado por invocação.
+> - **ECS:** um **processo que fica rodando**, como um servidor web, um worker ou uma API, sem limite de tempo, com a CPU e a memória que você definir, e cobrado pelo tempo em que a task fica no ar.
+>
+> O **ECS com Fargate** é o ponto mais próximo do serverless no mundo de containers. Você entrega a imagem, diz quanta CPU e memória quer, e não gerencia servidores.
+
+> **Pré-requisito:** os conceitos de container, imagem, registry e orquestração estão na seção [Containers](#containers).
+
+### Componentes do ECS
+
+| Componente | O que é | Paralelo com o Lambda |
+|---|---|---|
+| **Cluster** | Agrupamento lógico onde tasks e serviços rodam. Pode usar instâncias EC2, Fargate ou ambos | Não existe: o Lambda não expõe essa camada |
+| **Task definition** | O "molde" da aplicação, em JSON: imagem(ns), **CPU e memória**, portas, variáveis de ambiente, segredos, volumes, **roles IAM**, modo de rede, logs. É **versionada** por *revisões* (`api:1`, `api:2`...) | A **configuração** da função + a versão publicada |
+| **Task** | Uma **instância em execução** da task definition. Pode ter **um ou vários containers** que rodam juntos, compartilhando rede e volumes (ex: a aplicação + um *sidecar* de logs) | Um ambiente de execução do Lambda |
+| **Service** | Mantém **N tasks** de uma task definition sempre rodando (*desired count*), substitui as que falham, registra-as no **load balancer**, escala e faz **deploy** de revisões novas | O alias com escala e deploy gerenciados |
+| **Standalone task** | Uma task executada **uma vez** (`RunTask`), sem service, que termina quando o processo acaba. Usada para jobs, migrações e tarefas agendadas | Uma invocação, mas sem o limite de 15 min |
+| **Container agent** | Processo que roda em cada instância EC2 do cluster e conversa com o ECS. Não existe no Fargate | — |
+
+![Diagrama Amazon ECS - Componentes](./img/amazon-ecs/amazon-ecs-01.png)
+
+**Estratégias de agendamento** (*scheduling*) de um service:
+
+- **REPLICA** (padrão): mantém o número desejado de tasks, distribuídas pelas AZs.
+- **DAEMON:** roda **exatamente uma task em cada instância EC2** do cluster. Serve para agentes de monitoramento, coletores de logs e segurança. Só existe com EC2, porque no Fargate não há instâncias.
+
+[↑ Índice](#índice)
+
+### Onde as tasks rodam: EC2, Fargate e capacity providers
+
+Toda task precisa de CPU e memória **de algum lugar**. O ECS oferece três modelos:
+
+| | **EC2** | **Fargate** | **ECS Managed Instances** |
+|---|---|---|---|
+| Quem gerencia os servidores | **Você**: AMI otimizada para ECS, patches, escala do cluster (ASG) | **A AWS**: não há instâncias visíveis; cada task roda em um ambiente isolado próprio | **A AWS** provisiona, atualiza e escala instâncias EC2 para você |
+| Cobrança | Pelas **instâncias**, mesmo com espaço sobrando | Por **vCPU e memória da task**, por segundo | Pelas instâncias + taxa de gerenciamento |
+| Densidade e custo em escala | Alta: várias tasks por instância. Combina com Savings Plans, RIs e Spot | Sem desperdício por task, mas o preço por vCPU é maior | Intermediária |
+| GPU, tipos de instância específicos | **Sim** | **Não** (sem GPU) | Sim |
+| Acesso ao host, privileged, DAEMON, placement strategies | **Sim** | Não | Limitado |
+| Spot | EC2 Spot (via ASG) | **Fargate Spot** | Sim |
+| Quando escolher | Controle fino, GPU, grande escala com custo otimizado, requisitos de host | **Padrão** para a maioria das cargas: menor esforço operacional | Quer EC2 (GPU, tipos específicos) sem gerenciar instâncias |
+
+- **Fargate**, em mais detalhes: cada task recebe um ambiente isolado com a CPU e a memória da task definition, até 16 vCPUs e 120 GiB. Tem **armazenamento efêmero** de 20 GiB (expansível até 200 GiB) e sempre usa a rede **awsvpc**. O **Fargate Spot** custa até ~70% menos e avisa a task com um `SIGTERM` **2 minutos** antes da interrupção.
+- **ECS Managed Instances** é um recurso recente: o ECS escolhe e gerencia as instâncias EC2 a partir de requisitos (vCPU, memória, GPU), aplicando patches e trocando as instâncias periodicamente.
+- **ECS Anywhere:** registra **servidores on-premises** ou de outras nuvens no cluster (tipo `EXTERNAL`), com o agente do SSM e do ECS. Útil em migrações híbridas e para processar dados que precisam ficar no data center.
+
+**Capacity providers:** definem **de onde vem a capacidade** de um service e em que proporção.
+
+- **Tipos:** `FARGATE`, `FARGATE_SPOT`, ou um **ASG** de instâncias EC2.
+- **Capacity provider strategy:** uma **base** (o mínimo de tasks que sempre vai para aquele provider) e **pesos** (a proporção do resto). Exemplo: base 2 em `FARGATE` + peso 1 em `FARGATE` + peso 3 em `FARGATE_SPOT` significa que as 2 primeiras tasks rodam em Fargate e, das seguintes, 1 em cada 4 vai para Fargate e 3 para Fargate Spot.
+- **Managed scaling** (para ASGs): o ECS ajusta o tamanho do ASG conforme as tasks pendentes. É o *cluster auto scaling*.
+- **Managed termination protection:** impede que o ASG encerre instâncias que ainda têm tasks rodando.
+
+![Diagrama Amazon ECS - EC2, Fargate e capacity providers](./img/amazon-ecs/amazon-ecs-02.png)
+
+> **Paralelo com o Lambda:** a capacity provider strategy com `FARGATE` + `FARGATE_SPOT` é o mesmo raciocínio de base On-Demand + escala em Spot da seção [Spot](#spot-instances--spot-fleet), só que sem gerenciar instâncias.
+
+[↑ Índice](#índice)
+
+### Rede: network modes
+
+O *network mode* da task definition define **como os containers recebem endereço de rede**:
+
+- **awsvpc** (recomendado; **obrigatório no Fargate**): cada task recebe **sua própria ENI**, com um **IP privado da VPC** e **security groups próprios**. A task se comporta como uma instância na rede: regras de firewall por serviço, flow logs por task e acesso direto a recursos da VPC.
+  - **Limite no EC2:** cada instância tem um número máximo de ENIs, que limita quantas tasks awsvpc cabem nela. O **ENI trunking** aumenta esse limite nas instâncias compatíveis.
+- **bridge** (padrão histórico no EC2 Linux): os containers ficam em uma rede virtual do Docker dentro da instância e são expostos por **mapeamento de portas**. Com **mapeamento dinâmico** (host port 0), cada container recebe uma porta aleatória da instância, e o **ALB** registra o par instância:porta no target group. Isso permite **várias tasks iguais na mesma instância**. Todas compartilham o security group da instância.
+- **host:** o container usa a rede da instância diretamente, sem isolamento. A porta do container é a porta da instância, então só uma task por porta por instância.
+- **none:** sem rede externa.
+
+![Diagrama Amazon ECS - Network modes awsvpc e bridge](./img/amazon-ecs/amazon-ecs-03.png)
+
+> **Paralelo com o Lambda:** uma função Lambda **em VPC** usa ENIs gerenciadas e security groups, assim como uma task **awsvpc**. A diferença é que no ECS cada task tem a sua ENI.
+
+[↑ Índice](#índice)
+
+### IAM: task role vs. task execution role
+
+Esse é um dos pontos **mais cobrados** sobre ECS. Há **duas roles** na task definition, usadas por **quem** é diferente:
+
+| | **Task execution role** | **Task role** |
+|---|---|---|
+| Quem usa | O **ECS/Fargate** (o agente), para **preparar** a task | O **código da aplicação**, dentro do container |
+| Para quê | **Baixar a imagem** do ECR, enviar logs ao **CloudWatch Logs**, buscar **segredos** no Secrets Manager/Parameter Store para injetar como variáveis | Chamar serviços da AWS: ler o S3, gravar no DynamoDB, publicar no SNS... |
+| Erro típico se faltar permissão | A task **não inicia**: `CannotPullContainerError`, erro ao buscar segredo | A task sobe, mas a aplicação recebe **AccessDenied** |
+
+- **Como a aplicação recebe as credenciais da task role:** o SDK as busca automaticamente em um endpoint local do ECS (variável `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`). São temporárias e rotacionadas, como no instance profile do EC2 (ver [Instance metadata (IMDS) e IAM](#instance-metadata-imds-e-iam)).
+- **Menor privilégio por serviço:** cada task definition tem a **sua** task role. A API de pagamentos e o worker de e-mails têm permissões diferentes, mesmo rodando na **mesma instância**.
+- **Cuidado no EC2:** a instância também tem uma role (*container instance role*, usada pelo agente para se registrar no cluster). Por padrão, um container pode alcançar o **IMDS** da instância e usar essa role. Isso deve ser **bloqueado**, com o IMDSv2 com *hop limit* 1 ou com a configuração do agente que bloqueia o IMDS nas tasks, para que cada task use só a **sua** task role.
+
+![Diagrama Amazon ECS - Task execution role vs. task role](./img/amazon-ecs/amazon-ecs-04.png)
+
+> **Paralelo com o Lambda:** a **task role** é a **execution role** do Lambda: a permissão que o seu código usa. A *task execution role* do ECS não tem equivalente no Lambda, porque lá é a própria AWS que baixa o código e envia os logs. O nome parecido é uma armadilha: a "execution role" do Lambda corresponde à **task role** do ECS.
+
+[↑ Índice](#índice)
+
+### Load balancing e comunicação entre serviços
+
+- **Application Load Balancer:** o padrão para HTTP/HTTPS. Um único ALB pode atender **vários services** com regras de **path** (`/api` → service A, `/web` → service B) ou de **host**. Cada service registra suas tasks no seu target group (IP no awsvpc, instância:porta no bridge).
+- **Network Load Balancer:** TCP/UDP, desempenho extremo, IP estático, ou quando o service precisa ser exposto via **PrivateLink**.
+- **Service discovery** (comunicação entre serviços sem load balancer):
+  - **ECS Service Connect** (recomendado): os serviços se chamam por **nomes curtos** (ex: `http://pedidos:8080`) dentro de um *namespace* do **Cloud Map**. O ECS injeta um proxy (Envoy) gerenciado em cada task, que faz balanceamento, *retries*, *timeouts* e coleta **métricas de tráfego** entre serviços, sem alterar o código.
+  - **Cloud Map** direto: registra as tasks em registros **DNS** (ou na API do Cloud Map) para outros serviços as encontrarem.
+  - **VPC Lattice:** conecta serviços entre VPCs e contas, com autenticação IAM.
+  - O **AWS App Mesh** foi **descontinuado**, com o fim do suporte anunciado para setembro de 2026. Em cenários novos, a resposta é **Service Connect** ou **VPC Lattice**.
+
+[↑ Índice](#índice)
+
+### Auto Scaling no ECS: dois níveis
+
+Escalar no ECS significa escalar **duas coisas diferentes**:
+
+1. **Tasks (service auto scaling):** quantas tasks o service roda. Usa o **Application Auto Scaling** com target tracking (CPU média do service, memória média ou **requisições por target** do ALB), step scaling ou scheduled scaling. Para workers que consomem filas, usa-se o **backlog por task** (ver [Políticas de escala](#políticas-de-escala)).
+2. **Capacidade (cluster auto scaling):** só no **EC2**. Se o service quer mais tasks e as instâncias estão cheias, as tasks novas ficam **pendentes** (`PROVISIONING`). O **managed scaling** do capacity provider usa a métrica **CapacityProviderReservation** (capacidade necessária ÷ capacidade existente) e ajusta o ASG para mantê-la no alvo (ex: 100%).
+
+No **Fargate**, só existe o nível 1: cada task nova já vem com a sua capacidade.
+
+![Diagrama Amazon ECS - Auto Scaling em dois níveis](./img/amazon-ecs/amazon-ecs-05.png)
+
+> **Paralelo com o Lambda:** o Lambda escala sozinho a cada requisição, sem nenhuma política. No ECS com Fargate, você define **a regra** (ex: manter a CPU em 60%) e a AWS cuida da capacidade. No ECS com EC2, você também cuida de ter **instâncias suficientes** para as tasks.
+
+[↑ Índice](#índice)
+
+### Deploy de novas versões
+
+Atualizar um service significa apontá-lo para uma **nova revisão** da task definition, normalmente com uma nova tag de imagem. As estratégias seguem os mesmos conceitos de [Auto Scaling Update Strategies](#auto-scaling-update-strategies):
+
+- **Rolling update** (padrão): substitui as tasks aos poucos, controlado por dois parâmetros:
+  - **`minimumHealthyPercent`:** quantas tasks precisam continuar saudáveis. Ex: 100% significa não derrubar nenhuma antes de a nova estar pronta.
+  - **`maximumPercent`:** quantas tasks podem existir durante o deploy. Ex: 200% permite subir todas as novas antes de remover as antigas.
+- **Deployment circuit breaker:** se as tasks novas não ficam saudáveis (falham ao iniciar, falham no health check), o ECS **para o deploy** e, com *rollback* habilitado, **volta à última revisão que funcionava**. Alarmes do CloudWatch também podem disparar o rollback.
+- **Blue/green:** dois target groups e a troca do tráfego no ALB. Pode ser feito com o **AWS CodeDeploy** (configurações *all at once*, **canary** e **linear**, com hooks de teste e rollback automático) ou com o blue/green **nativo do ECS**, um recurso recente que dispensa o CodeDeploy e também oferece canary e linear.
+
+[↑ Índice](#índice)
+
+### Armazenamento em containers
+
+Containers são **efêmeros**: o que é gravado no sistema de arquivos do container **some** quando a task termina. Para persistir ou compartilhar dados:
+
+| Opção | Características | Uso |
+|---|---|---|
+| **Armazenamento efêmero** da task | Fargate: 20 GiB, expansível até 200 GiB. Some com a task | Arquivos temporários, cache local |
+| **Amazon EFS** | Sistema de arquivos **compartilhado** entre tasks e AZs, **persistente**, funciona no **Fargate** e no EC2 | Conteúdo compartilhado, uploads, dados que sobrevivem às tasks |
+| **Volumes EBS** por task | Um volume EBS criado e anexado a **cada task** no deploy (Fargate e EC2) | Cargas com muito I/O que precisam de disco de bloco próprio por task |
+| **Bind mounts / volumes Docker** (EC2) | Pastas da instância montadas no container | Compartilhar arquivos entre containers da mesma task (ex: app + sidecar) |
+| **FSx for Windows File Server** | Compartilhamento SMB | Containers **Windows** |
+
+[↑ Índice](#índice)
+
+### Configuração, segredos e observabilidade
+
+- **Segredos:** declarados na task definition como referências ao **Secrets Manager** ou ao **SSM Parameter Store**. O ECS os busca, usando a **task execution role**, e os injeta como **variáveis de ambiente** no início da task. O valor nunca fica gravado na task definition. Arquivos de variáveis também podem vir do **S3** (`environmentFiles`).
+- **Logs:** o driver **`awslogs`** envia o stdout/stderr dos containers ao **CloudWatch Logs**. O **FireLens** (um sidecar com Fluent Bit) envia para outros destinos: S3, OpenSearch, Firehose ou ferramentas de terceiros.
+- **Métricas:** **CloudWatch Container Insights** (CPU, memória, rede e disco por cluster, service e task).
+- **Tracing:** **AWS X-Ray** ou **OpenTelemetry (ADOT)**, normalmente como sidecar.
+- **ECS Exec:** abre um shell ou executa comandos **dentro de um container em execução**, via SSM, sem SSH e com auditoria no CloudTrail. É o equivalente ao Session Manager para containers.
+
+[↑ Índice](#índice)
+
+### Amazon ECR (Elastic Container Registry)
+
+O registry de imagens da AWS, integrado ao IAM. Os pontos que caem na prova:
+
+- **Repositórios privados** (com políticas IAM e políticas de repositório para **acesso entre contas**) e **ECR Public**.
+- **Image scanning:** *basic* ou *enhanced*, com o **Amazon Inspector**, que procura vulnerabilidades (CVEs) nas imagens, inclusive de forma contínua.
+- **Replicação** entre **regiões** e entre **contas**, para DR e para reduzir a latência de *pull* em ambientes multi-região.
+- **Lifecycle policies:** apagam automaticamente imagens antigas ou sem tag, reduzindo custo.
+- **Tag immutability:** impede sobrescrever uma tag existente (ex: `1.4.2`), garantindo que a mesma tag sempre aponte para a mesma imagem.
+- **Pull through cache:** espelha imagens de registries públicos (Docker Hub, ECR Public, Quay...) no ECR privado. Evita limites de taxa e dependência da internet.
+- **Acesso privado:** com **VPC endpoints** do ECR (`ecr.api`, `ecr.dkr`) e do **S3** (gateway, porque as camadas das imagens ficam no S3), tasks em subnets privadas baixam imagens **sem NAT Gateway**.
+
+[↑ Índice](#índice)
+
+### Padrões comuns com ECS
+
+- **Tarefas agendadas:** o **EventBridge Scheduler** executa uma standalone task em um horário (ex: um relatório diário). É a alternativa ao Lambda quando o job passa de 15 minutos.
+- **Tarefas orientadas a eventos:** um arquivo chega no S3 → uma regra do **EventBridge** → `RunTask` processa o arquivo. O **Step Functions** também executa tasks ECS como etapas de um fluxo, esperando a conclusão.
+- **Workers de fila:** um service lê uma fila **SQS** e escala pelo **backlog por task**.
+- **Sidecar:** um container auxiliar na mesma task: proxy, agente de logs (FireLens), coletor de métricas.
+- **Placement** (só no EC2): as **placement strategies** (`binpack` para usar o mínimo de instâncias, `spread` por AZ ou instância para alta disponibilidade, `random`) e as **constraints** (`distinctInstance`, ou `memberOf` com expressões, como "só em instâncias com GPU") definem em qual instância cada task cai.
+
+[↑ Índice](#índice)
+
+### ECS, EKS, Fargate ou Lambda?
+
+| Situação | Escolha |
+|---|---|
+| Containers com o **menor esforço operacional**, integração nativa com a AWS | **ECS + Fargate** |
+| Equipe já usa **Kubernetes**, precisa de portabilidade entre nuvens/on-premises ou do ecossistema K8s (Helm, operators) | **EKS** (com nós EC2 ou Fargate) |
+| Containers com **GPU**, tipos de instância específicos ou o menor custo em grande escala | **ECS no EC2** (ou ECS Managed Instances) com Savings Plans/Spot |
+| Código **acionado por eventos**, de curta duração (< 15 min), com tráfego irregular ou que escala até zero | **Lambda** |
+| Processo longo, servidor que fica ouvindo conexões (WebSocket, gRPC), ou dependências do sistema operacional | **ECS** |
+| Jobs batch com filas, prioridades e dependências | **AWS Batch** (que roda sobre ECS/EKS) |
+| Levar uma aplicação legada para containers sem reescrever | **ECS** (com o **App2Container** para gerar a imagem e a task definition) |
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Rodar containers **sem gerenciar servidores**" → **ECS com Fargate**.
+- "Containers com **GPU**" → **ECS no EC2** (Fargate não tem GPU).
+- "Menor custo para containers tolerantes a interrupção" → **Fargate Spot** (ou EC2 Spot via capacity provider), com uma **base** em Fargate/On-Demand na capacity provider strategy.
+- "A task **não inicia** e o erro é ao baixar a imagem ou ao buscar o segredo" → permissão na **task execution role**. "A aplicação recebe **AccessDenied** ao acessar o S3" → **task role**.
+- "Permissões diferentes para cada serviço na mesma instância" → uma **task role** por task definition, e bloquear o acesso das tasks ao **IMDS** da instância.
+- "Security group **por serviço**" → network mode **awsvpc**.
+- "Várias tasks iguais na **mesma instância EC2** atrás de um ALB" → network mode **bridge** com **mapeamento dinâmico de portas** (ou awsvpc com ENI trunking).
+- "Um agente de monitoramento em **cada instância** do cluster" → service com estratégia **DAEMON**.
+- "Tasks novas ficam **pendentes** por falta de capacidade no cluster EC2" → **capacity provider** com **managed scaling**.
+- "Escalar o número de tasks pela CPU ou pelas requisições" → **service auto scaling** (Application Auto Scaling) com target tracking.
+- "Deploy que **volta sozinho** se as tasks novas não ficarem saudáveis" → **deployment circuit breaker** com rollback. "Canary/linear com rollback automático" → **blue/green** com CodeDeploy ou o nativo do ECS.
+- "Comunicação entre microsserviços por nome, com métricas e retries, sem alterar o código" → **ECS Service Connect**. "App Mesh" em cenário novo → **não**: foi descontinuado.
+- "Dados **compartilhados e persistentes** entre tasks no Fargate" → **EFS**.
+- "Injetar senhas sem gravá-las na task definition" → referências ao **Secrets Manager/Parameter Store**.
+- "Abrir um shell em um container em produção, com auditoria" → **ECS Exec**.
+- "Tasks em subnet privada sem NAT precisam baixar imagens" → **VPC endpoints** do ECR (`api` e `dkr`) + **gateway endpoint do S3**.
+- "Imagens disponíveis em outra região para DR" → **replicação** do ECR. "Encontrar vulnerabilidades nas imagens" → **enhanced scanning** (Inspector).
+- "Rodar containers gerenciados pelo ECS **on-premises**" → **ECS Anywhere**.
+- "Job agendado que dura mais de 15 minutos" → **ECS task** via **EventBridge Scheduler** (em vez de Lambda).
+
+[↑ Índice](#índice)
+
 ## High Performance Computing (HPC)
 
 **HPC** (*High Performance Computing*, computação de alto desempenho) é usar **muitos computadores trabalhando juntos** para resolver um problema grande demais para uma máquina só. O problema é dividido em milhares de pedaços, cada núcleo calcula um pedaço, e os resultados são combinados no final. Exemplos: previsão do tempo, simulação de colisão de carros, aerodinâmica (**CFD**, *Computational Fluid Dynamics*), sequenciamento genômico, descoberta de medicamentos, análise sísmica, risco financeiro e renderização de filmes.
@@ -1350,6 +1733,20 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Mudança de ALB, VPC, conta ou região; isolamento total | [Ambientes completos + Route 53](#4-bluegreen-com-ambientes-completos-e-route-53) |
 | ASG novo no CloudFormation, removendo o antigo só se der certo | [AutoScalingReplacingUpdate](#ferramentas-que-implementam-essas-estratégias) |
 | Deploy imutável no Beanstalk | [Immutable](#ferramentas-que-implementam-essas-estratégias) |
+
+### Containers (ECS)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Containers sem gerenciar servidores | [ECS + Fargate](#onde-as-tasks-rodam-ec2-fargate-e-capacity-providers) |
+| Containers com GPU ou custo mínimo em grande escala | [ECS no EC2](#onde-as-tasks-rodam-ec2-fargate-e-capacity-providers) |
+| Task não inicia (imagem/segredo) vs. AccessDenied na aplicação | [Task execution role vs. task role](#iam-task-role-vs-task-execution-role) |
+| Security group por serviço | [awsvpc](#rede-network-modes) |
+| Tasks pendentes por falta de capacidade | [Capacity provider com managed scaling](#auto-scaling-no-ecs-dois-níveis) |
+| Comunicação entre microsserviços por nome | [Service Connect](#load-balancing-e-comunicação-entre-serviços) |
+| Deploy com rollback automático | [Circuit breaker / blue/green](#deploy-de-novas-versões) |
+| Dados compartilhados entre tasks no Fargate | [EFS](#armazenamento-em-containers) |
+| ECS ou EKS ou Lambda | [Comparação](#ecs-eks-fargate-ou-lambda) |
 
 ### High Performance Computing
 
