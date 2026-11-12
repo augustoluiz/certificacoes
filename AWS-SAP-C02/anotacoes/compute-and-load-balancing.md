@@ -10,6 +10,7 @@ servicos:
   - Amazon ECS
   - AWS Fargate
   - Amazon ECR
+  - Amazon EKS
   - AWS ParallelCluster
   - AWS Parallel Computing Service (PCS)
   - AWS Batch
@@ -17,7 +18,7 @@ servicos:
   - Amazon File Cache
   - Amazon DCV
 criado-em: 2026-11-05
-atualizado-em: 2026-11-11
+atualizado-em: 2026-11-12
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
 tags: [sap-c02, compute, load-balancing]
 ---
@@ -31,7 +32,7 @@ tags: [sap-c02, compute, load-balancing]
 ## Índice
 
 - **Compute:** [Amazon EC2](#amazon-elastic-compute-cloud-ec2) · [Amazon EC2 Auto Scaling](#amazon-ec2-auto-scaling) · [Auto Scaling Update Strategies](#auto-scaling-update-strategies) · [Spot Instances & Spot Fleet](#spot-instances--spot-fleet) · [High Performance Computing (HPC)](#high-performance-computing-hpc)
-- **Containers:** [Containers (conceitos)](#containers) · [Amazon ECS](#amazon-elastic-container-service-ecs)
+- **Containers:** [Containers (conceitos)](#containers) · [Amazon ECS](#amazon-elastic-container-service-ecs) · [Amazon EKS](#amazon-elastic-kubernetes-service-eks)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## Amazon Elastic Compute Cloud (EC2)
@@ -1436,6 +1437,366 @@ O registry de imagens da AWS, integrado ao IAM. Os pontos que caem na prova:
 
 [↑ Índice](#índice)
 
+## Amazon Elastic Kubernetes Service (EKS)
+
+O **Amazon EKS** é o **Kubernetes gerenciado** da AWS. Ele resolve o mesmo problema que o ECS: orquestrar containers. A diferença é que o EKS usa o **Kubernetes**, o orquestrador **open source** que virou o padrão de mercado. Kubernetes roda em qualquer nuvem, no data center e no notebook do desenvolvedor.
+
+Para entender o EKS, é preciso primeiro entender o Kubernetes, que tem vocabulário e jeito de funcionar próprios. Esta seção começa pelos conceitos do Kubernetes, sem AWS, compara-os com o que você já viu no ECS, e só depois mostra o que o EKS acrescenta.
+
+Na SAP-C02, o EKS aparece em cenários de:
+- **portabilidade e padronização**: "a empresa já usa Kubernetes on-premises", "quer evitar dependência de um provedor";
+- **migração** de clusters existentes;
+- **detalhes de integração com a AWS**: rede (IPs de pods), IAM por pod, load balancers, armazenamento e escala.
+
+> **Paralelo com o Lambda:** no Lambda, você entrega código e a AWS decide tudo. No ECS, você descreve a task e o service. No Kubernetes, você descreve **tudo** em arquivos YAML: a aplicação, a rede, a escala e as permissões internas. O orquestrador trabalha para que o cluster fique igual ao que está escrito. É o modelo com **mais controle e mais conceitos para aprender**. Em compensação, o mesmo YAML funciona em qualquer Kubernetes, em qualquer lugar.
+
+### Kubernetes: o que é e por que existe
+
+O **Kubernetes** (abreviado **K8s**: o 8 representa as oito letras entre o "K" e o "s") nasceu no Google, a partir da experiência com o orquestrador interno da empresa, e foi doado à comunidade open source em 2014. Hoje é mantido pela **CNCF** (*Cloud Native Computing Foundation*).
+
+Ele faz o que qualquer orquestrador faz (ver [Por que é preciso um orquestrador](#por-que-é-preciso-um-orquestrador)): escolhe em que máquina cada container roda, recria os que falham, escala, faz deploy e conecta os serviços. Três características o tornam diferente:
+
+- **Declarativo:** você não dá ordens ("suba 3 containers"). Você **declara o estado desejado** em YAML ("devem existir 3 réplicas desta aplicação") e entrega ao cluster.
+- **Ciclo de reconciliação** (*reconciliation loop*): dentro do cluster, **controladores** comparam o tempo todo o estado **desejado** com o estado **real** e agem para corrigir a diferença. Se um container morre, o real passa a ser 2 réplicas, o desejado continua 3, e o controlador cria outra. É como um **termostato**, aplicado a tudo no cluster.
+- **Extensível e portável:** a mesma API funciona em qualquer Kubernetes (EKS, Azure, Google, on-premises). A comunidade criou um ecossistema enorme de ferramentas, e qualquer um pode criar **novos tipos de objeto** para ensinar o Kubernetes a gerenciar outras coisas.
+
+**O que se ganha e o que se paga:**
+
+- **Ganha:** portabilidade entre nuvens e data center, padrão de mercado (profissionais, ferramentas, documentação), ecossistema rico e muito controle.
+- **Paga:** **curva de aprendizado** grande, muitos componentes para operar e atualizar, e versões novas a cada ~4 meses, que obrigam a atualizar o cluster com frequência.
+
+[↑ Índice](#índice)
+
+### Arquitetura de um cluster Kubernetes
+
+Um cluster Kubernetes tem duas partes:
+
+**1. Control plane (plano de controle): o "cérebro" do cluster.** Ele não roda as aplicações; ele decide e acompanha tudo.
+
+| Componente | Função | Analogia |
+|---|---|---|
+| **API server** (`kube-apiserver`) | A **porta de entrada** do cluster. Todo comando, de pessoas, de pipelines ou dos próprios componentes, passa por essa API REST | A recepção de um prédio: tudo passa por ela |
+| **etcd** | Banco de dados chave-valor que guarda **todo o estado** do cluster: o desejado e o real | O livro de registros oficial |
+| **Scheduler** (`kube-scheduler`) | Decide **em qual nó** cada pod novo vai rodar, conforme a CPU e a memória livres e as regras de posicionamento | O *maître* que escolhe a mesa |
+| **Controller manager** | Roda os **controladores**, os ciclos de reconciliação que mantêm o estado real igual ao desejado (réplicas, nós, endpoints...) | Os supervisores que conferem e corrigem |
+
+**2. Worker nodes (nós de trabalho): as máquinas que rodam os containers.** Na AWS, normalmente instâncias EC2. Cada nó tem:
+
+| Componente | Função |
+|---|---|
+| **kubelet** | O agente do nó. Recebe do API server a lista de pods que devem rodar ali, manda o container runtime iniciá-los e informa se estão saudáveis. É o equivalente ao **agente do ECS** |
+| **Container runtime** (containerd) | Quem de fato executa os containers |
+| **kube-proxy** | Configura as regras de rede do nó para que o tráfego enviado a um **Service** chegue aos pods certos |
+
+**Como um deploy acontece por dentro:**
+
+1. Você envia um YAML ao **API server** com `kubectl apply -f app.yaml`.
+2. O API server valida o pedido e grava o estado desejado no **etcd**.
+3. Um **controlador** percebe que deveriam existir 3 pods e só existem 0, e cria a definição de 3 pods.
+4. O **scheduler** escolhe um nó para cada pod.
+5. O **kubelet** de cada nó escolhido vê o pod atribuído a ele e manda o runtime iniciar os containers.
+6. Daí em diante, os controladores **vigiam** o tempo todo: se um pod ou um nó some, o ciclo recomeça.
+
+**kubectl** é a ferramenta de linha de comando para falar com o API server (`kubectl get pods`, `kubectl apply`, `kubectl logs`). Equivale ao AWS CLI para o Kubernetes.
+
+![Diagrama Amazon EKS - Arquitetura de um cluster Kubernetes no EKS](./img/amazon-eks/amazon-eks-01.png)
+
+[↑ Índice](#índice)
+
+### Objetos do Kubernetes
+
+Tudo no Kubernetes é um **objeto** descrito em YAML: um registro do estado desejado, com um **tipo** (`kind`), um nome e uma especificação (`spec`). Estes são os que mais importam:
+
+**Executar a aplicação:**
+
+- **Pod:** a **menor unidade** do Kubernetes. É um ou mais containers que rodam **juntos**, no mesmo nó, compartilhando o **mesmo IP** (conversam por `localhost`) e volumes. É o equivalente exato de uma **task do ECS**, inclusive para sidecars (ver [Sidecars](#sidecars)). Pods são **descartáveis**: quando morrem, não "voltam", e outro pod, com outro IP, é criado no lugar.
+- **ReplicaSet:** garante que exista **um número fixo de pods** iguais. Raramente é criado diretamente; quem o cria é o Deployment.
+- **Deployment:** o objeto mais usado para aplicações **stateless**. Declara a imagem, o número de réplicas e a estratégia de atualização. Para trocar de versão, ele cria um ReplicaSet novo e migra os pods aos poucos (*rolling update*), com *rollback* para a versão anterior. Equivale ao **service do ECS** na parte de "manter N tasks e fazer deploy".
+- **StatefulSet:** como o Deployment, mas para aplicações **com estado**, como bancos de dados, Kafka e Elasticsearch. Cada pod tem **nome fixo** (`db-0`, `db-1`), ordem de início e **disco próprio**, que o acompanha mesmo se o pod for recriado.
+- **DaemonSet:** roda **exatamente um pod em cada nó**, para agentes de logs, monitoramento e rede. Equivale à estratégia **DAEMON do ECS**.
+- **Job:** roda pods **até terminarem com sucesso**, como uma migração ou um processamento em lote. **CronJob:** um Job agendado ("todo dia às 2h"). Equivalem à **task avulsa** e à **tarefa agendada** do ECS.
+
+**Rede:**
+
+- **Service:** como os pods são descartáveis e trocam de IP, os outros componentes não podem depender do IP de um pod. O **Service** dá a um conjunto de pods um **nome e um IP estáveis** e distribui o tráfego entre eles. Ele encontra os pods por **labels** (etiquetas). Por exemplo, o Service `api` encaminha para todos os pods com o label `app: api`. Existem três tipos:
+  - **ClusterIP** (padrão): IP interno, acessível **só dentro do cluster**. Os outros serviços chamam `http://api` (via DNS interno, o **CoreDNS**).
+  - **NodePort:** expõe o Service em uma porta de **todos os nós**. É pouco usado diretamente.
+  - **LoadBalancer:** pede ao provedor de nuvem um **load balancer externo**. Na AWS, cria um **NLB**.
+- **Ingress:** regras de roteamento **HTTP/HTTPS** de fora para dentro do cluster: host, path e TLS. Por exemplo, `/api` vai para o Service `api` e `/` vai para o Service `web`. Na AWS, um Ingress vira um **ALB**. O **Gateway API** é a evolução mais moderna e flexível do Ingress.
+- **NetworkPolicy:** regras de firewall **entre pods**. Por exemplo, "só pods com o label `app: web` podem chamar a `api`".
+
+**Configuração e organização:**
+
+- **Namespace:** uma divisão **lógica** do cluster, como uma pasta. Os nomes só precisam ser únicos dentro do namespace, e é possível aplicar permissões, cotas de recursos (**ResourceQuota**) e políticas por namespace. É comum ter um namespace por equipe, aplicação ou ambiente.
+- **ConfigMap:** configurações (variáveis e arquivos) entregues aos pods como variáveis de ambiente ou arquivos montados.
+- **Secret:** como o ConfigMap, mas para dados sensíveis. Por padrão, é só codificado em base64, **não criptografado**. No EKS, ele deve ser criptografado com **KMS**, ou buscado direto do **Secrets Manager** (ver [Segurança](#segurança-quem-acessa-o-cluster-e-o-que-os-pods-acessam)).
+- **ServiceAccount:** a **identidade de um pod** dentro do Kubernetes. No EKS, é por meio dela que o pod recebe uma **role IAM**.
+- **Labels e selectors:** etiquetas chave-valor (`app: api`, `env: prod`) colocadas nos objetos. Quase tudo no Kubernetes se conecta por labels: o Service encontra os pods, o Deployment controla os seus pods e as NetworkPolicies escolhem a quem se aplicam.
+
+**Armazenamento:**
+
+- **PersistentVolume (PV):** um disco real disponível para o cluster, como um volume EBS ou um file system EFS.
+- **PersistentVolumeClaim (PVC):** o **pedido** de disco feito por um pod ("quero 20 GiB, leitura e escrita"). O Kubernetes liga o pedido a um PV.
+- **StorageClass:** o "tipo de disco" disponível (ex: `gp3` criptografado). Com ela, os PVs são **criados automaticamente** quando surge um PVC (*provisionamento dinâmico*).
+
+**Exemplo:** uma aplicação descrita em YAML, com um Deployment de 3 réplicas e um Service interno:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: pedidos
+spec:
+  replicas: 3                       # estado desejado: 3 pods
+  selector:
+    matchLabels: { app: api }       # o Deployment controla os pods com este label
+  template:                         # modelo de cada pod (equivale à task definition)
+    metadata:
+      labels: { app: api }
+    spec:
+      serviceAccountName: api-sa    # identidade do pod (→ role IAM no EKS)
+      containers:
+        - name: api
+          image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/api:1.5
+          ports: [{ containerPort: 8080 }]
+          resources:
+            requests: { cpu: 500m, memory: 512Mi }   # reserva usada pelo scheduler
+            limits:   { memory: 1Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: pedidos
+spec:
+  selector: { app: api }            # envia tráfego para os pods com app=api
+  ports: [{ port: 80, targetPort: 8080 }]
+```
+
+![Diagrama Amazon EKS - Objetos principais do Kubernetes](./img/amazon-eks/amazon-eks-02.png)
+
+**Ferramentas do ecossistema que aparecem em questões:**
+
+- **Helm:** o "gerenciador de pacotes" do Kubernetes. Um **chart** empacota todos os YAMLs de uma aplicação com parâmetros, e com ele se instala um software completo (ex: Prometheus) com um comando.
+- **GitOps (Argo CD, Flux):** o estado desejado fica em um **repositório Git**, e uma ferramenta dentro do cluster aplica automaticamente o que estiver lá. O deploy passa a ser um *pull request*.
+- **CRDs e Operators:** as **Custom Resource Definitions** criam tipos novos de objeto (ex: `kind: PostgresCluster`). Um **Operator** é um controlador que sabe gerenciar esse tipo, fazendo backups, failover e upgrades. Muitas ferramentas da AWS para Kubernetes, como o Karpenter e o AWS Load Balancer Controller, funcionam assim.
+
+[↑ Índice](#índice)
+
+### Do ECS para o Kubernetes: equivalências
+
+| ECS | Kubernetes / EKS | Observação |
+|---|---|---|
+| Cluster | Cluster | No EKS, o control plane é gerenciado pela AWS |
+| Task definition | Template de pod (dentro do Deployment) | Imagem, CPU/memória, variáveis, volumes |
+| Task | **Pod** | Um ou mais containers, mesmo IP, mesmos volumes |
+| Service (manter N tasks + deploy) | **Deployment** (+ ReplicaSet) | Réplicas, rolling update, rollback |
+| Service (registrar no ALB) | **Service** + **Ingress** | No K8s, "rodar" e "expor" são objetos separados |
+| Estratégia DAEMON | **DaemonSet** | Um pod por nó |
+| Task avulsa / tarefa agendada | **Job** / **CronJob** | Rodam até terminar |
+| Container instance (EC2 com agente) | **Node** (EC2 com kubelet) | |
+| Agente do ECS | **kubelet** | |
+| Capacity provider (ASG) | **Managed node group** / **Karpenter** | |
+| Task role | **IRSA** / **EKS Pod Identity** (via ServiceAccount) | Role IAM por aplicação |
+| Service Connect / Cloud Map | **Service** (ClusterIP) + **CoreDNS** | Descoberta de serviços por nome |
+| Service auto scaling | **Horizontal Pod Autoscaler (HPA)** | |
+| Secrets via task definition | **Secret** (+ KMS) ou Secrets Store CSI Driver | |
+| — | **Namespace**, **ConfigMap**, **StatefulSet**, **CRDs** | Conceitos sem equivalente direto no ECS |
+
+[↑ Índice](#índice)
+
+### O que o EKS gerencia
+
+Operar o **control plane** do Kubernetes é a parte mais difícil: o etcd precisa de backups e alta disponibilidade, e o API server precisa escalar e ser atualizado. O EKS assume essa parte:
+
+- **Control plane gerenciado:** o API server e o etcd rodam em uma **conta da AWS**, fora da sua VPC, distribuídos em **várias AZs**, com backups, escala e correções de segurança feitos pela AWS. Você não vê nem acessa essas máquinas.
+- **Cobrança:** um valor **por cluster por hora** (cerca de US$ 0,10/h no suporte padrão), além dos nós e dos recursos usados.
+- **Endpoint do API server:**
+  - **público:** acessível pela internet, com restrição opcional por IPs de origem;
+  - **público e privado:** os nós usam o caminho privado;
+  - **privado:** só de dentro da VPC ou de redes conectadas (VPN, Direct Connect).
+
+  Clusters de produção costumam usar o endpoint **privado**.
+- **Versões e suporte:** cada versão do Kubernetes tem **suporte padrão** de cerca de 14 meses no EKS e depois **suporte estendido** (mais ~12 meses), que é **cobrado a mais** por cluster. A atualização do control plane é **feita por você**, uma versão menor por vez (ex: 1.30 → 1.31), e depois vêm os nós e os add-ons (ver [Atualização de versões](#atualização-de-versões)).
+- **EKS add-ons:** componentes essenciais instalados e atualizados pelo EKS: VPC CNI, CoreDNS, kube-proxy, os drivers CSI de EBS e EFS, o agente do Pod Identity, o agente de observabilidade do CloudWatch, entre outros.
+
+**Onde os pods rodam** (o *data plane*) é escolha sua:
+
+| Opção | Quem gerencia os nós | Características | Quando usar |
+|---|---|---|---|
+| **Managed node groups** | AWS cria e atualiza um **ASG** de instâncias EC2 com a AMI otimizada para EKS; você escolhe tipos e tamanhos | Atualização de nós com drenagem automática dos pods; On-Demand ou Spot | Padrão "clássico", com controle sobre as instâncias |
+| **Self-managed nodes** | **Você**: ASG, AMI, atualizações | Controle total (AMIs personalizadas, SOs específicos) | Requisitos que os managed node groups não atendem |
+| **Fargate** | **AWS**: cada pod roda em um ambiente isolado | Sem nós para gerenciar; **um pod por "nó"**; sem DaemonSets, sem GPU, sem EBS (EFS sim); só subnets privadas. Um **Fargate profile** define quais pods (namespace + labels) vão para o Fargate | Cargas pequenas e isoladas, menor esforço operacional |
+| **Karpenter** | Você instala; ele **cria nós sob medida** para os pods pendentes | Escolhe o tipo de instância ideal na hora, sem ASG, consolida nós subutilizados e trata interrupções Spot | Escala rápida e eficiente em custo, frotas grandes e diversificadas |
+| **EKS Auto Mode** | **AWS** gerencia os nós (baseado no Karpenter), e também a rede, o armazenamento e o load balancer | Nós com Bottlerocket, atualizados e trocados automaticamente; taxa adicional por instância | Kubernetes com **menor esforço operacional** sem abrir mão de EC2 (GPU, Spot, tipos específicos) |
+| **EKS Hybrid Nodes** | Você fornece servidores **on-premises** ou de borda | O control plane fica na AWS e os nós ficam no seu data center | Rodar pods perto dos dados on-premises com o control plane gerenciado |
+
+![Diagrama Amazon EKS - Opções de data plane](./img/amazon-eks/amazon-eks-03.png)
+
+**Kubernetes da AWS fora da região:**
+
+- **EKS Anywhere:** um Kubernetes **completo**, control plane incluído, que **você** roda e opera no seu data center (VMware, bare metal), com ferramentas e suporte da AWS. O cluster não depende de conexão com a AWS.
+- **EKS em Outposts:** EKS rodando em racks do **AWS Outposts** instalados no seu data center.
+- **EKS Hybrid Nodes:** só os **nós** ficam on-premises, e o control plane fica na região.
+
+[↑ Índice](#índice)
+
+### Rede no EKS
+
+**Pods recebem IPs da VPC (VPC CNI).** No EKS, o plugin de rede padrão (**Amazon VPC CNI**) dá a **cada pod um IP real da subnet**, assim como o modo **awsvpc** dá um IP a cada task do ECS. Os pods conversam com bancos, outros serviços e redes on-premises **sem tradução de endereço**, e aparecem nos VPC Flow Logs com IP próprio.
+
+- **Consequência 1: esgotamento de IPs.** Cada pod consome um IP da subnet. Clusters grandes esgotam subnets pequenas rapidamente, e esse é um problema **muito comum** em EKS. As soluções:
+  - **subnets maiores**, já no planejamento da VPC;
+  - **CIDR secundário** na VPC (ex: `100.64.0.0/16`), usado só para os pods (*custom networking*);
+  - **IPv6**, que elimina o problema de escassez.
+- **Consequência 2: pods por nó.** O número de pods por nó é limitado pelas ENIs e pelos IPs por ENI do tipo de instância. O **prefix delegation** atribui **blocos de IPs** (prefixos /28) às ENIs, aumentando bastante a quantidade de pods por nó.
+- **Security groups for pods:** permite aplicar **security groups da VPC a pods específicos**. Por exemplo, só os pods da `api` podem acessar o RDS. Sem isso, os pods usam o SG do nó.
+- **NetworkPolicies:** o VPC CNI também aplica as **NetworkPolicies** do Kubernetes, as regras entre pods.
+
+**Expor aplicações (AWS Load Balancer Controller).** É um controlador instalado no cluster que **cria load balancers da AWS a partir de objetos do Kubernetes**:
+- um **Ingress** (ou Gateway API HTTP) cria um **ALB**;
+- um **Service** do tipo `LoadBalancer` cria um **NLB**.
+
+Com o **target type `ip`**, o load balancer envia o tráfego **direto para os IPs dos pods**, sem passar pela porta dos nós. Um mesmo ALB pode ser compartilhado por vários Ingresses (*IngressGroup*). No **EKS Auto Mode**, esse controlador já vem gerenciado.
+
+- **Comunicação entre serviços:** dentro do cluster, os Services ClusterIP e o **CoreDNS** (`http://api.pedidos.svc.cluster.local`, ou só `http://api` no mesmo namespace). Entre clusters, VPCs ou contas, o **VPC Lattice**, com um controlador para Gateway API, ou um *service mesh* open source como o Istio. O App Mesh foi descontinuado.
+
+![Diagrama Amazon EKS - VPC CNI e AWS Load Balancer Controller](./img/amazon-eks/amazon-eks-04.png)
+
+> **Paralelo com o Lambda:** um Lambda em VPC também consome IPs das subnets por meio das ENIs, mas compartilhadas entre execuções. No EKS, cada pod tem o seu IP, e por isso o planejamento de endereços pesa muito mais.
+
+[↑ Índice](#índice)
+
+### Segurança: quem acessa o cluster e o que os pods acessam
+
+Há **dois sistemas de permissão** no EKS, e é importante não confundi-los:
+- o **IAM da AWS**, que controla recursos da AWS;
+- o **RBAC do Kubernetes**, que controla objetos do cluster.
+
+**1. Pessoas e pipelines acessando o cluster (IAM → Kubernetes).** Quem roda `kubectl` se autentica com a **identidade IAM** (usuário, role ou role do SSO). O EKS então traduz essa identidade em permissões **dentro** do Kubernetes:
+
+- **Access entries** (recomendado): pela **API do EKS**, você associa uma role IAM a permissões no cluster. Por exemplo, a role `DevOps` recebe uma *access policy* de administrador do cluster, e a role `TimePedidos` recebe edição só no namespace `pedidos`. Isso é gerenciado como qualquer recurso AWS (CloudFormation, CloudTrail).
+- **ConfigMap `aws-auth`** (legado): o mapeamento ficava em um objeto **dentro** do cluster. Um erro de edição podia trancar todos para fora. As access entries substituem esse modelo.
+- **RBAC do Kubernetes:** **Roles/ClusterRoles** (o que pode ser feito: ler pods, criar Deployments...) ligadas a usuários ou grupos por **RoleBindings**. As access policies do EKS são atalhos para permissões RBAC comuns.
+
+**2. Pods acessando serviços da AWS (Kubernetes → IAM).** Um pod que lê o S3 ou grava no DynamoDB precisa de credenciais. A regra é a mesma da [task role do ECS](#iam-task-role-vs-task-execution-role): **uma role IAM por aplicação**, nunca a role do nó. Há dois mecanismos:
+
+| | **IRSA** (IAM Roles for Service Accounts) | **EKS Pod Identity** |
+|---|---|---|
+| Como funciona | O cluster tem um **provedor OIDC** registrado no IAM. A **trust policy da role** confia nesse OIDC e na ServiceAccount; a ServiceAccount recebe uma anotação com o ARN da role | Um **agente** (add-on) roda nos nós. Você cria uma **associação** pela API do EKS: "ServiceAccount X do namespace Y → role Z" |
+| Configuração por cluster | Um OIDC por cluster, e a trust policy de cada role cita o cluster | A trust policy confia no serviço `pods.eks.amazonaws.com` e pode ser **reaproveitada** em vários clusters |
+| Situação | Mecanismo mais antigo, amplamente usado (e o que funciona em mais cenários, como clusters fora do EKS) | **Recomendado** para clusters EKS novos: mais simples de configurar e de escalar |
+
+O SDK da AWS dentro do pod obtém as credenciais **automaticamente** nos dois casos, assim como no ECS e no Lambda.
+
+> **Obs:** Por padrão, um pod pode alcançar o **IMDS do nó** e usar a **role IAM do nó**, que normalmente tem permissões amplas. Assim como no ECS, isso deve ser **bloqueado** (IMDSv2 com *hop limit* 1), e cada aplicação deve usar só a sua role via Pod Identity ou IRSA.
+
+![Diagrama Amazon EKS - Acesso ao cluster e IAM para pods](./img/amazon-eks/amazon-eks-05.png)
+
+**Outros pontos de segurança:**
+
+- **Criptografia de Secrets** com **KMS** (*envelope encryption*) no etcd, ou o **Secrets Store CSI Driver**, que monta segredos do **Secrets Manager/Parameter Store** direto nos pods.
+- **Logs do control plane** (API, **audit**, authenticator, scheduler, controller manager) enviados ao **CloudWatch Logs**. O log de **audit** registra quem fez o quê no cluster.
+- **Amazon GuardDuty** (EKS Protection / Runtime Monitoring) detecta comportamentos suspeitos no cluster e nos containers.
+- **Pod Security Standards:** proíbem pods privilegiados ou rodando como root nos namespaces.
+- **Multi-tenancy:** **namespaces** + RBAC + ResourceQuotas + NetworkPolicies dão um isolamento **lógico** (*soft*) entre equipes. Para isolamento **forte** entre clientes ou ambientes, o caminho é **um cluster por tenant ou ambiente**, de preferência em **contas separadas**.
+
+[↑ Índice](#índice)
+
+### Armazenamento no EKS
+
+Os discos são conectados por **drivers CSI** (*Container Storage Interface*), instalados como add-ons, e consumidos pelos pods por meio de **PVCs**:
+
+| Driver CSI | Tipo de acesso | Características | Uso típico |
+|---|---|---|---|
+| **EBS CSI** | **ReadWriteOnce**: um nó por vez | Disco de bloco, **preso a uma AZ**: o pod precisa rodar na mesma AZ do volume | Bancos de dados em StatefulSets, dados por pod |
+| **EFS CSI** | **ReadWriteMany**: vários pods e nós ao mesmo tempo | **Multi-AZ**, compartilhado, elástico. Funciona no **Fargate** | Conteúdo compartilhado, uploads, aplicações que precisam do mesmo diretório |
+| **FSx for Lustre CSI** | ReadWriteMany | Alto desempenho, ligado ao S3 | ML e HPC no Kubernetes |
+| **Mountpoint for S3 CSI** | Leitura (e escrita sequencial) | Monta um bucket S3 como diretório | Datasets grandes para leitura |
+
+> **Obs:** Um StatefulSet com volumes **EBS** fica preso à **AZ** de cada volume. Se a AZ cair, o pod não pode ser recriado em outra AZ com o mesmo disco. Por isso, bancos de dados **dentro** do Kubernetes exigem replicação no nível da aplicação. Em muitos casos, a resposta mais simples na prova é usar um **banco gerenciado** (RDS, Aurora, DynamoDB) fora do cluster.
+
+[↑ Índice](#índice)
+
+### Auto Scaling no EKS: pods e nós
+
+Assim como no ECS, a escala acontece em **dois níveis**:
+
+1. **Pods:**
+   - **Horizontal Pod Autoscaler (HPA):** aumenta ou diminui o número de **réplicas** de um Deployment pela CPU, pela memória ou por métricas personalizadas. Equivale ao service auto scaling do ECS.
+   - **KEDA** (*Kubernetes Event-Driven Autoscaling*): escala pods por **eventos externos**, como o tamanho de uma fila **SQS**, um tópico Kafka ou um cron, e pode escalar **até zero**.
+   - **Vertical Pod Autoscaler (VPA):** ajusta a **CPU e a memória** pedidas por cada pod, conforme o uso real.
+2. **Nós:** quando o HPA cria pods e não há espaço nos nós, os pods ficam **Pending**. Alguém precisa criar nós:
+   - **Cluster Autoscaler:** o mecanismo tradicional. Aumenta e diminui o **ASG** dos node groups. É limitado aos tipos de instância de cada grupo e mais lento.
+   - **Karpenter:** observa os pods pendentes e **lança diretamente** a instância EC2 mais adequada (tipo, tamanho, arquitetura, Spot ou On-Demand), sem ASG, em segundos. Também **consolida**: remove ou troca nós subutilizados por menores, reduzindo custo. É o padrão recomendado hoje, e é a base do **EKS Auto Mode**.
+   - **Fargate:** cada pod já traz a sua capacidade, e não existe esse nível.
+
+![Diagrama Amazon EKS - Auto scaling de pods e nós](./img/amazon-eks/amazon-eks-06.png)
+
+> **Paralelo com o Lambda:** o **KEDA** escalando pods pelo tamanho de uma fila SQS, inclusive até zero, é o que mais se aproxima do comportamento de Lambda + SQS dentro do Kubernetes.
+
+[↑ Índice](#índice)
+
+### Atualização de versões
+
+O Kubernetes lança uma versão menor (*minor*) a cada ~4 meses, e versões antigas saem do suporte padrão do EKS. Ficar parado significa pagar **suporte estendido** e, depois, ter o cluster atualizado à força. O processo de atualização é:
+
+1. **Verificar compatibilidade:** APIs depreciadas nos YAMLs e nos charts Helm. Os **upgrade insights** do EKS apontam problemas.
+2. **Atualizar o control plane**, uma versão menor por vez, sem indisponibilidade para os pods.
+3. **Atualizar os add-ons** (VPC CNI, CoreDNS, kube-proxy, drivers CSI).
+4. **Atualizar os nós:** os managed node groups e o Karpenter trocam os nós aos poucos, **drenando** os pods antes. Os **PodDisruptionBudgets** garantem que não caiam réplicas demais ao mesmo tempo.
+
+**Alternativa blue/green de clusters:** criar um **cluster novo** na versão nova, implantar as aplicações nele (fácil com GitOps) e migrar o tráfego (Route 53 ponderado ou load balancer). Permite pular várias versões e voltar atrás, mas exige que os dados e o estado fiquem **fora** do cluster.
+
+[↑ Índice](#índice)
+
+### Observabilidade no EKS
+
+- **CloudWatch Container Insights** (via add-on de observabilidade do CloudWatch): métricas e logs de cluster, nós, pods e containers.
+- **Amazon Managed Service for Prometheus** + **Amazon Managed Grafana:** a pilha de monitoramento padrão do mundo Kubernetes, gerenciada pela AWS. Faz sentido quando a equipe já usa Prometheus e Grafana.
+- **ADOT** (OpenTelemetry) para traces e métricas, e **Fluent Bit** (DaemonSet) para enviar logs.
+- **Logs do control plane** no CloudWatch Logs.
+
+[↑ Índice](#índice)
+
+### ECS ou EKS?
+
+| Critério | **ECS** | **EKS** |
+|---|---|---|
+| Curva de aprendizado | Baixa: conceitos próprios e poucos | **Alta**: Kubernetes tem muitos conceitos e componentes |
+| Esforço operacional | Menor: sem control plane para atualizar | Maior: upgrades de versão frequentes, add-ons, ferramentas (menor com Auto Mode) |
+| Custo do orquestrador | **Sem custo** | Taxa por cluster/hora (+ suporte estendido em versões antigas) |
+| Portabilidade | Só AWS | **Qualquer Kubernetes**: outras nuvens, on-premises (EKS Anywhere, Hybrid Nodes) |
+| Ecossistema | Integração nativa com a AWS | Enorme: Helm, operators, GitOps, service meshes, CRDs |
+| Equipe | Equipe pequena, foco em AWS | Equipe que **já conhece Kubernetes** ou plataforma interna multi-nuvem |
+
+**Regra prática:** sem um motivo claro para Kubernetes (portabilidade, padronização com o que já existe, ecossistema), **ECS com Fargate** costuma ser a resposta de menor esforço operacional. Com uma organização que **já usa Kubernetes**, ou um requisito de rodar a mesma plataforma em várias nuvens e on-premises, a resposta é **EKS**.
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "A empresa já usa **Kubernetes** on-premises e quer migrar com o mínimo de mudanças" → **EKS**, com os mesmos manifests e charts Helm.
+- "Kubernetes on-premises **gerenciado com ferramentas da AWS**, sem depender da região" → **EKS Anywhere**. "Control plane na AWS, nós no data center" → **EKS Hybrid Nodes**. "Hardware AWS no data center" → EKS em **Outposts**.
+- "Kubernetes com o **menor esforço operacional**" → **EKS Auto Mode** (ou **Fargate** para cargas simples, sem GPU e sem DaemonSets).
+- "Pods precisam acessar o S3 com **permissões diferentes por aplicação**" → **EKS Pod Identity** (ou **IRSA**), nunca a role do nó.
+- "Dar acesso ao cluster a uma role IAM do SSO, restrito a um namespace" → **access entries** + access policy com escopo de namespace (em vez do ConfigMap `aws-auth`).
+- "Os pods não conseguem IP / a subnet esgotou" → **CIDR secundário** com custom networking, **prefix delegation** ou **IPv6**.
+- "Aumentar o número de pods por nó" → **prefix delegation** no VPC CNI.
+- "Restringir quais pods acessam o banco RDS por security group" → **security groups for pods**. "Firewall entre pods" → **NetworkPolicies**.
+- "Expor um serviço HTTP com regras de path/host" → **Ingress** + **AWS Load Balancer Controller** (cria um **ALB**). "TCP/UDP" → Service `LoadBalancer` (cria um **NLB**). "Tráfego direto para os pods" → **target type ip**.
+- "Nós sobem devagar e há desperdício de capacidade" → **Karpenter** (em vez do Cluster Autoscaler).
+- "Escalar pods pela fila SQS, inclusive até zero" → **KEDA**.
+- "Volume compartilhado entre pods em várias AZs" → **EFS CSI**. "Disco de bloco por pod" → **EBS CSI** (preso à AZ).
+- "Criptografar os Secrets do Kubernetes" → **KMS envelope encryption**. "Usar segredos do Secrets Manager nos pods" → **Secrets Store CSI Driver**.
+- "Auditar quem alterou objetos no cluster" → **audit logs** do control plane no CloudWatch Logs.
+- "Isolamento **forte** entre clientes" → **clusters separados** (e contas). "Isolamento entre equipes internas" → **namespaces** + RBAC + quotas + NetworkPolicies.
+- "Cluster em versão fora do suporte padrão, com custo maior" → **suporte estendido**: planejar upgrades (control plane → add-ons → nós) ou blue/green de clusters.
+- "Containers com o menor esforço, sem requisito de Kubernetes" → **ECS + Fargate** (não EKS).
+
+[↑ Índice](#índice)
+
 ## High Performance Computing (HPC)
 
 **HPC** (*High Performance Computing*, computação de alto desempenho) é usar **muitos computadores trabalhando juntos** para resolver um problema grande demais para uma máquina só. O problema é dividido em milhares de pedaços, cada núcleo calcula um pedaço, e os resultados são combinados no final. Exemplos: previsão do tempo, simulação de colisão de carros, aerodinâmica (**CFD**, *Computational Fluid Dynamics*), sequenciamento genômico, descoberta de medicamentos, análise sísmica, risco financeiro e renderização de filmes.
@@ -1844,6 +2205,20 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Deploy com rollback automático | [Circuit breaker / blue/green](#deploy-de-novas-versões) |
 | Dados compartilhados entre tasks no Fargate | [EFS](#armazenamento-em-containers) |
 | ECS ou EKS ou Lambda | [Comparação](#ecs-eks-fargate-ou-lambda) |
+
+### Kubernetes (EKS)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Já usa Kubernetes e quer migrar com mínimo de mudanças | [EKS](#ecs-ou-eks) |
+| Kubernetes com menor esforço operacional | [EKS Auto Mode / Fargate](#o-que-o-eks-gerencia) |
+| Kubernetes on-premises | [EKS Anywhere / Hybrid Nodes / Outposts](#o-que-o-eks-gerencia) |
+| Permissões AWS por aplicação (pod) | [EKS Pod Identity / IRSA](#segurança-quem-acessa-o-cluster-e-o-que-os-pods-acessam) |
+| Acesso de roles IAM ao cluster | [Access entries](#segurança-quem-acessa-o-cluster-e-o-que-os-pods-acessam) |
+| Subnet sem IPs para pods | [CIDR secundário / prefix delegation / IPv6](#rede-no-eks) |
+| Expor HTTP com regras de path | [Ingress + AWS Load Balancer Controller](#rede-no-eks) |
+| Nós rápidos e sob medida | [Karpenter](#auto-scaling-no-eks-pods-e-nós) |
+| Volume compartilhado multi-AZ | [EFS CSI](#armazenamento-no-eks) |
 
 ### High Performance Computing
 
