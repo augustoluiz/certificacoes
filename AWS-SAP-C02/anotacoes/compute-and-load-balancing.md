@@ -12,6 +12,7 @@ servicos:
   - Amazon ECR
   - Amazon EKS
   - AWS Lambda
+  - Amazon API Gateway
   - AWS ParallelCluster
   - AWS Parallel Computing Service (PCS)
   - AWS Batch
@@ -34,7 +35,7 @@ tags: [sap-c02, compute, load-balancing]
 
 - **Compute:** [Amazon EC2](#amazon-elastic-compute-cloud-ec2) · [Amazon EC2 Auto Scaling](#amazon-ec2-auto-scaling) · [Auto Scaling Update Strategies](#auto-scaling-update-strategies) · [Spot Instances & Spot Fleet](#spot-instances--spot-fleet) · [High Performance Computing (HPC)](#high-performance-computing-hpc)
 - **Containers:** [Containers (conceitos)](#containers) · [Amazon ECS](#amazon-elastic-container-service-ecs) · [Amazon EKS](#amazon-elastic-kubernetes-service-eks)
-- **Serverless:** [AWS Lambda](#aws-lambda)
+- **Serverless:** [AWS Lambda](#aws-lambda) · [Amazon API Gateway](#amazon-api-gateway)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## Amazon Elastic Compute Cloud (EC2)
@@ -2043,6 +2044,215 @@ São **duas políticas diferentes**, e a prova costuma testar qual usar:
 
 [↑ Índice](#índice)
 
+## Amazon API Gateway
+
+O **Amazon API Gateway** é a "porta da frente" gerenciada para APIs. Ele recebe as requisições dos clientes e cuida de tudo que fica **antes** do código: autenticação, limites de uso, validação, transformação, cache e logs. Depois, encaminha cada requisição para o **backend**, seja Lambda, um serviço HTTP, um container em VPC ou até um serviço AWS diretamente. É serverless: escala sozinho e cobra por requisição (e por hora, no caso de cache e conexões WebSocket).
+
+Na SAP-C02, o API Gateway aparece em perguntas sobre:
+- **qual tipo de API** escolher (REST, HTTP ou WebSocket) e **qual tipo de endpoint** (edge, regional ou privado);
+- **segurança** (autorizadores, resource policies, WAF, mTLS) e **proteção do backend** (throttling, usage plans, cache);
+- **integração** com recursos privados na VPC (VPC Link) e com serviços AWS **sem Lambda no meio**;
+- **limites** (o timeout de integração) e padrões para processamento longo.
+
+> **Comparação com o resto deste arquivo:** o API Gateway ocupa o lugar que um **ALB** ocupa na frente de instâncias e containers, mas com funções de **gestão de API**: chaves, cotas por cliente, autorizadores e transformação. No ECS e no EKS, o ALB distribui tráfego. Aqui, o API Gateway também decide **quem pode chamar o quê e quantas vezes**.
+
+### Tipos de API: REST, HTTP e WebSocket
+
+| | **REST API** | **HTTP API** | **WebSocket API** |
+|---|---|---|---|
+| Para quê | APIs com **gestão completa**: chaves, cotas, cache, transformação, WAF | APIs **simples e baratas** na frente de Lambda ou backends HTTP | Comunicação **bidirecional** em tempo real: chat, notificações, dashboards ao vivo |
+| Custo e latência | Maior | **Até ~70% mais barata**, latência menor | Por mensagem + minutos de conexão |
+| Autorização | IAM, Cognito, Lambda authorizer, resource policy | IAM, **JWT nativo** (Cognito ou qualquer OIDC), Lambda authorizer | IAM, Lambda authorizer (na conexão) |
+| API keys e usage plans | **Sim** | Não | Não |
+| Cache | **Sim** | Não | Não |
+| AWS WAF | **Sim** | Não (usar CloudFront + WAF na frente) | Não |
+| Validação e transformação de requisições (*mapping templates*) | **Sim** | Limitada (mapeamento de parâmetros) | Sim (por rota) |
+| Endpoint privado (só da VPC) | **Sim** | Não | Não |
+| Integração direta com serviços AWS | Ampla (qualquer API AWS) | Algumas (SQS, Step Functions, Kinesis, EventBridge, AppConfig) | Sim |
+| Canary deployment | **Sim** | Não | Não |
+
+**Regra prática:** comece pela **HTTP API**, que é mais simples e barata. Mude para **REST API** quando precisar de algo que só ela tem: **usage plans/API keys**, **cache**, **WAF direto**, **endpoint privado**, **validação ou transformação** de requisições, ou **canary**. Muitas questões giram exatamente em torno dessas diferenças.
+
+[↑ Índice](#índice)
+
+### Tipos de endpoint (REST API)
+
+| Tipo | Como funciona | Quando usar |
+|---|---|---|
+| **Edge-optimized** | As requisições entram por uma distribuição **CloudFront gerenciada pela AWS** (que você não controla) e seguem para a região da API | Clientes **espalhados pelo mundo**, sem necessidade de customizar a CDN |
+| **Regional** | A API é acessada diretamente na região | Clientes na mesma região, ou quando você quer **o seu próprio CloudFront** na frente (com cache, WAF e comportamentos personalizados). Também é o tipo usado em arquiteturas **multi-região** com Route 53 |
+| **Private** | Acessível **somente de dentro de VPCs**, por um **interface VPC endpoint** (`execute-api`). Exige uma **resource policy** dizendo quais VPCs ou endpoints podem chamar | APIs **internas** entre microsserviços, ou expostas a outras contas e VPCs sem passar pela internet |
+
+- **Custom domain** (ex: `api.empresa.com`): com certificado do **ACM**. Para edge-optimized, o certificado precisa estar em **us-east-1**. Para regional, na mesma região da API. Os **base path mappings** permitem publicar várias APIs ou versões sob o mesmo domínio (`/v1`, `/v2`, `/pedidos`).
+- **mTLS** (*mutual TLS*) no custom domain: o **cliente** também apresenta um certificado. É comum em integrações B2B e em IoT.
+
+![Diagrama API Gateway - Tipos de endpoint](./img/amazon-api-gateway/amazon-api-gateway-01.png)
+
+[↑ Índice](#índice)
+
+### O caminho de uma requisição
+
+Uma requisição a uma REST API passa por várias etapas antes de chegar ao backend. Cada uma é um ponto de controle:
+
+1. **AWS WAF** (opcional): bloqueia ataques comuns (SQL injection, XSS), IPs e países, e aplica *rate limiting* por IP.
+2. **Resource policy:** quem pode chamar a API (contas, IPs, VPCs, VPC endpoints).
+3. **Autorização:** o autorizador configurado no método (IAM, Cognito, Lambda authorizer).
+4. **Throttling:** limites da conta, do stage, do método e do **usage plan** do cliente (API key).
+5. **Validação da requisição:** parâmetros obrigatórios e corpo conforme um JSON Schema. Uma requisição inválida é rejeitada **sem custo de backend**.
+6. **Cache:** se a resposta está em cache, ela volta daqui, sem chamar o backend.
+7. **Transformação** (*mapping template*) da requisição para o formato que o backend espera.
+8. **Integração:** a chamada ao backend.
+9. **Transformação da resposta** e devolução ao cliente.
+
+![Diagrama API Gateway - Caminho de uma requisição e pontos de controle](./img/amazon-api-gateway/amazon-api-gateway-02.png)
+
+[↑ Índice](#índice)
+
+### Integrações
+
+| Tipo | O que faz | Exemplo |
+|---|---|---|
+| **Lambda proxy** | Passa a requisição inteira (headers, path, corpo) para a função, que monta a resposta HTTP | A forma mais comum com Lambda |
+| **Lambda (não proxy)** | O API Gateway transforma a requisição e a resposta com *mapping templates* | Adaptar um contrato de API sem mudar a função |
+| **HTTP / HTTP proxy** | Encaminha para um endpoint HTTP **público** | API legada, serviço de terceiros |
+| **AWS service** | Chama uma **API de um serviço AWS diretamente**, sem Lambda: `SendMessage` no SQS, `PutItem` no DynamoDB, `StartExecution` no Step Functions, `PutRecord` no Kinesis, `PutEvents` no EventBridge | Receber eventos e gravar em fila com o **menor custo e latência**, sem código |
+| **Private integration (VPC Link)** | Alcança backends em **subnets privadas**: na **REST API**, via **NLB** (e, mais recentemente, ALB); na **HTTP API**, via **ALB, NLB ou Cloud Map** | Expor um serviço ECS/EKS/EC2 privado sem colocá-lo em subnet pública |
+| **Mock** | Responde sem backend | Testes, respostas fixas, CORS |
+
+**Padrão "storage-first":** em vez de `API Gateway → Lambda → SQS`, usar `API Gateway → SQS` diretamente. O cliente recebe a confirmação assim que a mensagem é **gravada**, e o processamento acontece depois, consumindo a fila. É mais barato, mais resiliente (nada se perde se o processamento falhar) e protege o backend de picos.
+
+![Diagrama API Gateway - Integrações: Lambda, serviços AWS e VPC Link](./img/amazon-api-gateway/amazon-api-gateway-03.png)
+
+[↑ Índice](#índice)
+
+### Segurança
+
+**Quem pode chamar (autorização):**
+
+| Mecanismo | Como funciona | Quando usar |
+|---|---|---|
+| **IAM (SigV4)** | O cliente assina a requisição com credenciais AWS; a permissão `execute-api:Invoke` é avaliada | Chamadas **entre serviços AWS**, contas e aplicações internas |
+| **Cognito User Pools** | O cliente envia o token do usuário logado no Cognito, e o API Gateway o valida sem código | Aplicações web/mobile com usuários no Cognito |
+| **JWT authorizer** (HTTP API) | Valida tokens JWT de **qualquer provedor OIDC** (Cognito, Auth0, Okta, Entra ID) | Identidade externa com OIDC, sem código |
+| **Lambda authorizer** | Uma função recebe o token (ou headers, query, contexto) e devolve uma **política IAM** de allow/deny. O resultado pode ficar em **cache** por um TTL | Lógica própria: tokens proprietários, consultas a bases de permissões, autorização por tenant |
+
+- **Resource policy** (REST): restringe **de onde** a API pode ser chamada: contas, faixas de IP, VPCs, VPC endpoints. É obrigatória nas APIs **privadas** e permite acesso **entre contas**.
+- **API keys não são autenticação.** Elas identificam um cliente para aplicar um **usage plan**: cotas e limites. Devem ser combinadas com um autorizador de verdade.
+- **AWS WAF** (REST, ou via CloudFront para HTTP API): proteção contra ataques de aplicação e rate limiting por IP.
+- **mTLS** e certificados de cliente para o backend: o API Gateway pode apresentar um certificado ao backend HTTP, que confirma que a requisição veio dele.
+- **CORS:** precisa ser configurado na API quando o navegador chama de outro domínio.
+
+[↑ Índice](#índice)
+
+### Throttling, usage plans e cache
+
+**Throttling em camadas:**
+
+- **Conta:** por padrão, cerca de **10.000 requisições por segundo** (com *burst* de 5.000) por região, somando **todas** as APIs da conta. É uma quota ajustável.
+- **Stage e método** (REST): limites específicos, por exemplo para proteger um endpoint caro.
+- **Usage plan + API key** (REST): limites e **cotas** (por dia, semana ou mês) **por cliente**. Por exemplo, o plano "básico" tem 10 req/s e 10 mil req/dia, e o "premium" tem 100 req/s e cota ilimitada. É o mecanismo para **monetizar** ou controlar o consumo de APIs por parceiros.
+- Passou do limite → **429 Too Many Requests**. Os limites usam o algoritmo *token bucket*: uma taxa média e um *burst* permitido.
+
+**Cache** (REST):
+
+- Cache **por stage**, com tamanho de 0,5 GB a 237 GB e **cobrança por hora**. O TTL padrão é de 300 s, com máximo de 3.600 s, e pode ser ajustado **por método**.
+- A chave de cache pode incluir parâmetros, headers e query strings.
+- Clientes podem pedir a invalidação com o header `Cache-Control: max-age=0`, que deve ser **protegida por IAM**.
+- Reduz a latência e as chamadas ao backend. Para cache **global**, perto dos usuários, use **CloudFront** na frente de uma API regional.
+
+[↑ Índice](#índice)
+
+### Limites do API Gateway
+
+| Limite | Valor | Consequência |
+|---|---|---|
+| **Timeout de integração** | **29 s** por padrão (REST regional/privada pode pedir aumento) | Processamento longo → padrão **assíncrono**: a API grava o pedido (SQS/Step Functions), devolve **202** com um ID, e o cliente consulta o status (polling) ou recebe o resultado por **WebSocket** ou callback |
+| **Payload** | **10 MB** | Arquivos grandes → **URL pré-assinada do S3** para upload e download diretos |
+| **WebSocket** | Mensagem de até 128 KB; conexão de até **2 h**; desconexão após **10 min** ociosa | Clientes precisam reconectar e mandar *heartbeats* |
+| **Throttling da conta** | ~10.000 req/s por região (ajustável) | Planejar a quota em sistemas de grande volume |
+
+[↑ Índice](#índice)
+
+### Stages, deploys e versionamento
+
+- **Stage:** uma "versão publicada" da API (`dev`, `prod`), com URL, configurações de logs, throttling e cache próprias. As **stage variables** funcionam como variáveis de ambiente, por exemplo para apontar cada stage para um alias diferente do Lambda.
+- **Deployment:** na REST API, as mudanças só valem depois de um **deploy** para um stage. A HTTP API pode fazer deploy automático.
+- **Canary release** (REST): uma porcentagem do tráfego do stage vai para um **deploy novo**, com métricas separadas, até ser promovido. É o mesmo conceito de canary visto em [Auto Scaling Update Strategies](#auto-scaling-update-strategies).
+- **Versionamento:** por path (`/v1`, `/v2`) com base path mappings no custom domain, ou por stages e APIs separadas.
+- **Definição por OpenAPI:** APIs podem ser importadas e exportadas em OpenAPI (Swagger), o que facilita IaC e documentação.
+
+[↑ Índice](#índice)
+
+### WebSocket APIs
+
+Em uma API HTTP comum, o servidor só responde quando o cliente pergunta. Em uma **WebSocket API**, a conexão fica **aberta**, e o servidor pode **enviar mensagens a qualquer momento**. Funciona assim:
+
+- **Rotas:** `$connect` (abertura da conexão, onde se faz a autorização), `$disconnect`, `$default`, e rotas personalizadas escolhidas por um campo da mensagem (*route selection expression*, ex: `$request.body.action`). Cada rota tem sua integração, normalmente uma Lambda.
+- **Connection ID:** cada cliente conectado tem um ID. O backend **guarda** esses IDs, normalmente no DynamoDB, ao receber o `$connect`.
+- **Enviar para o cliente:** o backend chama a **API de gerenciamento de conexões** (`@connections`, com `POST` para o connection ID) para enviar uma mensagem a um cliente específico, ou percorre os IDs para fazer *broadcast*.
+- **Sem estado no Lambda:** a conexão é mantida pelo API Gateway. As funções só são invocadas quando há mensagens, e o Lambda continua stateless.
+
+![Diagrama API Gateway - WebSocket API](./img/amazon-api-gateway/amazon-api-gateway-04.png)
+
+[↑ Índice](#índice)
+
+### Observabilidade
+
+- **CloudWatch metrics:** `Count`, `4XXError`, `5XXError`, `Latency` (total) e `IntegrationLatency` (só o backend). A diferença entre as duas mostra o tempo gasto no próprio API Gateway. Para cache, `CacheHitCount` e `CacheMissCount`.
+- **Access logs:** um registro por requisição, em formato configurável: quem chamou, status, latência.
+- **Execution logs** (REST): o detalhe de cada etapa, útil para depurar autorizadores e mapping templates. Deve ficar desligado ou em nível baixo em produção, por custo e volume.
+- **AWS X-Ray** (REST): tracing da requisição através do API Gateway e do backend.
+
+[↑ Índice](#índice)
+
+### API Gateway, ALB, AppSync ou Function URL?
+
+| Necessidade | Escolha |
+|---|---|
+| Gestão de API: chaves, cotas por cliente, cache, transformação, autorizadores | **API Gateway (REST)** |
+| API simples na frente de Lambda, com JWT/OIDC e baixo custo | **API Gateway (HTTP)** |
+| Comunicação bidirecional em tempo real | **API Gateway WebSocket** (ou **AppSync** com subscriptions) |
+| Tráfego HTTP de alto volume e constante para containers/instâncias, sem recursos de gestão de API | **ALB** (custo por hora + LCU, mais barato em volume muito alto) |
+| **GraphQL**: o cliente escolhe os campos, junta várias fontes de dados em uma chamada, *subscriptions* em tempo real | **AWS AppSync** |
+| Expor **uma** função Lambda com o mínimo de configuração | **Lambda Function URL** |
+| Conectar serviços **internos** entre VPCs e contas, com autenticação IAM | **VPC Lattice** (ou API Gateway privada) |
+
+[↑ Índice](#índice)
+
+### Padrões arquiteturais
+
+- **Storage-first:** API Gateway → **SQS**, Kinesis ou EventBridge diretamente, com o processamento desacoplado.
+- **Processamento longo:** API Gateway → **Step Functions** (`StartExecution`) → devolve **202** com o ID da execução → o cliente consulta o status em outro endpoint, ou recebe o resultado por WebSocket.
+- **Upload de arquivos grandes:** a API devolve uma **URL pré-assinada** do S3, e o cliente envia o arquivo direto ao S3. O evento do S3 dispara o processamento.
+- **Multi-região ativo-ativo:** APIs **regionais** idênticas em duas regiões, com o mesmo **custom domain**, e o **Route 53** com roteamento por **latência** e **health checks**/failover. Os dados ficam em DynamoDB Global Tables ou Aurora Global Database.
+- **APIs internas e entre contas:** **API privada** + interface VPC endpoint na VPC consumidora + resource policy liberando aquele endpoint ou conta.
+- **Proteger um backend legado:** throttling e usage plans no API Gateway, cache para leituras repetidas e **VPC Link** para alcançar o backend sem expô-lo.
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Cotas e limites **por cliente/parceiro**, com chaves de acesso" → **REST API** + **usage plans** + **API keys** (e um autorizador de verdade, porque API key não é autenticação).
+- "API simples para Lambda com o **menor custo**, autenticação **JWT/OIDC**" → **HTTP API**.
+- "Proteger a API contra SQL injection/XSS e limitar requisições por IP" → **AWS WAF** na **REST API** (ou CloudFront + WAF na frente da HTTP API).
+- "API acessível **somente de dentro da VPC**" → **API privada** + **interface VPC endpoint** (`execute-api`) + **resource policy**.
+- "Expor um serviço ECS/EC2 em **subnet privada** pelo API Gateway" → **VPC Link** (REST: NLB; HTTP: ALB/NLB/Cloud Map).
+- "Gravar requisições em uma fila **sem Lambda**" → integração **AWS service** direta com **SQS** (storage-first).
+- "Processamento que leva **mais de 29 segundos**" → **assíncrono**: SQS ou Step Functions + resposta **202** + polling/WebSocket.
+- "Upload de arquivos maiores que **10 MB**" → **URL pré-assinada do S3**.
+- "Reduzir chamadas repetidas ao backend" → **cache** do API Gateway (REST), ou **CloudFront** na frente.
+- "Autorização com lógica própria (token proprietário, permissões por tenant)" → **Lambda authorizer**, com cache do resultado.
+- "Chamadas entre serviços/contas com credenciais AWS" → autorização **IAM (SigV4)** + resource policy para entre contas.
+- "Clientes recebem **429**" → throttling: rever limites de stage, método ou usage plan, ou pedir aumento da quota da conta.
+- "Clientes no mundo todo, sem customizar a CDN" → **edge-optimized**. "CloudFront próprio com WAF e cache personalizados" → **regional** + CloudFront.
+- "Certificado do custom domain para endpoint **edge-optimized**" → ACM em **us-east-1**.
+- "Clientes B2B precisam se autenticar com certificado" → **mTLS** no custom domain.
+- "Notificações em tempo real do servidor para o navegador" → **WebSocket API** (connection IDs no DynamoDB + `@connections`), ou **AppSync** subscriptions.
+- "Testar uma versão nova da API com uma parte do tráfego" → **canary release** no stage (REST).
+- "API ativa em duas regiões com failover" → APIs **regionais** + custom domain + **Route 53** (latência/failover + health checks).
+
+[↑ Índice](#índice)
+
 ## High Performance Computing (HPC)
 
 **HPC** (*High Performance Computing*, computação de alto desempenho) é usar **muitos computadores trabalhando juntos** para resolver um problema grande demais para uma máquina só. O problema é dividido em milhares de pedaços, cada núcleo calcula um pedaço, e os resultados são combinados no final. Exemplos: previsão do tempo, simulação de colisão de carros, aerodinâmica (**CFD**, *Computational Fluid Dynamics*), sequenciamento genômico, descoberta de medicamentos, análise sísmica, risco financeiro e renderização de filmes.
@@ -2481,6 +2691,20 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Deploy gradual com rollback | [Alias com pesos + CodeDeploy](#deploy-versões-aliases-e-pacotes) |
 | Lógica no CloudFront | [CloudFront Functions / Lambda@Edge](#lambda-na-borda-e-formas-de-expor-funções) |
 | Processo longo, carga constante, GPU | [Outra opção](#custo-e-quando-o-lambda-não-é-a-melhor-escolha) |
+
+### API Gateway
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Cotas e limites por cliente | [REST API + usage plans + API keys](#throttling-usage-plans-e-cache) |
+| API simples e barata com JWT/OIDC | [HTTP API](#tipos-de-api-rest-http-e-websocket) |
+| API só acessível da VPC | [API privada + interface endpoint + resource policy](#tipos-de-endpoint-rest-api) |
+| Backend em subnet privada | [VPC Link](#integrações) |
+| Gravar em fila sem Lambda | [Integração AWS service (storage-first)](#integrações) |
+| Processamento > 29 s | [Padrão assíncrono (202 + polling/WebSocket)](#limites-do-api-gateway) |
+| Autorização com lógica própria | [Lambda authorizer](#segurança) |
+| Tempo real servidor → cliente | [WebSocket API](#websocket-apis) |
+| API Gateway, ALB, AppSync ou Function URL | [Comparação](#api-gateway-alb-appsync-ou-function-url) |
 
 ### High Performance Computing
 
