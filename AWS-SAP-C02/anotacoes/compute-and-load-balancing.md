@@ -1190,6 +1190,35 @@ O *network mode* da task definition define **como os containers recebem endereç
 
 ![Diagrama Amazon ECS - Network modes awsvpc e bridge](./img/amazon-ecs/amazon-ecs-03.png)
 
+#### Quando usar awsvpc ou bridge
+
+O **awsvpc é o padrão**, e o bridge é a exceção, disponível só no ECS com EC2.
+
+**Use awsvpc quando:**
+
+- é preciso um **security group por serviço**. Por exemplo, a API de pagamentos só aceita conexões do frontend. No bridge, todas as tasks da instância dividem o mesmo SG, e esse isolamento não existe;
+- há necessidade de **visibilidade e controle de rede por task**: IP próprio, VPC Flow Logs por task, NACLs e rotas como se cada task fosse um servidor;
+- a task roda no **Fargate**, que só aceita awsvpc;
+- a integração espera um **IP da VPC**: target groups do tipo **IP** no ALB/NLB, Service Connect, VPC Lattice.
+
+**O bridge ainda faz sentido quando:**
+
+- há **muitas tasks pequenas por instância** e o **limite de ENIs** atrapalha. No awsvpc, cada task consome uma ENI, e cada instância aceita poucas: uma `c5.large` tem 3, e uma delas é da própria instância. O **ENI trunking** resolve isso nos tipos compatíveis. Sem ele, o bridge com portas dinâmicas coloca dezenas de tasks na mesma instância;
+- a **subnet está ficando sem IPs**. Cada task awsvpc ocupa **um IP da subnet**, e centenas de tasks podem esgotar subnets pequenas. No bridge, só a instância consome IP;
+- o workload é **legado** e já foi desenhado com mapeamento de portas, e migrar não traz ganho.
+
+Para **desempenho bruto de rede**, a opção é o **host**, e não o bridge: o container usa a rede da instância sem a camada de NAT do Docker, mas só cabe uma task por porta em cada instância.
+
+| Critério | **awsvpc** | **bridge** |
+|---|---|---|
+| Fargate | Obrigatório | Não existe |
+| Security group | **Por task** | Da instância (compartilhado) |
+| IP | Um IP da VPC por task | Só o da instância |
+| Densidade no EC2 | Limitada pelas ENIs (melhora com ENI trunking) | Alta (portas dinâmicas) |
+| Consumo de IPs da subnet | Alto (1 por task) | Baixo |
+| Target group no ALB/NLB | Tipo **IP** | Tipo **instância** (instância:porta) |
+| Recomendação da AWS | **Padrão** | Casos específicos |
+
 > **Paralelo com o Lambda:** uma função Lambda **em VPC** usa ENIs gerenciadas e security groups, assim como uma task **awsvpc**. A diferença é que no ECS cada task tem a sua ENI.
 
 [↑ Índice](#índice)
@@ -1277,6 +1306,71 @@ Containers são **efêmeros**: o que é gravado no sistema de arquivos do contai
 
 [↑ Índice](#índice)
 
+### Sidecars
+
+Uma aplicação em produção precisa de várias funções **além** do próprio negócio:
+- enviar logs para algum lugar;
+- coletar métricas e traces;
+- criptografar o tráfego;
+- descobrir outros serviços;
+- buscar configuração.
+
+Colocar tudo isso **dentro** do código da aplicação mistura responsabilidades e obriga cada equipe a reimplementar o mesmo em cada linguagem. O padrão **sidecar** resolve isso tirando essas funções da aplicação e colocando-as em um **container auxiliar**, que roda **ao lado** dela, na **mesma task**.
+
+> **Como pensar:** é o **sidecar de uma moto**, o carrinho preso ao lado dela. Ele vai sempre junto, para onde a moto for, mas é uma peça separada, que pode ser trocada sem mexer no motor.
+
+**O que faz um container ser "sidecar" e não apenas outro serviço:** ele vive **dentro da mesma task** (ou do mesmo *pod*, no Kubernetes) que a aplicação, e por isso:
+
+- **Mesmo ciclo de vida:** o sidecar sobe e desce **junto** com a aplicação, e escala junto, porque cada task nova traz o seu sidecar.
+- **Mesma rede:** no modo **awsvpc**, todos os containers da task compartilham a mesma ENI e o mesmo IP, e conversam por **`localhost`**. A aplicação envia traces para `localhost:4317`, e o sidecar recebe.
+- **Volumes compartilhados:** os containers da task podem montar o **mesmo volume**. A aplicação grava um arquivo, e o sidecar o lê e envia para fora.
+- **Mesmo host e recursos da task:** os containers dividem a CPU e a memória definidas na task definition. É possível reservar uma parte para cada container.
+
+**Sidecars comuns na AWS:**
+
+| Sidecar | O que faz |
+|---|---|
+| **FireLens** (Fluent Bit ou Fluentd) | Recebe os logs da aplicação e os envia para **vários destinos**: CloudWatch Logs, S3, Firehose, OpenSearch, ferramentas de terceiros. Pode filtrar e enriquecer os logs no caminho |
+| **AWS Distro for OpenTelemetry (ADOT)** / **X-Ray daemon** | Recebe **traces** e **métricas** da aplicação e envia para o X-Ray, CloudWatch ou Prometheus |
+| **CloudWatch agent** | Coleta métricas personalizadas (ex: StatsD, Prometheus) e envia ao CloudWatch |
+| **Proxy Envoy do Service Connect** | Injetado e **gerenciado pelo ECS**: faz service discovery, balanceamento, *retries*, *timeouts* e métricas de tráfego entre serviços. É um sidecar que você nem declara |
+| **Proxies de autenticação e TLS** | Terminam TLS, validam tokens ou fazem mTLS antes de a requisição chegar à aplicação |
+| **Agentes de terceiros** | Datadog, New Relic, agentes de segurança em tempo de execução |
+
+**Como o ECS controla os containers de uma task** (campos da task definition):
+
+- **`essential`:** se um container **essencial** para, a **task inteira** é encerrada, e o service cria outra. A aplicação é sempre essencial. Um sidecar de logs normalmente também é, porque uma task sem logs é um problema. Um sidecar opcional pode ser marcado como não essencial, e a task continua rodando se ele falhar.
+- **`dependsOn`:** define a **ordem de início**. Por exemplo, a aplicação só sobe depois que o sidecar de logs estiver **`HEALTHY`** (com health check do container), para não perder os primeiros logs. As condições são `START`, `HEALTHY`, `COMPLETE` e `SUCCESS`.
+- **Container de inicialização (*init container*):** um container **não essencial** que roda **antes** da aplicação e termina, como uma migração de banco, o download de um arquivo de configuração ou a preparação de um volume. A aplicação declara `dependsOn` com a condição **`SUCCESS`**, e só sobe se ele terminar com sucesso.
+- **`stopTimeout`:** quanto tempo cada container tem, depois do `SIGTERM`, para terminar. Os containers param na **ordem inversa** das dependências, então o sidecar de logs consegue enviar os últimos logs da aplicação.
+- **Recursos:** a CPU e a memória são definidas para a **task** e podem ser divididas entre os containers. O sidecar ocupa parte do que a task paga, e isso deve entrar no dimensionamento.
+
+![Diagrama Amazon ECS - Sidecars, init container e comparação com DAEMON](./img/amazon-ecs/amazon-ecs-06.png)
+
+**Sidecar vs. DAEMON:** as duas formas são usadas para agentes de logs e de monitoramento, mas funcionam de modos diferentes:
+
+| | **Sidecar** | **DAEMON** (estratégia de agendamento) |
+|---|---|---|
+| Quantos | **Um por task** | **Um por instância EC2** |
+| Fargate | **Sim**: é a única opção, porque não há instâncias | Não |
+| Isolamento | Cada task tem o seu, com configuração própria | Compartilhado por todas as tasks da instância |
+| Custo de recursos | Repetido em cada task | Um só por instância (mais eficiente em alta densidade) |
+| Quando usar | Fargate, configuração por serviço, proxy por task | Muitas tasks por instância EC2, agente de host (segurança, métricas da instância) |
+
+**Prós e contras do padrão:**
+
+- **Prós:** separa responsabilidades, reaproveita o mesmo sidecar em serviços de linguagens diferentes, permite atualizar o agente sem mexer na aplicação e padroniza a observabilidade e a segurança.
+- **Contras:** consome CPU e memória **em cada task**, aumenta o tempo de início, acrescenta pontos de falha (um sidecar essencial que cai derruba a task) e torna a task definition mais complexa.
+
+**Padrões relacionados** (do mesmo conceito de containers auxiliares):
+
+- **Ambassador:** um proxy que representa um serviço **externo** para a aplicação. A aplicação chama `localhost`, e o ambassador cuida de conexão, retries e autenticação com o destino real.
+- **Adapter:** **converte** a saída da aplicação para um formato padrão, por exemplo transformando métricas proprietárias em métricas no formato Prometheus.
+
+> **Paralelo com o Lambda:** as **Lambda extensions** são os "sidecars" do Lambda. Uma extensão externa roda como um **processo separado**, dentro do mesmo ambiente de execução da função, com o mesmo ciclo de vida. Ela inicia junto, recebe os eventos de **Shutdown** para enviar os últimos dados, e serve para o mesmo tipo de função auxiliar: agentes de observabilidade como Datadog ou New Relic, e a extensão de **Parameters and Secrets**, que faz cache de configuração e segredos. Se você já usou uma Lambda Layer com uma extensão de monitoramento, já usou o padrão sidecar.
+
+[↑ Índice](#índice)
+
 ### Amazon ECR (Elastic Container Registry)
 
 O registry de imagens da AWS, integrado ao IAM. Os pontos que caem na prova:
@@ -1296,7 +1390,7 @@ O registry de imagens da AWS, integrado ao IAM. Os pontos que caem na prova:
 - **Tarefas agendadas:** o **EventBridge Scheduler** executa uma standalone task em um horário (ex: um relatório diário). É a alternativa ao Lambda quando o job passa de 15 minutos.
 - **Tarefas orientadas a eventos:** um arquivo chega no S3 → uma regra do **EventBridge** → `RunTask` processa o arquivo. O **Step Functions** também executa tasks ECS como etapas de um fluxo, esperando a conclusão.
 - **Workers de fila:** um service lê uma fila **SQS** e escala pelo **backlog por task**.
-- **Sidecar:** um container auxiliar na mesma task: proxy, agente de logs (FireLens), coletor de métricas.
+- **Sidecar:** um container auxiliar na mesma task, como proxy, agente de logs ou coletor de métricas. Ver [Sidecars](#sidecars).
 - **Placement** (só no EC2): as **placement strategies** (`binpack` para usar o mínimo de instâncias, `spread` por AZ ou instância para alta disponibilidade, `random`) e as **constraints** (`distinctInstance`, ou `memberOf` com expressões, como "só em instâncias com GPU") definem em qual instância cada task cai.
 
 [↑ Índice](#índice)
@@ -1324,7 +1418,10 @@ O registry de imagens da AWS, integrado ao IAM. Os pontos que caem na prova:
 - "Permissões diferentes para cada serviço na mesma instância" → uma **task role** por task definition, e bloquear o acesso das tasks ao **IMDS** da instância.
 - "Security group **por serviço**" → network mode **awsvpc**.
 - "Várias tasks iguais na **mesma instância EC2** atrás de um ALB" → network mode **bridge** com **mapeamento dinâmico de portas** (ou awsvpc com ENI trunking).
-- "Um agente de monitoramento em **cada instância** do cluster" → service com estratégia **DAEMON**.
+- "Tasks awsvpc não sobem por **falta de ENIs** na instância" → **ENI trunking** (em instâncias compatíveis) ou bridge. "A subnet está **ficando sem IPs**" com muitas tasks awsvpc → subnets maiores (ou um CIDR secundário na VPC), ou bridge.
+- "Um agente de monitoramento em **cada instância** do cluster" → service com estratégia **DAEMON**. "Agente de logs ou de tracing no **Fargate**" → **sidecar** (FireLens, ADOT), porque no Fargate não há DAEMON.
+- "Enviar os logs dos containers para **vários destinos** (S3, OpenSearch, ferramenta de terceiros)" → sidecar **FireLens**.
+- "Rodar uma migração ou preparar arquivos **antes** de a aplicação subir" → container **não essencial** + `dependsOn` com condição **`SUCCESS`** (init container).
 - "Tasks novas ficam **pendentes** por falta de capacidade no cluster EC2" → **capacity provider** com **managed scaling**.
 - "Escalar o número de tasks pela CPU ou pelas requisições" → **service auto scaling** (Application Auto Scaling) com target tracking.
 - "Deploy que **volta sozinho** se as tasks novas não ficarem saudáveis" → **deployment circuit breaker** com rollback. "Canary/linear com rollback automático" → **blue/green** com CodeDeploy ou o nativo do ECS.
