@@ -11,6 +11,7 @@ servicos:
   - AWS Fargate
   - Amazon ECR
   - Amazon EKS
+  - AWS Lambda
   - AWS ParallelCluster
   - AWS Parallel Computing Service (PCS)
   - AWS Batch
@@ -33,6 +34,7 @@ tags: [sap-c02, compute, load-balancing]
 
 - **Compute:** [Amazon EC2](#amazon-elastic-compute-cloud-ec2) · [Amazon EC2 Auto Scaling](#amazon-ec2-auto-scaling) · [Auto Scaling Update Strategies](#auto-scaling-update-strategies) · [Spot Instances & Spot Fleet](#spot-instances--spot-fleet) · [High Performance Computing (HPC)](#high-performance-computing-hpc)
 - **Containers:** [Containers (conceitos)](#containers) · [Amazon ECS](#amazon-elastic-container-service-ecs) · [Amazon EKS](#amazon-elastic-kubernetes-service-eks)
+- **Serverless:** [AWS Lambda](#aws-lambda)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## Amazon Elastic Compute Cloud (EC2)
@@ -1797,6 +1799,250 @@ O Kubernetes lança uma versão menor (*minor*) a cada ~4 meses, e versões anti
 
 [↑ Índice](#índice)
 
+## AWS Lambda
+
+O **AWS Lambda** executa código **sob demanda, acionado por eventos**, sem servidores para gerenciar: a AWS cuida da capacidade, da escala, da alta disponibilidade multi-AZ e dos patches do runtime. A cobrança é por **requisição** e por **duração × memória** (GB-segundo), e uma função sem uso não custa nada.
+
+O uso diário de Lambda é parecido em qualquer projeto. Na SAP-C02, o que diferencia uma resposta certa de uma errada são os **detalhes de comportamento**:
+- **como** a função é invocada, e o que isso muda em retries e erros;
+- **quanto** ela pode escalar e como proteger os sistemas que ela chama;
+- como lidar com **cold start**, **VPC** e **bancos relacionais**;
+- **quando o Lambda não é a resposta**: processos longos, cargas constantes e pesadas, estado em memória.
+
+> **Comparação com o resto deste arquivo:** o Lambda é o extremo "a AWS gerencia tudo" da escala vista em [Containers na AWS: o mapa](#containers-na-aws-o-mapa). Muitos mecanismos do EC2/ECS têm equivalente aqui:
+> - a **execution role** corresponde ao instance profile e à task role;
+> - a **provisioned concurrency** corresponde à capacidade mínima do ASG;
+> - a **reserved concurrency** corresponde à capacidade máxima;
+> - as **versões e aliases com pesos** correspondem ao blue/green com target groups ponderados.
+
+### Ambiente de execução e cold start
+
+Cada invocação roda em um **ambiente de execução**: uma microVM **Firecracker** isolada, com o runtime, o código e a memória configurada. O ciclo de vida de um ambiente é:
+
+1. **Init (cold start):** a AWS cria o ambiente, baixa o código ou a imagem, inicia o runtime e roda o **código de inicialização** (tudo fora do handler: imports, clientes do SDK, conexões). Isso leva de dezenas de milissegundos a alguns segundos, dependendo do runtime, do tamanho do pacote e do que a inicialização faz.
+2. **Invoke:** o handler processa o evento. O mesmo ambiente é **reaproveitado** nas próximas invocações (*warm start*): variáveis globais, conexões e o conteúdo de `/tmp` persistem entre elas, mas **sem garantia**.
+3. **Shutdown:** depois de um tempo ocioso, ou quando a AWS recicla o ambiente, ele é destruído. As extensões recebem o evento de Shutdown.
+
+**Cada ambiente atende uma invocação por vez.** Se chegam 50 requisições simultâneas, são necessários 50 ambientes. É isso que define a **concorrência**.
+
+**Como reduzir o cold start:**
+
+- **Provisioned concurrency:** mantém N ambientes **já inicializados**, prontos para responder. Elimina o cold start, mas é **cobrada** enquanto estiver configurada, usada ou não. É configurada em uma **versão ou alias**, e pode escalar por horário ou por utilização com o **Application Auto Scaling**.
+- **SnapStart:** no publish de uma versão, a AWS roda o Init uma vez, tira um **snapshot** da memória do ambiente inicializado e, nos cold starts, **restaura o snapshot** em vez de reinicializar. Reduz drasticamente o cold start de runtimes pesados (Java, .NET, Python), com custo bem menor que o da provisioned concurrency. Cuidado com o que é único por ambiente: números aleatórios, conexões abertas e credenciais criadas no Init precisam ser renovados depois da restauração (*runtime hooks*). Não pode ser usado junto com provisioned concurrency.
+- **Otimizações:** pacote menor, menos dependências, inicialização preguiçosa (*lazy*), runtime leve e **mais memória**, porque a CPU acompanha a memória.
+
+![Diagrama AWS Lambda - Ambiente de execução, cold start, provisioned concurrency e SnapStart](./img/aws-lambda/aws-lambda-01.png)
+
+[↑ Índice](#índice)
+
+### Modelos de invocação
+
+O mesmo código se comporta de forma **muito diferente** conforme quem o invoca. Esse é um dos assuntos mais cobrados:
+
+| | **Síncrona** | **Assíncrona** | **Event source mapping** (polling) |
+|---|---|---|---|
+| Quem invoca | API Gateway, ALB, Function URL, Cognito, SDK (`RequestResponse`) | S3, SNS, EventBridge, CloudWatch Logs, SES, SDK (`Event`) | O **próprio Lambda** lê de **SQS**, **Kinesis**, **DynamoDB Streams**, **MSK/Kafka**, **Amazon MQ**, DocumentDB |
+| Quem espera a resposta | O chamador | Ninguém: o evento vai para uma **fila interna** do Lambda | O poller, que entrega **lotes** (*batches*) de registros |
+| Retries em caso de erro | **Do chamador** (o Lambda não refaz) | **Do Lambda**: até **2 novas tentativas** (configurável de 0 a 2), com espera crescente; o evento pode ficar até **6 horas** na fila | Depende da fonte: **SQS** devolve a mensagem à fila; **streams** repetem o lote até sucesso ou expiração |
+| Para onde vão as falhas | Erro para o chamador | **Destinations** (on failure) ou **DLQ** | **On-failure destination** (streams, Kafka) ou **DLQ da própria fila SQS** |
+| Payload máximo | 6 MB (requisição e resposta) | ~256 KB (a AWS vem ampliando esse limite; conferir o valor atual) | Definido pelo lote |
+
+![Diagrama AWS Lambda - Modelos de invocação](./img/aws-lambda/aws-lambda-02.png)
+
+**Invocação assíncrona: destinations vs. DLQ.**
+
+- **Destinations:** enviam o resultado de uma invocação assíncrona para **SQS, SNS, EventBridge ou outra Lambda**, tanto em **sucesso** quanto em **falha**, com o **contexto completo** (evento original, erro, tentativas). É o mecanismo **recomendado**.
+- **DLQ (Dead-Letter Queue):** SQS ou SNS que recebe **só as falhas**, com menos contexto. É o mecanismo mais antigo.
+- **Idempotência:** com retries automáticos, o mesmo evento pode ser processado **mais de uma vez**. As funções devem ser **idempotentes**, por exemplo registrando um ID do evento já processado no DynamoDB, com o *Powertools for AWS Lambda*.
+
+**Event source mapping: SQS.**
+
+- O Lambda lê **lotes** (até 10 mil mensagens em filas standard, com *batching window* para juntar mensagens) e escala o número de pollers conforme a fila cresce.
+- Se a função falha, as mensagens **voltam a ficar visíveis** e são reprocessadas. Depois de N tentativas (`maxReceiveCount`), vão para a **DLQ da fila**.
+- **Partial batch response** (`ReportBatchItemFailures`): a função informa **quais mensagens** falharam, e só elas voltam para a fila. Sem isso, uma mensagem ruim faz o **lote inteiro** ser reprocessado.
+- O **visibility timeout** da fila deve ser **maior que o timeout da função**. A recomendação é pelo menos 6 vezes, para dar tempo aos retries sem que a mensagem reapareça enquanto ainda está sendo processada.
+- **Maximum concurrency** no event source mapping limita quantas execuções a fila pode disparar ao mesmo tempo, protegendo um banco de dados ou uma API downstream.
+- **FIFO:** a ordem é mantida por *message group*, e cada grupo é processado por uma execução por vez.
+
+**Event source mapping: Kinesis e DynamoDB Streams.**
+
+- Os registros são lidos **por shard, em ordem**. Por padrão, **um lote por shard por vez**.
+- Um registro que falha **bloqueia o shard**: o lote é repetido até ter sucesso ou até os registros expirarem. Isso é o *poison pill*. Para evitar, use:
+  - **bisect batch on error** (divide o lote ao meio para isolar o registro ruim);
+  - **maximum retry attempts** e **maximum record age**;
+  - **on-failure destination**, que envia os metadados do lote que falhou para SQS, SNS ou S3;
+  - **partial batch response**.
+- **Parallelization factor** (até 10): processa até 10 lotes por shard ao mesmo tempo, mantendo a ordem **por chave de partição**. Aumenta a vazão sem precisar de mais shards.
+
+![Diagrama AWS Lambda - Tratamento de erros em filas e streams](./img/aws-lambda/aws-lambda-03.png)
+
+[↑ Índice](#índice)
+
+### Concorrência e escala
+
+**Concorrência** é o número de **execuções simultâneas**. Uma estimativa útil: concorrência ≈ **requisições por segundo × duração média (s)**. Por exemplo, 500 req/s × 0,2 s = 100 execuções simultâneas.
+
+- **Limite da conta:** por padrão, **1.000 execuções simultâneas por região**, compartilhadas por **todas** as funções da conta. É uma quota ajustável. Quando ela é atingida, as invocações sofrem **throttling**:
+  - **síncronas** recebem erro **429**;
+  - **assíncronas** e de **event source mapping** são repetidas automaticamente.
+- **Velocidade de escala:** cada função pode aumentar a concorrência em até **1.000 execuções a cada 10 segundos**, até o limite da conta.
+- **Reserved concurrency:** reserva uma parte do limite da conta para uma função (ex: 100), com dois efeitos:
+  - **garante** que ela sempre terá essa capacidade, mesmo que outras funções consumam o resto;
+  - **limita** a função a esse valor, protegendo um banco de dados ou uma API que não aguenta mais.
+
+  Com reserved concurrency **0**, a função é **desligada**, o que serve como um *kill switch*. Não tem custo.
+- **Provisioned concurrency:** ambientes **pré-inicializados**, para latência sem cold start (ver [Ambiente de execução e cold start](#ambiente-de-execução-e-cold-start)). Tem custo.
+
+![Diagrama AWS Lambda - Concorrência da conta, reserved e provisioned](./img/aws-lambda/aws-lambda-04.png)
+
+**Proteger o que está atrás do Lambda.** O Lambda escala muito mais rápido do que um banco relacional ou uma API legada aguentam. Padrões comuns:
+
+- **Fila na frente** (SQS) + **maximum concurrency** no event source mapping, ou **reserved concurrency** na função, para controlar o ritmo.
+- **RDS Proxy** para bancos relacionais (ver [Lambda em VPC e acesso a dados](#lambda-em-vpc-e-acesso-a-dados)).
+- **Throttling** no **API Gateway** (limites por stage, por método e por cliente via *usage plans*), antes mesmo de a requisição chegar ao Lambda.
+
+[↑ Índice](#índice)
+
+### Lambda em VPC e acesso a dados
+
+Por padrão, a função roda em uma **VPC gerenciada pela AWS**, com acesso à internet e aos endpoints públicos dos serviços, mas **sem acesso** aos recursos privados da sua VPC (RDS, ElastiCache, serviços internos).
+
+**Ao associar a função a subnets e security groups da sua VPC:**
+
+- O Lambda cria **Hyperplane ENIs** nas subnets: interfaces **compartilhadas** por todos os ambientes que usam a mesma combinação de subnet e security group. São criadas quando a função é configurada, e não a cada invocação, então o antigo cold start extra de VPC não existe mais.
+- A função passa a acessar os recursos privados, controlada pelos **security groups**.
+- A função **perde o acesso direto à internet**: ela **não recebe IP público**, mesmo em subnet pública. Para alcançar a internet ou APIs públicas, é preciso colocá-la em **subnets privadas** com rota para um **NAT Gateway**.
+- Para acessar serviços AWS **sem NAT**, use **VPC endpoints**: gateway para S3 e DynamoDB, e interface para os demais (SQS, Secrets Manager, STS...).
+- Use subnets em **várias AZs**, para alta disponibilidade.
+
+**Bancos relacionais: RDS Proxy.** Cada ambiente de execução abre **suas próprias conexões**. Com 500 execuções simultâneas, são 500+ conexões, e o banco esgota o limite de conexões e a memória. O **RDS Proxy** mantém um **pool de conexões** compartilhado entre as funções e o banco, e ainda:
+- reduz o tempo de failover do Aurora/RDS;
+- pode autenticar com **IAM** e buscar a senha no **Secrets Manager**.
+
+O proxy fica na VPC, então a função também precisa estar. A alternativa sem conexões persistentes é a **RDS Data API** (Aurora), que funciona por HTTPS.
+
+**Arquivos compartilhados: EFS.** A função pode montar um **EFS**, para arquivos grandes, modelos de ML ou dados compartilhados entre execuções e com instâncias EC2 e containers. É obrigatório estar em VPC. O `/tmp` (até 10 GB) é local a cada ambiente e efêmero.
+
+![Diagrama AWS Lambda - Lambda em VPC, NAT, VPC endpoints e RDS Proxy](./img/aws-lambda/aws-lambda-05.png)
+
+[↑ Índice](#índice)
+
+### Permissões
+
+São **duas políticas diferentes**, e a prova costuma testar qual usar:
+
+- **Execution role** (role de execução): o que a **função pode fazer**, como ler o S3, gravar no DynamoDB ou enviar logs. Equivale à task role do ECS.
+- **Resource-based policy** (política da função): **quem pode invocar** a função. Por exemplo, permitir que o S3 de um bucket específico, o SNS, o EventBridge, o API Gateway ou **outra conta AWS** chame a função. Ao configurar um gatilho pelo console, essa permissão é criada automaticamente.
+- **Event source mappings** são o caso oposto: quem lê a fila ou o stream é o **Lambda**, então a permissão de `sqs:ReceiveMessage`, `kinesis:GetRecords` etc. fica na **execution role**, e não na resource policy.
+- **Invocação entre contas:** resource-based policy na função permitindo a conta ou role de origem, e a role de origem com permissão `lambda:InvokeFunction`.
+
+**Outros pontos de segurança:**
+
+- **Variáveis de ambiente** são criptografadas em repouso com KMS. Para **segredos**, o recomendado é buscá-los no **Secrets Manager** ou no **Parameter Store**, com cache pela extensão *Parameters and Secrets*.
+- **Code signing** (com o AWS Signer) garante que só código **assinado por publicadores confiáveis** seja implantado.
+- **Detecção de loops recursivos:** o Lambda interrompe automaticamente loops como "a função grava no S3, que dispara a mesma função". É uma proteção, não um substituto de um bom desenho.
+
+[↑ Índice](#índice)
+
+### Deploy: versões, aliases e pacotes
+
+- **Versões:** um snapshot **imutável** do código e da configuração (`:1`, `:2`...). `$LATEST` é a versão editável.
+- **Aliases:** ponteiros com nome (`prod`, `staging`) para uma versão. Os gatilhos e os clientes apontam para o **alias**, e o deploy muda o alias para a nova versão.
+- **Alias com pesos** (*weighted alias*): divide o tráfego entre duas versões (ex: 90% na v5 e 10% na v6), o que permite fazer **canary**. O **CodeDeploy** automatiza isso com as configurações **canary** (`Canary10Percent5Minutes`), **linear** (`Linear10PercentEvery1Minute`) e **all at once**, com **rollback automático** por alarmes do CloudWatch e hooks de validação antes e depois da troca. É o mesmo conceito de [Auto Scaling Update Strategies](#auto-scaling-update-strategies), aplicado a funções.
+- **Pacotes:**
+  - **.zip:** até 50 MB compactado no upload direto, ou 250 MB descompactado, contando as layers;
+  - **container image:** até **10 GB**, no ECR. É bom para dependências grandes (ex: bibliotecas de ML) e para padronizar com o pipeline de containers.
+- **Layers:** bibliotecas e dependências compartilhadas entre funções, até 5 por função.
+- **Extensions:** processos auxiliares no ambiente de execução, como agentes de observabilidade e cache de segredos. São os "sidecars" do Lambda (ver [Sidecars](#sidecars)).
+- **Infraestrutura como código:** AWS SAM, CDK ou CloudFormation. O SAM inclui o *deployment preference* que liga o CodeDeploy automaticamente.
+
+[↑ Índice](#índice)
+
+### Limites que mudam a arquitetura
+
+| Limite | Valor | Consequência na arquitetura |
+|---|---|---|
+| **Timeout** | **15 minutos** | Processos mais longos → **Step Functions** (dividir em etapas), **ECS/Fargate** ou **AWS Batch** |
+| **Memória** | 128 MB a **10.240 MB**, com CPU proporcional (até 6 vCPUs) | Cargas muito pesadas de CPU ou memória → EC2/ECS |
+| **`/tmp`** | 512 MB a **10 GB** | Arquivos maiores ou compartilhados → **EFS** ou S3 |
+| **Payload síncrono** | **6 MB** | Arquivos grandes → upload direto ao **S3** com URL pré-assinada, e processar no evento do S3 |
+| **API Gateway (REST)** | Timeout de integração de **29 s** (ampliável sob pedido) | Processamento longo atrás de API → assíncrono (fila + polling ou WebSocket) |
+| **Concorrência** | 1.000 por região (ajustável) | Planejar quota, reserved concurrency e proteção do downstream |
+| **GPU** | Não há | ML com GPU → SageMaker, ECS/EKS em EC2 |
+
+[↑ Índice](#índice)
+
+### Lambda na borda e formas de expor funções
+
+- **Function URL:** um endpoint HTTPS **dedicado** para a função, com autenticação **IAM** ou pública, e CORS. Não tem os recursos do API Gateway (autorizadores, throttling por cliente, cache, WAF direto), mas é a forma mais simples de expor uma função.
+- **API Gateway:** REST ou HTTP API, com autorizadores (Cognito, Lambda, IAM), *usage plans*, cache, validação e integração com WAF.
+- **ALB:** uma função pode ser um **target** de um ALB, útil para misturar Lambda com EC2/ECS atrás do mesmo load balancer.
+- **Response streaming:** a função envia a resposta **aos poucos**, o que reduz o tempo até o primeiro byte e permite respostas maiores que 6 MB. Funciona via Function URL ou API Gateway.
+- **Lambda@Edge vs. CloudFront Functions:** código executado no **CloudFront**, perto dos usuários.
+
+| | **CloudFront Functions** | **Lambda@Edge** |
+|---|---|---|
+| Linguagem | JavaScript (subconjunto) | Node.js, Python |
+| Execução | Sub-milissegundo, nos edge locations | Milissegundos a segundos, nos *regional edge caches* |
+| Eventos | Viewer request/response | Viewer **e origin** request/response |
+| Acesso à rede/corpo da requisição | Não | Sim (chamar APIs, ler o corpo) |
+| Uso típico | Reescrita de URL, headers, redirecionamentos, validação simples de token, em altíssima escala e baixo custo | Lógica mais pesada: autenticação com chamadas externas, personalização, roteamento por origem |
+
+[↑ Índice](#índice)
+
+### Observabilidade
+
+- **CloudWatch Logs:** tudo o que a função escreve no stdout vai para um log group. Os *advanced logging controls* permitem logs em **JSON** e filtro por nível.
+- **Métricas:** invocações, erros, duração, **throttles**, concorrência, **IteratorAge** (atraso no processamento de streams) e idade de eventos assíncronos.
+- **AWS X-Ray / ADOT:** tracing distribuído entre API Gateway, Lambda, DynamoDB e outros serviços.
+- **CloudWatch Lambda Insights:** métricas de sistema (CPU, memória, cold starts) via extensão.
+- **Powertools for AWS Lambda:** biblioteca com logs estruturados, métricas, tracing, idempotência e *batch processing*.
+
+[↑ Índice](#índice)
+
+### Custo e quando o Lambda não é a melhor escolha
+
+- **Cobrança:** requisições + GB-segundo + extras (provisioned concurrency, SnapStart, transferência de dados, armazenamento efêmero acima de 512 MB). A arquitetura **arm64 (Graviton)** custa cerca de 20% menos por GB-segundo, com desempenho igual ou melhor para a maioria das cargas. **Compute Savings Plans** também cobrem o Lambda.
+- **Rightsizing:** mais memória dá mais CPU. Às vezes, dobrar a memória **reduz o custo**, porque a duração cai mais do que pela metade. O **Lambda Power Tuning** e o **Compute Optimizer** ajudam a achar o ponto ideal.
+
+**Quando outra opção é melhor:**
+
+| Situação | Melhor opção |
+|---|---|
+| Processamento acima de **15 min** | Step Functions (em etapas), **ECS/Fargate**, **AWS Batch** |
+| Carga **constante e alta**, 24×7 | **ECS/Fargate ou EC2** com Savings Plans costumam sair mais baratos a partir de certa utilização |
+| Conexões **persistentes** (WebSocket com estado, gRPC streaming, TCP) | ECS/EKS/EC2 (ou API Gateway WebSocket + Lambda, sem estado na função) |
+| **GPU** ou hardware específico | EC2, ECS/EKS em EC2, SageMaker |
+| Estado em memória entre requisições, cache local grande | ECS/EC2 (ou ElastiCache externo) |
+| Orquestrar várias funções com retries, esperas e paralelismo | **Step Functions** (em vez de uma função chamando outra) |
+
+> **Obs:** "Lambda chamando Lambda" de forma síncrona é um **anti-padrão**. A primeira função fica parada, e paga, esperando a segunda, os erros se acumulam e os timeouts somam. Use **Step Functions** para orquestrar, ou **eventos** (SQS, SNS, EventBridge) para desacoplar.
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Eliminar o **cold start** de uma API com picos previsíveis" → **provisioned concurrency** (com Application Auto Scaling por horário). "Reduzir cold start de **Java** com menor custo" → **SnapStart**.
+- "Garantir capacidade para uma função crítica e **limitar** outra que sobrecarrega o banco" → **reserved concurrency**. "Desligar uma função imediatamente" → reserved concurrency = **0**.
+- "Invocações síncronas retornando **429**" → **throttling**: aumentar a quota da conta, rever reserved concurrency, ou colocar uma **fila** na frente.
+- "Muitas funções esgotando as **conexões** do RDS/Aurora" → **RDS Proxy**.
+- "Função em VPC não acessa a **internet**" → subnet **privada** com rota para **NAT Gateway** (Lambda não recebe IP público). "Acessar S3/DynamoDB sem NAT" → **gateway VPC endpoints**.
+- "Capturar o **resultado** (sucesso e falha) de invocações assíncronas com contexto" → **Lambda destinations** (em vez de DLQ).
+- "Uma mensagem ruim faz o **lote inteiro** do SQS ser reprocessado" → **partial batch response** (`ReportBatchItemFailures`).
+- "Mensagens do SQS processadas **duas vezes**" → visibility timeout **menor que o timeout da função**: aumentar para ≥ 6× o timeout, e tornar a função **idempotente**.
+- "Um registro com erro **trava o processamento** do Kinesis/DynamoDB Streams" → **bisect batch on error**, **maximum retry attempts/record age** e **on-failure destination**.
+- "Aumentar a vazão do Kinesis **sem adicionar shards**" → **parallelization factor**.
+- "Limitar quantas execuções uma fila SQS dispara, para proteger o downstream" → **maximum concurrency** do event source mapping.
+- "Permitir que o S3 ou outra conta invoque a função" → **resource-based policy**. "A função precisa ler o DynamoDB" → **execution role**.
+- "Deploy gradual de uma nova versão com rollback automático" → **alias com pesos + CodeDeploy** (canary/linear) e alarmes do CloudWatch.
+- "Dependências grandes (ex: bibliotecas de ML) que não cabem no .zip" → **container image** (até 10 GB) ou **EFS**.
+- "Upload de arquivos grandes por uma API com Lambda" → **URL pré-assinada do S3** (o payload síncrono é limitado a 6 MB).
+- "Manipulação simples de headers/URLs no CloudFront, em grande escala e baixo custo" → **CloudFront Functions**. "Lógica com chamadas de rede ou no evento de origem" → **Lambda@Edge**.
+- "Processamento de **mais de 15 minutos**" → **Step Functions**, **ECS/Fargate** ou **Batch**.
+- "Reduzir o custo do Lambda sem mudar o código (runtime compatível)" → **arm64 (Graviton)** e **rightsizing** de memória; Compute Savings Plans para uso constante.
+
+[↑ Índice](#índice)
+
 ## High Performance Computing (HPC)
 
 **HPC** (*High Performance Computing*, computação de alto desempenho) é usar **muitos computadores trabalhando juntos** para resolver um problema grande demais para uma máquina só. O problema é dividido em milhares de pedaços, cada núcleo calcula um pedaço, e os resultados são combinados no final. Exemplos: previsão do tempo, simulação de colisão de carros, aerodinâmica (**CFD**, *Computational Fluid Dynamics*), sequenciamento genômico, descoberta de medicamentos, análise sísmica, risco financeiro e renderização de filmes.
@@ -2219,6 +2465,22 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Expor HTTP com regras de path | [Ingress + AWS Load Balancer Controller](#rede-no-eks) |
 | Nós rápidos e sob medida | [Karpenter](#auto-scaling-no-eks-pods-e-nós) |
 | Volume compartilhado multi-AZ | [EFS CSI](#armazenamento-no-eks) |
+
+### Lambda
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Eliminar cold start | [Provisioned concurrency / SnapStart](#ambiente-de-execução-e-cold-start) |
+| Garantir ou limitar a capacidade de uma função | [Reserved concurrency](#concorrência-e-escala) |
+| Resultado de invocações assíncronas com contexto | [Destinations](#modelos-de-invocação) |
+| Lote SQS inteiro reprocessado por uma mensagem | [Partial batch response](#modelos-de-invocação) |
+| Registro ruim travando o stream | [Bisect + retries + on-failure destination](#modelos-de-invocação) |
+| Conexões esgotadas no RDS | [RDS Proxy](#lambda-em-vpc-e-acesso-a-dados) |
+| Função em VPC sem internet | [NAT Gateway / VPC endpoints](#lambda-em-vpc-e-acesso-a-dados) |
+| Quem pode invocar vs. o que a função pode fazer | [Resource policy vs. execution role](#permissões) |
+| Deploy gradual com rollback | [Alias com pesos + CodeDeploy](#deploy-versões-aliases-e-pacotes) |
+| Lógica no CloudFront | [CloudFront Functions / Lambda@Edge](#lambda-na-borda-e-formas-de-expor-funções) |
+| Processo longo, carga constante, GPU | [Outra opção](#custo-e-quando-o-lambda-não-é-a-melhor-escolha) |
 
 ### High Performance Computing
 
