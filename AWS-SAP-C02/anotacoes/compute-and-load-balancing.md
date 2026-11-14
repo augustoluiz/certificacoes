@@ -13,6 +13,11 @@ servicos:
   - Amazon EKS
   - AWS Lambda
   - Amazon API Gateway
+  - AWS AppSync
+  - AWS Global Accelerator
+  - AWS Outposts
+  - AWS Wavelength
+  - AWS Local Zones
   - AWS ParallelCluster
   - AWS Parallel Computing Service (PCS)
   - AWS Batch
@@ -20,7 +25,7 @@ servicos:
   - Amazon File Cache
   - Amazon DCV
 criado-em: 2026-11-05
-atualizado-em: 2026-11-12
+atualizado-em: 2026-11-13
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
 tags: [sap-c02, compute, load-balancing]
 ---
@@ -35,7 +40,9 @@ tags: [sap-c02, compute, load-balancing]
 
 - **Compute:** [Amazon EC2](#amazon-elastic-compute-cloud-ec2) · [Amazon EC2 Auto Scaling](#amazon-ec2-auto-scaling) · [Auto Scaling Update Strategies](#auto-scaling-update-strategies) · [Spot Instances & Spot Fleet](#spot-instances--spot-fleet) · [High Performance Computing (HPC)](#high-performance-computing-hpc)
 - **Containers:** [Containers (conceitos)](#containers) · [Amazon ECS](#amazon-elastic-container-service-ecs) · [Amazon EKS](#amazon-elastic-kubernetes-service-eks)
-- **Serverless:** [AWS Lambda](#aws-lambda) · [Amazon API Gateway](#amazon-api-gateway)
+- **Serverless:** [AWS Lambda](#aws-lambda) · [Amazon API Gateway](#amazon-api-gateway) · [AWS AppSync](#aws-appsync)
+- **Tráfego global:** [AWS Global Accelerator](#aws-global-accelerator)
+- **Híbrido e borda:** [AWS Outposts](#aws-outposts) · [AWS Wavelength](#aws-wavelength) · [AWS Local Zones](#aws-local-zones)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## Amazon Elastic Compute Cloud (EC2)
@@ -1863,7 +1870,7 @@ O mesmo código se comporta de forma **muito diferente** conforme quem o invoca.
 - **Partial batch response** (`ReportBatchItemFailures`): a função informa **quais mensagens** falharam, e só elas voltam para a fila. Sem isso, uma mensagem ruim faz o **lote inteiro** ser reprocessado.
 - O **visibility timeout** da fila deve ser **maior que o timeout da função**. A recomendação é pelo menos 6 vezes, para dar tempo aos retries sem que a mensagem reapareça enquanto ainda está sendo processada.
 - **Maximum concurrency** no event source mapping limita quantas execuções a fila pode disparar ao mesmo tempo, protegendo um banco de dados ou uma API downstream.
-- **FIFO:** a ordem é mantida por *message group*, e cada grupo é processado por uma execução por vez.
+- **FIFO:** a ordem é mantida por *message group*, e cada grupo é processado por uma execução por vez.+
 
 **Event source mapping: Kinesis e DynamoDB Streams.**
 
@@ -2250,6 +2257,540 @@ Em uma API HTTP comum, o servidor só responde quando o cliente pergunta. Em uma
 - "Notificações em tempo real do servidor para o navegador" → **WebSocket API** (connection IDs no DynamoDB + `@connections`), ou **AppSync** subscriptions.
 - "Testar uma versão nova da API com uma parte do tráfego" → **canary release** no stage (REST).
 - "API ativa em duas regiões com failover" → APIs **regionais** + custom domain + **Route 53** (latência/failover + health checks).
+
+[↑ Índice](#índice)
+
+## AWS AppSync
+
+O **AWS AppSync** é um serviço gerenciado de APIs **GraphQL**, com recursos de **tempo real** (*subscriptions*). Ele recebe as consultas dos clientes, busca os dados em **várias fontes** (DynamoDB, Lambda, Aurora, OpenSearch, APIs HTTP...) e devolve **exatamente** os campos pedidos, em uma única resposta. Assim como o API Gateway, é serverless: escala sozinho e cobra por operação e por mensagens e conexões em tempo real.
+
+Na SAP-C02, o AppSync aparece em cenários de:
+- **aplicações web e mobile** que precisam juntar dados de várias fontes em uma tela, com o mínimo de chamadas;
+- **tempo real**: chat, placares, colaboração, notificações;
+- **escolha entre REST e GraphQL**: API Gateway ou AppSync;
+- **organizações com várias equipes** expondo uma única API (Merged APIs).
+
+> **Comparação com o resto deste arquivo:** o **API Gateway** expõe **endpoints** (`GET /pedidos/42`), e cada endpoint devolve um formato fixo. O **AppSync** expõe **um único endpoint** e um **schema**, e o cliente descreve na própria requisição quais dados quer. Os dois são portas de entrada gerenciadas, com autorização, cache e WAF. A diferença está no **modelo da API**.
+
+### GraphQL: o que é e por que existe
+
+O **GraphQL** é uma linguagem de consulta para APIs, criada pelo Facebook (2012) e aberta em 2015. Ela nasceu de um problema típico de aplicações mobile com APIs REST:
+
+- **Over-fetching:** o endpoint devolve **mais** dados do que a tela precisa. `GET /usuarios/42` traz 40 campos, mas a tela só mostra o nome e a foto. Isso desperdiça banda, o que pesa no celular.
+- **Under-fetching e várias idas e voltas:** uma tela precisa de dados de **vários recursos**, como o usuário, os pedidos dele e os itens de cada pedido. Com REST, são várias chamadas em sequência (`/usuarios/42`, `/usuarios/42/pedidos`, `/pedidos/7/itens`...), cada uma com a sua latência.
+- **Versões e telas novas:** cada tela nova pede um endpoint novo ou um parâmetro novo no backend.
+
+No GraphQL, o cliente envia **uma consulta** descrevendo a "forma" dos dados que quer, e recebe exatamente isso:
+
+```graphql
+query {
+  usuario(id: "42") {
+    nome
+    foto
+    pedidos(ultimos: 3) {
+      id
+      total
+      itens { produto { nome } quantidade }
+    }
+  }
+}
+```
+
+**Conceitos do GraphQL:**
+
+- **Schema:** o **contrato** da API, que define os **tipos** (`Usuario`, `Pedido`...), os campos de cada um e as operações disponíveis. É fortemente tipado, e os clientes podem consultar o próprio schema (*introspection*) para saber o que existe.
+- **Query:** operação de **leitura**.
+- **Mutation:** operação de **escrita**: criar, alterar, apagar.
+- **Subscription:** o cliente se **inscreve** para receber dados em **tempo real** quando algo acontece. Por exemplo, "avise-me a cada nova mensagem nesta sala".
+- **Resolver:** a função que diz **de onde vem** cada campo do schema. O campo `usuario` pode vir do DynamoDB, e o campo `pedidos` de um Aurora. O servidor GraphQL chama os resolvers necessários e monta a resposta.
+
+![Diagrama AppSync - REST vs. GraphQL](./img/aws-appsync/aws-appsync-01.png)
+
+**O que se ganha e o que se paga com GraphQL:**
+
+- **Ganha:** menos chamadas e menos dados trafegados, flexibilidade para o front-end evoluir sem mudar o backend, um schema tipado e autodocumentado, e tempo real integrado.
+- **Paga:** **cache HTTP** mais difícil (todas as consultas vão para o mesmo endpoint, normalmente por `POST`), consultas **muito complexas** ou profundas podem sobrecarregar o backend, o risco do problema **N+1** (um resolver chamado para cada item de uma lista) e uma curva de aprendizado para a equipe.
+
+> **Paralelo com o Lambda:** se você já escreveu uma Lambda "BFF" (*backend for frontend*) que chama três serviços e junta as respostas para uma tela, você fez à mão o que o GraphQL faz por padrão. No AppSync, essa composição é declarada no **schema** e nos **resolvers**, e o próprio serviço orquestra as chamadas.
+
+[↑ Índice](#índice)
+
+### Arquitetura do AppSync
+
+**Data sources: de onde vêm os dados.**
+
+| Data source | Uso típico |
+|---|---|
+| **Amazon DynamoDB** | O mais comum: leitura e escrita direta, **sem Lambda**, incluindo operações em lote e transações |
+| **AWS Lambda** | Lógica de negócio, integração com qualquer sistema, ou fontes sem integração nativa |
+| **Aurora / RDS** (via **Data API** ou RDS) | Dados relacionais com SQL |
+| **Amazon OpenSearch Service** | Busca textual e consultas analíticas |
+| **HTTP** | APIs REST existentes, internas ou de terceiros, e **qualquer API AWS** (com assinatura SigV4) |
+| **Amazon EventBridge** | Publicar eventos a partir de mutations |
+| **Amazon Bedrock** | Chamar modelos de IA generativa a partir de resolvers |
+| **None** | Resolver **local**, sem fonte de dados: transformar dados ou disparar subscriptions |
+
+**Resolvers: como cada campo é resolvido.**
+
+- **Unit resolver:** liga um campo a **uma** data source.
+- **Pipeline resolver:** executa **várias funções em sequência** para um campo, cada uma podendo usar uma data source diferente. Por exemplo: ① checar permissão em uma tabela, ② ler o pedido, ③ buscar o preço atualizado em uma API HTTP.
+- **Linguagem dos resolvers:** **JavaScript** (runtime `APPSYNC_JS`, o recomendado hoje) ou **VTL** (*Velocity Template Language*, o formato original). Eles traduzem a requisição GraphQL para a chamada à data source e a resposta de volta. Rodam **dentro do AppSync**, sem custo nem cold start de Lambda.
+- **Direct Lambda resolvers:** a Lambda recebe o contexto completo da consulta, sem template intermediário. É o caminho quando a lógica fica toda no código.
+- **Batching** (Lambda): para evitar o problema **N+1**, o AppSync pode agrupar as chamadas de uma lista em uma única invocação **BatchInvoke**.
+
+![Diagrama AppSync - Arquitetura: autorização, resolvers e data sources](./img/aws-appsync/aws-appsync-02.png)
+
+[↑ Índice](#índice)
+
+### Autorização
+
+O AppSync tem **cinco modos de autorização**, e uma mesma API pode usar **vários ao mesmo tempo**, por exemplo leitura pública com API key e escrita só para usuários logados no Cognito:
+
+| Modo | Quando usar |
+|---|---|
+| **API key** | Acesso **público** ou de protótipos, com chave e data de expiração. Não identifica usuários |
+| **IAM** | Chamadas de serviços AWS, backends e usuários com credenciais temporárias (ex: Cognito **Identity Pools** para usuários não autenticados) |
+| **Cognito User Pools** | Usuários da aplicação, com **grupos** do Cognito para controle de acesso |
+| **OpenID Connect (OIDC)** | Identidade de outro provedor (Auth0, Okta, Entra ID) |
+| **Lambda authorizer** | Lógica própria: tokens proprietários, regras por tenant |
+
+- **Autorização por campo:** com diretivas no schema (ex: `@aws_cognito_user_pools(cognito_groups: ["Admin"])` em um campo), é possível dizer que **só administradores** veem o campo `salario`, mesmo que todos possam consultar o tipo `Funcionario`. Os resolvers também podem filtrar dados pelo usuário (ex: só os pedidos do próprio usuário).
+- **AWS WAF:** pode ser associado à API GraphQL, para regras de proteção e *rate limiting*.
+- **APIs privadas:** acessíveis apenas de dentro de uma VPC, por um **interface VPC endpoint**.
+- **Proteção contra consultas abusivas:** limites de **profundidade** de consulta e de **resolvers por consulta**, e **desativação da introspection** em produção.
+
+[↑ Índice](#índice)
+
+### Tempo real: subscriptions e AppSync Events
+
+**Subscriptions GraphQL:**
+
+- O cliente abre uma **conexão WebSocket** gerenciada pelo AppSync e se inscreve (ex: `onNovaMensagem(salaId: "42")`).
+- Quando uma **mutation** é executada **pelo AppSync** (ex: `enviarMensagem`), ele envia o resultado automaticamente a todos os inscritos. Não é preciso guardar connection IDs nem chamar APIs de envio, ao contrário do WebSocket do API Gateway.
+- **Filtros:** os inscritos recebem só o que interessa: por argumentos da subscription e por **filtros avançados** (*enhanced filtering*), aplicados no próprio AppSync.
+- **Ponto de atenção:** a subscription é disparada pela **mutation do AppSync**, e não pela mudança no banco. Se os dados mudam **fora** do AppSync (outro serviço gravou no DynamoDB, um job batch, um evento externo), é preciso fazer esse processo chamar uma **mutation** no AppSync. Normalmente é uma mutation ligada à data source **None**, só para notificar. Um padrão comum é **DynamoDB Streams → Lambda → mutation do AppSync** ou **EventBridge → AppSync**.
+
+**AppSync Events:** uma API de **pub/sub em tempo real via WebSocket**, sem GraphQL. Você cria **canais** (*channels*), e clientes e backends publicam e assinam mensagens neles. Serve para broadcast em grande escala (placares, notificações, chats simples) quando não se quer um schema GraphQL.
+
+![Diagrama AppSync - Subscriptions em tempo real](./img/aws-appsync/aws-appsync-03.png)
+
+**Comparação com o WebSocket do API Gateway:**
+
+| | **API Gateway WebSocket** | **AppSync (subscriptions ou Events)** |
+|---|---|---|
+| Gerenciar connection IDs | **Você** (DynamoDB) | O AppSync |
+| Enviar mensagens | Backend chama `@connections` para cada cliente | Automático, a partir da mutation ou da publicação no canal |
+| Filtrar destinatários | Lógica própria | Argumentos e filtros da subscription/canal |
+| Quando usar | Protocolo próprio, controle total das mensagens | Notificações e dados em tempo real com o mínimo de código |
+
+[↑ Índice](#índice)
+
+### Cache, sincronização offline e Merged APIs
+
+- **Cache:** gerenciado pelo AppSync, sobre ElastiCache. Pode guardar a **requisição completa** ou o resultado **por resolver**, com TTL e chaves de cache configuráveis. Reduz a latência e a carga nas data sources.
+- **Sincronização offline e conflitos:** com **data sources versionadas** (DynamoDB), aplicações mobile podem trabalhar **offline** e sincronizar depois, usando as bibliotecas do Amplify. Os conflitos são resolvidos por versão (*optimistic concurrency*), por *automerge* ou por uma **Lambda** personalizada.
+- **Merged APIs:** em empresas grandes, cada equipe mantém a **sua própria API GraphQL** (*source API*): pedidos, catálogo, usuários. A **Merged API** junta os schemas em **uma única API** para os clientes, inclusive com source APIs de **outras contas**, e cada equipe continua publicando a sua parte de forma independente. É o equivalente gerenciado da *federação* GraphQL.
+- **Custom domains:** domínio próprio com certificado do ACM.
+- **Observabilidade:** logs no **CloudWatch Logs** (inclusive por resolver), métricas e **X-Ray** para ver o tempo gasto em cada resolver e data source.
+
+[↑ Índice](#índice)
+
+### AppSync ou API Gateway?
+
+| Situação | Escolha |
+|---|---|
+| Telas que juntam dados de **várias fontes**, clientes mobile com banda limitada, front-end que muda muito | **AppSync** (GraphQL) |
+| Dados em **tempo real** para muitos clientes, com o mínimo de código | **AppSync** (subscriptions ou AppSync Events) |
+| Várias equipes expondo **uma única API** | **AppSync Merged APIs** |
+| API **REST** pública, padrão de mercado, integração com parceiros | **API Gateway** |
+| **Usage plans**, API keys com cotas por cliente, monetização | **API Gateway** (REST) |
+| Integração direta com serviços AWS (SQS, Step Functions) no padrão storage-first | **API Gateway** |
+| Cache HTTP em CDN por URL | **API Gateway** + CloudFront (GraphQL usa `POST` em um único endpoint) |
+| Protocolo WebSocket próprio, controle total das mensagens | **API Gateway WebSocket** |
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Aplicação mobile precisa juntar dados de **várias fontes** em uma chamada, reduzindo tráfego" → **AppSync** (GraphQL).
+- "Atualizações em **tempo real** para clientes web/mobile sem gerenciar conexões WebSocket" → **AppSync subscriptions** (ou **AppSync Events** para pub/sub sem GraphQL).
+- "Os dados mudam no DynamoDB por outro processo e os clientes não recebem a atualização" → a subscription só dispara com **mutation do AppSync**: usar **DynamoDB Streams/EventBridge → mutation** (data source **None**).
+- "Ler e gravar no DynamoDB pela API **sem Lambda**" → resolver com data source **DynamoDB** (JavaScript/VTL).
+- "Várias etapas para resolver um campo (checar permissão, ler dados, chamar API)" → **pipeline resolver**.
+- "Resolver de lista chama a Lambda uma vez para cada item (N+1)" → **batching** (BatchInvoke).
+- "Leitura pública e escrita só para usuários logados" → **múltiplos modos de autorização** (API key + Cognito User Pools).
+- "Só administradores podem ver um campo específico" → **autorização por campo** com diretivas do schema (grupos do Cognito).
+- "Usuários não autenticados acessando a API com credenciais temporárias" → modo **IAM** + **Cognito Identity Pools**.
+- "Aplicação mobile funcionando **offline** com sincronização e resolução de conflitos" → AppSync com **data sources versionadas** (Amplify).
+- "Equipes diferentes, inclusive em contas diferentes, mantêm partes da API e os clientes veem uma só" → **Merged APIs**.
+- "Reduzir a latência e a carga do banco em consultas repetidas" → **cache** do AppSync (requisição completa ou por resolver).
+- "API GraphQL acessível somente de dentro da VPC" → **API privada** + interface VPC endpoint.
+- "API REST com cotas por parceiro" → **API Gateway**, não AppSync.
+
+[↑ Índice](#índice)
+
+## AWS Global Accelerator
+
+O **AWS Global Accelerator** melhora a **disponibilidade** e o **desempenho** de aplicações com usuários no mundo todo. Ele oferece **dois endereços IP estáticos globais** (*anycast*), que funcionam como a porta de entrada da aplicação a partir de qualquer lugar. O tráfego do usuário entra na **rede da AWS** no ponto mais próximo dele e segue pela rede privada da AWS até os **endpoints** da aplicação (ALB, NLB, instâncias EC2 ou Elastic IPs), em uma ou mais regiões.
+
+Ele não guarda nada em cache e não entende HTTP: é um **proxy de rede** (camada 4, **TCP e UDP**). Isso o torna útil para **qualquer protocolo**, incluindo jogos, VoIP, IoT, MQTT e bancos de dados.
+
+Na SAP-C02, ele aparece em cenários de:
+- **IPs fixos** que clientes ou parceiros precisam liberar no firewall;
+- **failover entre regiões em segundos**, sem depender de cache DNS;
+- **desempenho global** para tráfego **não HTTP** (TCP/UDP);
+- **comparação com o CloudFront e o Route 53**, a confusão mais explorada pela prova.
+
+> **Comparação com o resto deste arquivo:** os load balancers distribuem tráfego **dentro de uma região**. O Global Accelerator fica **na frente** deles e distribui o tráfego **entre regiões**, como um "load balancer global" com IPs fixos. Ele já apareceu em [Auto Scaling Update Strategies](#auto-scaling-update-strategies) e no [API Gateway](#amazon-api-gateway) como alternativa ao Route 53 para trocar tráfego sem o problema de cache DNS.
+
+### Por que a internet pública é o problema
+
+Quando um usuário em São Paulo acessa uma aplicação em us-east-1 pela **internet pública**, os pacotes passam por **vários provedores** (o do usuário, provedores de trânsito, pontos de troca de tráfego) até chegar à AWS. Cada salto adiciona latência, e o caminho **muda** conforme o congestionamento e os acordos entre provedores. O resultado é latência **alta e variável** (*jitter*) e perda de pacotes, o que prejudica principalmente jogos, voz e vídeo.
+
+Com o Global Accelerator:
+
+1. Os dois IPs são **anycast**: o **mesmo IP** é anunciado a partir de **todos os edge locations** da AWS (centenas, no mundo todo). A internet entrega o pacote ao edge location **mais próximo** do usuário.
+2. A partir do edge, o tráfego segue pela **rede global da AWS**: fibra privada, redundante e monitorada, com menos saltos e menos congestionamento.
+3. O Global Accelerator escolhe o **endpoint saudável** mais adequado (região mais próxima, conforme as configurações) e entrega o tráfego a ele.
+
+A conexão TCP do usuário é **terminada no edge**, o que reduz o tempo do *handshake*, e uma conexão otimizada segue até a região. Na prática, a latência e o jitter caem, e a estabilidade sobe.
+
+![Diagrama Global Accelerator - Internet pública vs. rede da AWS](./img/aws-global-accelerator/aws-global-accelerator-01.png)
+
+[↑ Índice](#índice)
+
+### Componentes
+
+- **Accelerator:** o recurso principal, com os **2 IPs estáticos** (IPv4 anycast, em duas "zonas de rede" independentes para redundância), opcionalmente **dual-stack** (IPv6), ou com **seus próprios IPs** (*BYOIP*). Também recebe um nome DNS.
+- **Listener:** define as **portas** e o **protocolo** (TCP, UDP ou ambos) que o accelerator aceita (ex: TCP 443, UDP 3000-4000). Tem a opção de **client affinity**: o mesmo IP de origem vai sempre para o mesmo endpoint, para aplicações com estado.
+- **Endpoint group:** um por **região**. Agrupa os endpoints daquela região e tem:
+  - **traffic dial** (0 a 100%): quanto do tráfego que **seria enviado** a essa região ela realmente recebe. O restante vai para as outras regiões. Serve para **blue/green entre regiões**, manutenção e testes.
+  - **health checks**: para ALB e NLB, usa o próprio health check do load balancer; para EC2 e Elastic IP, faz verificações próprias.
+- **Endpoint:** **ALB**, **NLB**, **instância EC2** ou **Elastic IP**. Cada um tem um **weight** (peso), que distribui o tráfego **dentro** da região. Os endpoints podem ser **internos** (privados), sem nenhuma exposição à internet.
+
+**Como o tráfego é distribuído:**
+- **Entre regiões:** a região mais próxima do usuário que esteja saudável, ajustada pelos traffic dials.
+- **Dentro da região:** entre os endpoints, pelos weights.
+
+**Failover:** se os endpoints de uma região ficam **não saudáveis**, o tráfego vai para a próxima região saudável em **segundos**. Isso acontece **sem mudança de DNS**: os IPs dos clientes continuam os mesmos, então não existe o problema de clientes presos a um endereço antigo por causa do TTL.
+
+![Diagrama Global Accelerator - Componentes, traffic dial e failover entre regiões](./img/aws-global-accelerator/aws-global-accelerator-02.png)
+
+[↑ Índice](#índice)
+
+### Recursos e características importantes
+
+- **IPs estáticos:** os IPs **não mudam**, mesmo trocando regiões, load balancers ou instâncias por trás. É a solução para clientes, parceiros e redes corporativas que precisam **liberar IPs no firewall** (*allowlist*), ou para dispositivos IoT com IP fixo no firmware. Um ALB, por exemplo, **não tem** IP fixo.
+- **Preservação do IP do cliente:** para ALB e instâncias EC2 (e NLB, conforme a configuração), o endpoint vê o **IP real do usuário**, e não o do Global Accelerator. É importante para logs, auditoria, regras de segurança e geolocalização.
+- **Endpoints privados:** ALBs internos e instâncias em subnets privadas podem ser endpoints. A aplicação fica acessível pelos IPs do accelerator **sem nenhum IP público** na VPC.
+- **Segurança:** **AWS Shield Standard** incluído (proteção contra DDoS de rede), compatível com **Shield Advanced**. A superfície exposta são só os 2 IPs anycast, e o tráfego de ataque é absorvido nos edge locations, longe da aplicação.
+- **Custo:** taxa **fixa por hora** por accelerator, mais uma taxa por **GB transferido** (*Data Transfer Premium*), que varia conforme as regiões de origem e destino.
+
+[↑ Índice](#índice)
+
+### Custom routing accelerator
+
+O accelerator **padrão** (*standard*) escolhe o endpoint automaticamente: o mais próximo e saudável. Em algumas aplicações, porém, a **lógica da aplicação** precisa decidir para **qual instância exata** cada usuário vai. Por exemplo:
+- um **jogo multiplayer** em que o matchmaking coloca 4 jogadores na mesma **sessão**, que roda em uma instância e porta específicas;
+- uma plataforma de **VoIP** ou videoconferência que conecta participantes ao mesmo servidor de mídia.
+
+O **custom routing accelerator** mapeia **portas do accelerator** para **IPs e portas de instâncias EC2** específicas em **subnets** da VPC, de forma **determinística**. O servidor de matchmaking consulta esse mapeamento e diz ao jogador: "conecte-se em `IP-do-accelerator:porta 10.045`". O Global Accelerator encaminha essa porta, sempre, para a instância e a porta da sessão, com os benefícios da rede da AWS. Não há balanceamento nem health check automáticos: a aplicação decide.
+
+![Diagrama Global Accelerator - Custom routing accelerator](./img/aws-global-accelerator/aws-global-accelerator-03.png)
+
+[↑ Índice](#índice)
+
+### Global Accelerator, CloudFront ou Route 53?
+
+Os três usam a infraestrutura global da AWS, e a prova costuma oferecer os três como alternativas.
+
+| | **Global Accelerator** | **CloudFront** | **Route 53** (latência/failover) |
+|---|---|---|---|
+| O que é | Proxy de rede (camada 4) com **IPs anycast fixos** | **CDN**: cache e proxy HTTP(S) nos edge locations | **DNS**: responde com o IP do destino |
+| Protocolos | **TCP e UDP** (qualquer aplicação) | **HTTP/HTTPS** (e WebSocket) | Qualquer um (só resolve nomes) |
+| Cache de conteúdo | **Não** | **Sim** | Não |
+| IPs fixos | **Sim** (2 IPv4 anycast ou BYOIP) | Não (IPs mudam) | Não se aplica |
+| Failover entre regiões | **Segundos**, sem DNS | Origin failover (por requisição) | Depende do **TTL** e do cache DNS dos clientes |
+| Melhor para | Jogos, VoIP, IoT, TCP/UDP não-HTTP, **allowlist de IP**, failover rápido multi-região | Sites, APIs, vídeo, downloads: conteúdo HTTP **cacheável** ou dinâmico com aceleração | Roteamento por DNS simples e barato, entre regiões ou para recursos fora da AWS |
+
+**Regra prática:**
+- conteúdo **HTTP** e **cache** → **CloudFront**;
+- **TCP/UDP**, **IP fixo** ou **failover instantâneo** entre regiões → **Global Accelerator**;
+- roteamento **por DNS**, simples e barato, com o failover dependendo do TTL → **Route 53**.
+
+Os três podem ser **combinados**. Por exemplo, CloudFront para o site, Global Accelerator para a API de jogo em UDP, e Route 53 apontando os nomes para cada um.
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Clientes/parceiros precisam liberar **IPs fixos** no firewall para acessar a aplicação (que está atrás de um ALB)" → **Global Accelerator** (2 IPs estáticos anycast).
+- "Jogo multiplayer/VoIP/IoT em **UDP** com usuários no mundo todo, reduzindo latência e jitter" → **Global Accelerator**.
+- "Failover **entre regiões** em segundos, sem depender do **TTL do DNS**" → **Global Accelerator** com endpoint groups em várias regiões e health checks.
+- "Migrar gradualmente o tráfego de uma região para outra" (blue/green entre regiões) → **traffic dials** dos endpoint groups.
+- "Distribuir o tráfego entre ALBs dentro de uma região de forma ponderada" → **endpoint weights**.
+- "Conteúdo estático e HTTP com **cache** perto dos usuários" → **CloudFront**, não Global Accelerator.
+- "A aplicação precisa ver o **IP real do cliente**" → Global Accelerator com **client IP preservation** (ALB/EC2).
+- "Expor uma aplicação de subnets **privadas** sem IP público, com IPs fixos" → Global Accelerator com **ALB interno** ou instâncias privadas como endpoints.
+- "Direcionar cada jogador para a **instância e porta exatas** da sessão de jogo" → **custom routing accelerator**.
+- "Usar a própria faixa de IPs da empresa na entrada global" → **BYOIP** no Global Accelerator.
+- "Mesmo usuário deve sempre cair no mesmo endpoint (aplicação com estado)" → **client affinity** no listener.
+- "Proteção contra DDoS na entrada global de uma aplicação TCP/UDP" → Global Accelerator (Shield Standard) + **Shield Advanced**.
+
+[↑ Índice](#índice)
+
+## AWS Outposts
+
+O **AWS Outposts** leva a **infraestrutura da AWS para dentro do seu data center**: racks e servidores com o mesmo hardware que a AWS usa nas regiões, **instalados, monitorados, atualizados e mantidos pela AWS**, rodando os mesmos serviços, com as mesmas APIs, o mesmo console e as mesmas ferramentas (CloudFormation, CloudWatch, IAM). Para quem desenvolve, uma instância EC2 no Outpost é **igual** a uma instância na região, só que fisicamente no seu prédio.
+
+Ele existe para os casos em que **a nuvem não pode ficar longe**:
+
+- **Latência muito baixa** com sistemas que continuam on-premises. Por exemplo, uma linha de produção, um sistema de trading, equipamentos médicos ou um mainframe que não vai migrar agora.
+- **Processamento de dados locais:** grandes volumes gerados no local (vídeo, sensores, imagens) que precisam ser processados ali, sem enviar tudo para a região.
+- **Residência de dados:** regulações que exigem que certos dados fiquem **em um país ou em um prédio** onde não há região AWS.
+- **Migração gradual:** modernizar aplicações para as APIs da AWS **antes** de movê-las para a região, mantendo-as perto das dependências on-premises.
+
+Na SAP-C02, o Outposts aparece em cenários **híbridos**: "a aplicação precisa de latência de um dígito de milissegundo com o sistema da fábrica", "os dados não podem sair do país", "padronizar on-premises e nuvem com as mesmas APIs".
+
+> **Comparação com o resto deste arquivo:** o EKS e o ECS já apareceram com opções on-premises: **EKS Anywhere**, **EKS Hybrid Nodes** e **ECS Anywhere**, todas rodando no **seu** hardware. O Outposts é diferente: o **hardware é da AWS**, gerenciado por ela, e executa os serviços AWS de verdade (EC2, EBS, S3, RDS...), não só containers.
+
+### Como funciona: uma extensão da região
+
+Um Outpost **não é uma região independente**. Ele é uma **extensão de uma região AWS** (a *parent region*), ancorada a uma **Availability Zone** dessa região:
+
+- O **plano de controle** (as APIs, o console, o IAM, o CloudWatch) fica na **região**. O Outpost só executa os recursos: instâncias, volumes, objetos.
+- Você cria **subnets da sua VPC** que ficam **no Outpost**. A VPC "se estica" da região até o seu data center, e as instâncias no Outpost conversam com as da região pela rede privada, como se estivessem em outra AZ.
+- A conexão entre o Outpost e a região é o **service link**: um conjunto de túneis criptografados, sobre **Direct Connect** (recomendado) ou internet, que transporta o tráfego de gerenciamento e o tráfego da VPC entre o Outpost e a região.
+
+**Se o service link cair:**
+- as instâncias e os serviços **que já estão rodando continuam funcionando**, e o tráfego local (entre recursos do Outpost e com a rede on-premises) segue normal;
+- operações que dependem do plano de controle **param**: lançar ou parar instâncias, mudar configurações, ver métricas atualizadas.
+
+Por isso, o Outposts exige uma conexão **confiável e redundante** com a região. Ele não é uma solução para locais **desconectados**; para esses, o caminho é a família **Snow**.
+
+![Diagrama AWS Outposts - Outpost como extensão da região e da VPC](./img/aws-outposts/aws-outposts-01.png)
+
+[↑ Índice](#índice)
+
+### Formatos: racks e servers
+
+| | **Outposts rack** | **Outposts server** |
+|---|---|---|
+| Formato | Rack padrão de **42U**, que pode ser combinado em vários racks | Servidor de **1U ou 2U**, que cabe em um rack existente |
+| Para onde | Data centers, instalações com espaço, energia e refrigeração adequados | Lojas, filiais, fábricas, hospitais: locais com **pouco espaço** |
+| Serviços | **EC2, EBS, S3 on Outposts, ECS, EKS, RDS** (MySQL, PostgreSQL, SQL Server), **ElastiCache**, **EMR**, **ALB**, Route 53 Resolver, entre outros | **EC2** (com armazenamento local de instância) e **ECS**, para cargas mais simples |
+| Conexão com a rede local | **Local gateway** (LGW) | **Local network interface** (LNI) |
+
+**Contratação:** o Outposts é contratado por um prazo de **3 anos**, com pagamento total, parcial ou mensal. O valor inclui hardware, instalação, manutenção e substituição de peças. Você escolhe **a capacidade** (quantos e quais tipos de instância, quanto EBS e S3) **no pedido**, e ela é **fixa**. Não existe a elasticidade "infinita" da região: crescer significa pedir mais hardware.
+
+[↑ Índice](#índice)
+
+### Rede do Outpost
+
+- **Subnets no Outpost:** subnets da VPC criadas com o ID do Outpost. As instâncias recebem IPs privados da VPC.
+- **Service link:** a conexão com a região. Use **Direct Connect** com redundância, ou VPN sobre a internet como alternativa. O link precisa de largura de banda suficiente para o tráfego entre o Outpost e a região.
+- **Local gateway (LGW)**, nos racks: conecta as subnets do Outpost à **rede on-premises**. As instâncias falam com os servidores, as máquinas e os usuários locais **sem passar pela região**, com latência de LAN.
+- **Customer-owned IP pool (CoIP):** um bloco de **IPs da sua rede corporativa** que pode ser associado às instâncias do Outpost, como um Elastic IP. Assim, a rede on-premises alcança as instâncias por endereços que ela já roteia.
+- **Direct VPC routing:** uma alternativa ao CoIP em que os IPs privados da VPC são anunciados diretamente na rede on-premises.
+- **Tráfego para a internet:** pode sair pela região (via service link) ou **localmente**, pela rede on-premises (via LGW).
+
+[↑ Índice](#índice)
+
+### Responsabilidades e resiliência
+
+O modelo de responsabilidade compartilhada muda: parte da infraestrutura física passa a ser **sua**.
+
+| A AWS cuida de | Você cuida de |
+|---|---|
+| Hardware, firmware e software do Outpost | **Espaço físico, energia, refrigeração** e **segurança física** do local |
+| Monitoramento, atualizações e **substituição de peças** | **Rede local** e **conexão com a região** (service link redundante) |
+| Plano de controle na região | **Planejamento de capacidade**, que é fixa |
+| | **Alta disponibilidade** da aplicação no local |
+
+**Resiliência:**
+
+- Um Outpost em um único local é um **ponto único de falha**, como um data center. Para alta disponibilidade, a aplicação deve usar **vários racks**, distribuindo as instâncias com **placement groups do tipo spread** entre racks, e/ou **vários Outposts** em locais diferentes, e/ou ter um **plano de failover para a região**.
+- Deixe **capacidade sobrando** para absorver a falha de um servidor: não há onde lançar instâncias extras se o Outpost estiver cheio.
+- **Backups e cópias** para a região: snapshots EBS locais ou na região, S3 on Outposts → S3 da região (com **DataSync** ou replicação), e RDS on Outposts com backups.
+
+**Dados no local:**
+- O **S3 on Outposts** é uma classe de armazenamento própria (*S3 Outposts*), acessada por **access points** e **endpoints** do Outpost. Os dados **ficam no local**.
+- Os volumes **EBS** e os snapshots locais também podem ficar no Outpost, o que atende requisitos de residência de dados.
+- Para levar dados à região de forma controlada, use **DataSync** ou a replicação do S3 on Outposts.
+
+[↑ Índice](#índice)
+
+### Outposts e as outras opções de borda e híbridas
+
+A AWS tem várias formas de levar computação para perto dos usuários ou dos dados. A pergunta-chave é: **onde** a computação precisa estar, e **de quem** é o hardware?
+
+| Opção | Onde fica | De quem é o hardware | Quando usar |
+|---|---|---|---|
+| **Região** | Data centers da AWS | AWS | Padrão para quase tudo |
+| **Local Zones** | Data centers da AWS **em grandes cidades**, perto dos usuários | AWS | Latência de um dígito de ms para **usuários finais** de uma metrópole (jogos, streaming, edição de vídeo), sem colocar nada no seu prédio |
+| **Wavelength Zones** | Dentro da **rede 5G** das operadoras | AWS | Aplicações para **dispositivos móveis em 5G** com latência mínima (carros conectados, AR/VR, IoT móvel) |
+| **Outposts** | **No seu data center** ou local | AWS (gerenciado por ela) | Latência com **sistemas on-premises**, processamento local, **residência de dados**, mesmas APIs AWS no local, com conexão estável à região |
+| **Dedicated Local Zones** | Infraestrutura da AWS **dedicada a um cliente** (ex: governo), em local escolhido | AWS | Soberania e isolamento exigidos por regulação, com mais serviços que o Outposts |
+| **Família Snow** (Snowball Edge) | Qualquer lugar, **inclusive sem conexão** | AWS (dispositivo enviado a você) | Locais **desconectados** ou remotos (navios, campos de petróleo, áreas militares) e **migração de dados** offline |
+| **ECS Anywhere / EKS Anywhere / EKS Hybrid Nodes** | Seu data center | **Seu** hardware | Orquestrar containers no hardware que você já tem, com gerenciamento da AWS |
+
+![Diagrama AWS Outposts - Opções de borda e híbridas](./img/aws-outposts/aws-outposts-02.png)
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Latência de um dígito de milissegundo com sistemas que **continuam on-premises**" (fábrica, mainframe, equipamentos) → **Outposts**.
+- "Dados **não podem sair** do país/prédio onde não há região AWS, mas a empresa quer os serviços AWS" → **Outposts** (com **S3 on Outposts** e EBS local).
+- "Mesmas APIs, ferramentas e console da AWS **no data center**" → **Outposts**.
+- "Baixa latência para **usuários finais** em uma grande cidade, sem hardware próprio" → **Local Zones**, não Outposts.
+- "Aplicação para dispositivos **5G**" → **Wavelength**.
+- "Local **sem conexão** confiável com a internet/região" → família **Snow** (Snowball Edge), não Outposts (que depende do service link).
+- "O que acontece com o Outpost se a conexão com a região cair?" → recursos em execução **continuam**; operações de **plano de controle** (lançar, alterar) ficam indisponíveis.
+- "Conexão do Outpost com a região" → **service link**, de preferência sobre **Direct Connect** redundante.
+- "Instâncias do Outpost acessíveis pela rede corporativa com IPs da própria rede" → **local gateway** + **customer-owned IP pool (CoIP)**.
+- "Alta disponibilidade no Outpost" → **vários racks** (spread placement group entre racks), vários Outposts e/ou failover para a região, com **capacidade sobrando**.
+- "Copiar dados do S3 on Outposts para a região" → **DataSync** (ou replicação do S3 on Outposts).
+- "Rodar bancos de dados gerenciados no local" → **RDS on Outposts**.
+- "Filiais e lojas com pouco espaço" → **Outposts servers** (1U/2U).
+- "Containers on-premises no **hardware que a empresa já tem**" → **ECS Anywhere** / **EKS Anywhere** / **EKS Hybrid Nodes**, não Outposts.
+
+[↑ Índice](#índice)
+
+## AWS Wavelength
+
+O **AWS Wavelength** coloca computação e armazenamento da AWS **dentro da rede 5G das operadoras de telefonia** (Verizon, Vodafone, KDDI, SK Telecom, Bell, entre outras). Essas instalações se chamam **Wavelength Zones**. Uma aplicação implantada nelas fica a **poucos saltos** dos celulares e dispositivos conectados à rede 5G daquela operadora, com latência de **um dígito de milissegundo**.
+
+O 5G reduz bastante a latência entre o **aparelho** e a **antena**. Mas, se a aplicação está em uma região AWS, o tráfego ainda precisa sair da rede da operadora, atravessar a **internet** e chegar à região, e esse trecho anula boa parte do ganho. O Wavelength elimina esse trecho: o tráfego do dispositivo **não sai da rede da operadora** até chegar à aplicação. Esse conceito é chamado de *mobile edge computing* (MEC).
+
+Na SAP-C02, ele aparece em cenários com **dispositivos móveis em 5G** que exigem latência ultrabaixa:
+- **jogos** e streaming em nuvem;
+- **realidade aumentada e virtual**;
+- **veículos conectados**;
+- **vídeo ao vivo** e análise de vídeo em tempo real;
+- **inferência de ML** na borda;
+- automação industrial com dispositivos móveis.
+
+A pergunta típica é distinguir o Wavelength de **Local Zones**, **Outposts** e **CloudFront**.
+
+> **Comparação com o resto deste arquivo:** assim como o [Outposts](#aws-outposts), uma Wavelength Zone é uma **extensão de uma região**: o plano de controle fica na região, e a VPC se estende até ela. A diferença é **onde** o hardware está: no Outposts, no **seu** prédio; no Wavelength, na **rede da operadora**, perto dos usuários móveis. E, ao contrário do [Global Accelerator](#aws-global-accelerator), que leva o tráfego até a região pela rede da AWS, o Wavelength leva a **aplicação** até a borda da rede móvel.
+
+### Como funciona o Wavelength
+
+- **Wavelength Zone:** uma zona de infraestrutura AWS dentro de um data center da operadora, associada a uma **região** (*parent region*). É preciso **habilitar** (*opt in*) o grupo de zonas na conta.
+- **Extensão da VPC:** você cria uma **subnet** da sua VPC **na Wavelength Zone** e lança recursos nela. As instâncias na Wavelength Zone conversam com as da região pela **rede privada da VPC**, como se estivessem em outra zona.
+- **Serviços disponíveis:** um conjunto **reduzido**: **EC2** (alguns tipos, inclusive com GPU para inferência), **EBS**, **ECS** e **EKS** (nós na Wavelength Zone) e alguns outros. O restante, como bancos de dados gerenciados, S3, filas e IAM, fica na **região**.
+- **Carrier gateway:** o "internet gateway" da Wavelength Zone. Ele permite:
+  - tráfego **de entrada** vindo da **rede da operadora**: os celulares e dispositivos 5G daquela operadora;
+  - tráfego **de saída** para a internet, com NAT para o IP da operadora.
+- **Carrier IP:** o equivalente ao Elastic IP na Wavelength Zone. É um endereço do **bloco da operadora**, associado à instância, que os dispositivos da rede móvel usam para alcançá-la. Wavelength Zones não usam Elastic IPs.
+
+**Quem se beneficia:** dispositivos conectados à rede 5G **da operadora parceira** daquela Wavelength Zone. Usuários de outras operadoras, ou em Wi-Fi, chegam pela **internet** e não têm o mesmo ganho de latência. Muitas arquiteturas mantêm a aplicação **também na região**, para atender esses usuários.
+
+![Diagrama AWS Wavelength - Caminho do tráfego sem e com Wavelength](./img/aws-wavelength/aws-wavelength-01.png)
+
+[↑ Índice](#índice)
+
+### Padrão de arquitetura: dividir entre a borda e a região
+
+Como a Wavelength Zone tem poucos serviços e capacidade limitada, a arquitetura típica **divide a aplicação**:
+
+- **Na Wavelength Zone:** só a parte **sensível à latência**. Por exemplo, o servidor de jogo em tempo real, o processamento de quadros de vídeo, a inferência de ML ou o servidor de renderização de AR.
+- **Na região:** todo o resto. Bancos de dados (DynamoDB, Aurora), armazenamento (S3), autenticação, filas, analytics, painéis administrativos e treinamento de modelos.
+- **Entre as duas:** a rede **privada** da VPC. A borda envia resultados e dados agregados à região, e recebe configurações e modelos atualizados.
+
+**Vários Wavelength Zones:** para cobrir várias cidades ou operadoras, a aplicação é implantada em **várias** zonas. Um serviço de **descoberta**, que pode usar a localização do dispositivo e as APIs de rede da operadora, indica a cada dispositivo qual zona usar.
+
+**Orquestração:** o **EKS** ou o **ECS** podem gerenciar nós ou tasks em várias Wavelength Zones a partir da região, com o mesmo cluster.
+
+![Diagrama AWS Wavelength - Arquitetura dividida entre Wavelength Zone e região](./img/aws-wavelength/aws-wavelength-02.png)
+
+[↑ Índice](#índice)
+
+### Wavelength, Local Zones, Outposts ou CloudFront?
+
+| | **Wavelength** | **Local Zones** | **Outposts** | **CloudFront** |
+|---|---|---|---|---|
+| Onde | Rede **5G** da operadora | Cidades grandes (data centers AWS) | **Seu** data center | Edge locations globais |
+| Para quem | Dispositivos na rede **5G daquela operadora** | Usuários finais de uma metrópole (qualquer rede) | Sistemas e usuários **on-premises** | Usuários no mundo todo |
+| O que roda | EC2, EBS, ECS/EKS (conjunto reduzido) | Mais serviços (EC2, EBS, ELB, RDS em algumas, FSx...) | EC2, EBS, S3, RDS, ECS/EKS... | **Cache** HTTP e funções leves |
+| Entrada de tráfego | **Carrier gateway** + carrier IPs | Internet gateway da VPC | Local gateway (rede local) | Distribuição CloudFront |
+| Exemplo | Jogo em nuvem para celular 5G, AR, carro conectado | Edição de vídeo, jogos e streaming para uma cidade | Fábrica, hospital, residência de dados | Site, vídeo, APIs com cache |
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Latência **ultrabaixa** para **dispositivos móveis em 5G**" (AR/VR, jogos em nuvem, carros conectados) → **Wavelength**.
+- "Baixa latência para usuários de uma **cidade**, independentemente da rede que usam" → **Local Zones**, não Wavelength.
+- "Baixa latência com sistemas **on-premises**" → **Outposts**.
+- "Conteúdo estático/HTTP com cache perto dos usuários" → **CloudFront**.
+- "Permitir que dispositivos da rede da operadora alcancem as instâncias na Wavelength Zone" → **carrier gateway** + **carrier IP** (não Elastic IP nem internet gateway).
+- "Banco de dados da aplicação que roda na Wavelength Zone" → na **região** (DynamoDB, Aurora), acessado pela rede privada da VPC; só o componente sensível à latência fica na borda.
+- "Usar uma Wavelength Zone pela primeira vez" → **habilitar (opt in)** o grupo de zonas e criar uma **subnet** da VPC nela.
+- "Atender cidades/operadoras diferentes" → implantar em **várias Wavelength Zones**, orquestradas por **EKS/ECS** a partir da região.
+- "Usuários fora da rede 5G da operadora" → acessam pela **internet**; manter a aplicação também na **região**.
+
+[↑ Índice](#índice)
+
+## AWS Local Zones
+
+As **AWS Local Zones** são extensões de uma região AWS instaladas em **grandes cidades** (Los Angeles, Chicago, Miami, Buenos Aires, Lima, Lagos e dezenas de outras), longe da região "mãe". Elas oferecem um conjunto de serviços (EC2, EBS, VPC, load balancers, containers e, em algumas, bancos de dados e file systems) **perto dos usuários** daquela região metropolitana, com latência de **um dígito de milissegundo**.
+
+O motivo é geográfico. Um estúdio em Los Angeles usando a região **us-west-2** (Oregon) tem algumas dezenas de milissegundos de latência, o que é imperceptível para um site, mas inviável para um artista editando vídeo em uma estação de trabalho remota ou para um jogo competitivo. Com uma Local Zone em Los Angeles, os mesmos recursos AWS ficam **na mesma cidade** dos usuários.
+
+Na SAP-C02, as Local Zones aparecem em cenários de **latência ultrabaixa para usuários finais** de uma cidade específica:
+- edição de vídeo e renderização;
+- jogos e streaming ao vivo;
+- AR/VR e inferência de ML em tempo real;
+- **migração híbrida** com latência baixa até um data center on-premises na mesma cidade;
+- **residência de dados** em países ou estados onde não há uma região AWS.
+
+> **Comparação com o resto deste arquivo:** Local Zones, [Wavelength](#aws-wavelength) e [Outposts](#aws-outposts) são **extensões de uma região**: a VPC se estende até elas, e o plano de controle fica na região. A diferença é **onde** o hardware está:
+> - **Local Zones:** em data centers da AWS **nas cidades**, acessíveis a qualquer usuário pela internet;
+> - **Wavelength:** **dentro da rede 5G** de uma operadora;
+> - **Outposts:** **no seu prédio**.
+>
+> O diagrama de [opções de borda](#outposts-e-as-outras-opções-de-borda-e-híbridas) mostra as três lado a lado.
+
+### Como funciona uma Local Zone
+
+- **Parent region e nome:** cada Local Zone pertence a uma região, e o nome mostra isso. Por exemplo, `us-west-2-lax-1a` é uma Local Zone de Los Angeles, ligada a us-west-2. É preciso **habilitar** (*opt in*) o grupo de zonas na conta.
+- **Extensão da VPC:** você cria uma **subnet** da sua VPC **na Local Zone** e lança recursos nela, como em qualquer AZ. A comunicação com as subnets da região usa a **rede privada da AWS**.
+- **Internet:** a Local Zone tem saída e entrada de internet **própria**, pelo **internet gateway** da VPC. O tráfego dos usuários locais **não vai até a região**.
+- **Network border group:** os IPs públicos e os **Elastic IPs** de uma Local Zone vêm de um **grupo de borda próprio**, e não do grupo da região. Um Elastic IP precisa ser alocado **naquele network border group** para ser usado lá.
+- **Direct Connect:** algumas Local Zones aceitam conexões **Direct Connect** diretamente. É a base para cenários **híbridos**: um data center on-premises na cidade conecta-se à Local Zone com latência muito baixa, e as aplicações migradas ficam "na mesma cidade" das que continuam no data center.
+- **Serviços disponíveis:** variam por zona. Os mais comuns são **EC2** (com menos tipos de instância que a região, incluindo GPUs em várias), **EBS**, **ALB/NLB**, **ECS**, **EKS**, **FSx**, **RDS** e **ElastiCache** em algumas, **Direct Connect** e **Shield**. Os demais serviços (S3, DynamoDB, filas, IAM) são usados **na região**.
+- **Custo:** os preços costumam ser **mais altos** que os da região, e há menos opções de compra e de capacidade.
+
+![Diagrama AWS Local Zones - Local Zone como extensão da região perto dos usuários](./img/aws-local-zones/aws-local-zones-01.png)
+
+[↑ Índice](#índice)
+
+### Arquitetura e resiliência
+
+- **Dividir a aplicação:** como no Wavelength, só a parte **sensível à latência** fica na Local Zone, como servidores de jogo, estações de trabalho virtuais, renderização ou a camada web/API local. Os **dados mestres** e os serviços gerenciados ficam na **região**, acessados pela rede privada da VPC.
+- **Uma Local Zone é uma única zona:** ela **não** tem várias AZs, então é um ponto único de falha naquela cidade. Para resiliência:
+  - usar **duas Local Zones** na mesma metrópole, quando existirem;
+  - ter a aplicação também na **região**, com **Route 53** (latência + health checks/failover) ou **Global Accelerator** para mandar os usuários para a região se a Local Zone falhar, aceitando mais latência nesse caso;
+  - manter **backups e dados** na região (snapshots EBS, replicação de bancos).
+- **Dedicated Local Zones:** infraestrutura de Local Zone **dedicada a um único cliente** (normalmente governo ou setor regulado), instalada em um local escolhido e operada pela AWS, para requisitos de **soberania** e isolamento.
+
+![Diagrama AWS Local Zones - Arquitetura dividida e failover para a região](./img/aws-local-zones/aws-local-zones-02.png)
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Latência de **um dígito de ms** para usuários finais de uma **cidade** específica (edição de vídeo, jogos, streaming)" → **Local Zones**.
+- "Estúdio/escritório em uma cidade sem região AWS precisa de estações de trabalho virtuais e renderização com latência mínima" → **Local Zone** da cidade (+ **Amazon DCV**).
+- "Dados precisam ficar em um país/estado sem região AWS, mas com uma Local Zone" → **Local Zones** (ou **Dedicated Local Zones** para soberania).
+- "Migração híbrida: o data center on-premises fica na mesma cidade e as aplicações migradas precisam de latência baixa até ele" → **Local Zone** + **Direct Connect** na Local Zone.
+- "Usar uma Local Zone pela primeira vez" → **habilitar (opt in)** o grupo de zonas + criar **subnet** da VPC nela.
+- "Elastic IP para uma instância na Local Zone" → alocar no **network border group** da Local Zone.
+- "Dispositivos móveis **5G**" → **Wavelength**, não Local Zones. "Latência com sistemas **on-premises** no próprio prédio" → **Outposts**.
+- "Resiliência de uma aplicação em Local Zone" → segunda Local Zone ou **failover para a região** (Route 53/Global Accelerator), com dados na região.
+- "Serviço não disponível na Local Zone (ex: DynamoDB, S3)" → usar o serviço **na região** pela rede privada da VPC.
 
 [↑ Índice](#índice)
 
@@ -2705,6 +3246,46 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Autorização com lógica própria | [Lambda authorizer](#segurança) |
 | Tempo real servidor → cliente | [WebSocket API](#websocket-apis) |
 | API Gateway, ALB, AppSync ou Function URL | [Comparação](#api-gateway-alb-appsync-ou-function-url) |
+
+### AppSync (GraphQL)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Juntar dados de várias fontes em uma chamada | [AppSync / GraphQL](#graphql-o-que-é-e-por-que-existe) |
+| Tempo real sem gerenciar conexões | [Subscriptions / AppSync Events](#tempo-real-subscriptions-e-appsync-events) |
+| Mudança fora do AppSync não notifica clientes | [Mutation com data source None](#tempo-real-subscriptions-e-appsync-events) |
+| Várias etapas para resolver um campo | [Pipeline resolver](#arquitetura-do-appsync) |
+| Problema N+1 com Lambda | [Batching](#arquitetura-do-appsync) |
+| Acesso diferente por campo ou por tipo de usuário | [Múltiplos modos + autorização por campo](#autorização) |
+| Várias equipes, uma API | [Merged APIs](#cache-sincronização-offline-e-merged-apis) |
+| AppSync ou API Gateway | [Comparação](#appsync-ou-api-gateway) |
+
+### Global Accelerator
+
+| Pergunta do cenário | Solução |
+|---|---|
+| IPs fixos para allowlist em firewall | [Global Accelerator](#recursos-e-características-importantes) |
+| TCP/UDP global com baixa latência e jitter | [Global Accelerator](#por-que-a-internet-pública-é-o-problema) |
+| Failover entre regiões sem depender de DNS | [Endpoint groups + health checks](#componentes) |
+| Migrar tráfego entre regiões aos poucos | [Traffic dial](#componentes) |
+| Jogador na instância e porta exatas | [Custom routing accelerator](#custom-routing-accelerator) |
+| Global Accelerator, CloudFront ou Route 53 | [Comparação](#global-accelerator-cloudfront-ou-route-53) |
+
+### Outposts e borda
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Latência mínima com sistemas on-premises | [Outposts](#aws-outposts) |
+| Residência de dados sem região AWS no local | [Outposts + S3 on Outposts](#responsabilidades-e-resiliência) |
+| Service link cai: o que acontece | [Recursos seguem; plano de controle para](#como-funciona-uma-extensão-da-região) |
+| Instâncias acessíveis pela rede corporativa | [Local gateway + CoIP](#rede-do-outpost) |
+| Baixa latência para usuários de uma metrópole | [Local Zones](#aws-local-zones) |
+| Elastic IP em uma Local Zone | [Network border group](#como-funciona-uma-local-zone) |
+| Resiliência de aplicação em Local Zone | [Segunda zona ou failover para a região](#arquitetura-e-resiliência) |
+| Dispositivos 5G | [Wavelength](#aws-wavelength) |
+| Dispositivos da operadora alcançando a Wavelength Zone | [Carrier gateway + carrier IP](#como-funciona-o-wavelength) |
+| O que fica na borda e o que fica na região | [Arquitetura dividida](#padrão-de-arquitetura-dividir-entre-a-borda-e-a-região) |
+| Local sem conexão | [Família Snow](#outposts-e-as-outras-opções-de-borda-e-híbridas) |
 
 ### High Performance Computing
 
