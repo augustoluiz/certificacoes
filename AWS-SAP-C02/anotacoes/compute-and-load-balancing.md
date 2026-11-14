@@ -16,6 +16,7 @@ servicos:
   - AWS AppSync
   - AWS Global Accelerator
   - Amazon Route 53
+  - Elastic Load Balancing (ALB, NLB, GWLB)
   - AWS Outposts
   - AWS Wavelength
   - AWS Local Zones
@@ -43,6 +44,7 @@ tags: [sap-c02, compute, load-balancing]
 - **Containers:** [Containers (conceitos)](#containers) · [Amazon ECS](#amazon-elastic-container-service-ecs) · [Amazon EKS](#amazon-elastic-kubernetes-service-eks)
 - **Serverless:** [AWS Lambda](#aws-lambda) · [Amazon API Gateway](#amazon-api-gateway) · [AWS AppSync](#aws-appsync)
 - **Tráfego global:** [AWS Global Accelerator](#aws-global-accelerator) · [Amazon Route 53](#amazon-route-53)
+- **Load balancing:** [Elastic Load Balancing (ELB)](#elastic-load-balancing-elb)
 - **Híbrido e borda:** [AWS Outposts](#aws-outposts) · [AWS Wavelength](#aws-wavelength) · [AWS Local Zones](#aws-local-zones)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
@@ -2712,6 +2714,183 @@ O **DNSSEC** protege contra **respostas DNS falsificadas** (*DNS spoofing*, *cac
 
 [↑ Índice](#índice)
 
+## Elastic Load Balancing (ELB)
+
+O **Elastic Load Balancing** distribui o tráfego entre vários **destinos** (*targets*), como instâncias EC2, containers, IPs e funções Lambda, em **várias AZs**. Ele resolve, ao mesmo tempo, quatro necessidades de qualquer aplicação com mais de um servidor:
+
+- **Um único ponto de entrada:** os clientes acessam um nome DNS (ex: `app.empresa.com` → alias para o load balancer), e não precisam conhecer os servidores por trás.
+- **Distribuição da carga:** cada requisição ou conexão vai para um destino, conforme o algoritmo.
+- **Alta disponibilidade:** os **health checks** tiram de circulação os destinos com problema, e a distribuição entre AZs mantém a aplicação no ar se uma AZ cair.
+- **Funções de borda:** terminação de **TLS** (HTTPS), roteamento por conteúdo, autenticação, proteção (WAF).
+
+Ele é **gerenciado e escala sozinho**, com cobrança por hora e por unidades de capacidade (**LCU**). É a peça que liga quase tudo o que veio antes neste arquivo: o [Auto Scaling](#amazon-ec2-auto-scaling) registra as instâncias nele, o [ECS](#load-balancing-e-comunicação-entre-serviços) e o [EKS](#rede-no-eks) registram tasks e pods, as [estratégias de atualização](#auto-scaling-update-strategies) usam seus target groups com pesos, e o [Route 53](#amazon-route-53) e o [Global Accelerator](#aws-global-accelerator) apontam para ele.
+
+> **Paralelo com o Lambda:** em uma API serverless, o **API Gateway** recebe as requisições e o Lambda escala por baixo. Em uma aplicação com servidores ou containers, o **load balancer** faz o papel de "porta de entrada", e o Auto Scaling (ou o ECS/EKS) faz o papel da escala. Um ALB também pode ter **funções Lambda como destinos**, uma forma de expor Lambda por HTTP sem API Gateway.
+
+### Conceitos básicos
+
+- **Listener:** o "ouvido" do load balancer: um **protocolo e uma porta** (ex: HTTPS 443) e o que fazer com o tráfego recebido. Um load balancer pode ter vários listeners.
+- **Regras** (ALB): condições sobre a requisição (host, path, headers, método, query string, IP de origem) e **ações**: encaminhar para um target group, **redirecionar** (ex: HTTP → HTTPS), devolver uma **resposta fixa**, **autenticar**.
+- **Target group:** um grupo de destinos que recebem tráfego juntos, com seu protocolo, porta e **health check**. Os **tipos de destino** são:
+  - **instance:** instâncias EC2, por ID;
+  - **ip:** endereços IP, como tasks ECS em awsvpc, pods EKS, servidores **on-premises** alcançados por Direct Connect/VPN ou IPs de VPCs pareadas;
+  - **lambda:** uma função (só ALB);
+  - **alb:** um ALB como destino de um NLB.
+- **Health checks:** requisições periódicas (ex: `GET /health` a cada 30 s) a cada destino. Depois de N falhas seguidas, o destino é marcado como **unhealthy** e deixa de receber tráfego; depois de N sucessos, volta. Se **todos** os destinos estão unhealthy, o load balancer passa a mandar tráfego para **todos** (*fail open*), já que não há alternativa melhor.
+- **Deregistration delay** (*connection draining*): ao remover um destino (scale-in, deploy), o load balancer **para de mandar requisições novas** e espera as requisições em andamento terminarem, por até N segundos (padrão 300 s), antes de encerrar.
+- **Slow start:** um destino novo recebe tráfego **gradualmente** durante um período, para aquecer cache e JIT antes de receber a carga cheia.
+- **Sticky sessions:** o mesmo cliente vai sempre para o **mesmo destino**, por meio de um cookie do load balancer ou da aplicação. Resolve sessões guardadas em memória, mas **desbalanceia** a carga e perde a sessão se o destino cair. A prática recomendada é guardar a sessão **fora** do servidor (ElastiCache, DynamoDB).
+- **Algoritmos** (ALB): *round robin* (padrão), *least outstanding requests* (envia ao destino com menos requisições pendentes, bom quando as requisições têm duração muito variada) e *weighted random*, com mitigação automática de destinos anômalos.
+
+[↑ Índice](#índice)
+
+### Tipos de load balancer
+
+| | **Application Load Balancer (ALB)** | **Network Load Balancer (NLB)** | **Gateway Load Balancer (GWLB)** | Classic Load Balancer (CLB) |
+|---|---|---|---|---|
+| Camada | **7** (HTTP/HTTPS, gRPC, WebSocket) | **4** (TCP, UDP, TLS) | **3** (pacotes IP, protocolo GENEVE porta 6081) | 4 e 7 (legado) |
+| Função | Roteamento por **conteúdo** da requisição | **Desempenho** extremo e protocolos não-HTTP | Inserir **appliances de rede** (firewalls, IDS/IPS) de forma transparente | Não usar em projetos novos |
+| Roteamento | Host, path, headers, método, query string, IP de origem | Por porta/protocolo | Todo o tráfego passa pelos appliances | Simples |
+| IP | **Sem IP fixo** (os IPs mudam; use o nome DNS) | **IP estático por AZ**, inclusive **Elastic IP** | — | Sem IP fixo |
+| IP do cliente no destino | Via headers **X-Forwarded-For** | **Preservado** (ou via Proxy Protocol v2) | Preservado | X-Forwarded-For |
+| Destinos | Instâncias, IPs, **Lambda** | Instâncias, IPs, **ALB** | Instâncias e IPs (os appliances) | Instâncias |
+| Recursos de destaque | Autenticação (Cognito/OIDC), redirects, respostas fixas, **target groups com pesos**, **WAF**, mTLS | Milhões de req/s com latência ultrabaixa, **PrivateLink**, TLS passthrough | Gateway Load Balancer **endpoints**, roteamento transparente | — |
+
+![Diagrama ELB - ALB, NLB e GWLB](./img/elastic-load-balancing/elastic-load-balancing-01.png)
+
+**Como escolher:**
+- **HTTP/HTTPS** com roteamento por URL, microsserviços, containers ou Lambda → **ALB**.
+- **TCP/UDP**, jogos, IoT, latência mínima, **IP fixo** ou **PrivateLink** → **NLB**.
+- **Firewalls e appliances** de terceiros inspecionando o tráfego → **GWLB**.
+
+[↑ Índice](#índice)
+
+### Application Load Balancer em detalhe
+
+- **Roteamento por conteúdo:** um único ALB pode atender vários serviços. Por exemplo, `api.empresa.com/pedidos/*` → target group de pedidos, `/catalogo/*` → target group de catálogo, `admin.empresa.com` → painel administrativo. Isso reduz custo e simplifica microsserviços.
+- **Ações sem backend:** **redirect** (HTTP → HTTPS, domínio antigo → novo, com código 301/302) e **fixed response** (ex: página de manutenção ou 404 personalizado).
+- **Autenticação no ALB:** a regra pode exigir login via **Cognito User Pools** ou qualquer provedor **OIDC** (Google, Okta, Entra ID) **antes** de encaminhar a requisição. A aplicação recebe os dados do usuário em headers, sem precisar implementar o login.
+- **Target groups com pesos:** a mesma regra divide o tráfego entre dois target groups (ex: 90/10), para **blue/green e canary** (ver [Auto Scaling Update Strategies](#3-bluegreen-com-dois-target-groups-e-pesos-no-alb)).
+- **Lambda como destino:** a requisição HTTP vira o evento da função, e a resposta da função vira a resposta HTTP.
+- **gRPC e HTTP/2**, **WebSocket**.
+- **AWS WAF** associado ao ALB, para proteger contra ataques de aplicação.
+- **mTLS:** o ALB pode **verificar certificados de clientes** contra uma CA (*trust store*), ou repassar o certificado à aplicação (*passthrough*).
+- **Limitação importante:** o ALB **não tem IP fixo**. Os IPs mudam conforme ele escala. Para clientes que exigem IPs fixos em allowlist: **Global Accelerator** na frente do ALB, ou **NLB com Elastic IPs** tendo o ALB como destino.
+
+[↑ Índice](#índice)
+
+### Network Load Balancer em detalhe
+
+- **Desempenho:** milhões de requisições por segundo, latência muito baixa e capacidade para picos repentinos.
+- **IP estático:** um IP por AZ, que pode ser um **Elastic IP** seu. Ideal para allowlists de firewall e clientes que não usam DNS.
+- **Preservação do IP do cliente:** com destinos do tipo **instance**, o destino vê o IP **real** do cliente. Com destinos **ip**, o IP pode ser preservado conforme a configuração, ou o NLB envia o **Proxy Protocol v2** (um cabeçalho com o IP original).
+- **TLS:** o NLB pode **terminar TLS** (listener TLS, com certificado do ACM) ou fazer **passthrough**, com um listener TCP na porta 443 em que o TLS é terminado no **destino**, para criptografia de ponta a ponta sem o load balancer ver o conteúdo.
+- **UDP:** DNS, jogos, VoIP, IoT, streaming.
+- **ALB como destino:** NLB na frente de um ALB, para combinar **IP fixo/PrivateLink** com **roteamento HTTP**.
+- **PrivateLink:** um NLB pode ser a base de um **endpoint service**. Outras VPCs e **outras contas** acessam o serviço por um **interface VPC endpoint** na própria VPC, **sem peering, sem Transit Gateway e sem sobreposição de IPs**. É o padrão para empresas **SaaS** exporem serviços a clientes, e para serviços compartilhados em multi-conta.
+- **Security groups:** o NLB também aceita security groups, que antes eram exclusividade do ALB.
+
+![Diagrama ELB - NLB com IP fixo, ALB como destino e PrivateLink](./img/elastic-load-balancing/elastic-load-balancing-02.png)
+
+[↑ Índice](#índice)
+
+### Gateway Load Balancer em detalhe
+
+Muitas empresas usam **appliances de segurança de terceiros** (firewalls de próxima geração, IDS/IPS, inspeção profunda de pacotes: Palo Alto, Fortinet, Check Point...) e precisam que **todo o tráfego** passe por eles. O problema é **escalar** esses appliances e mantê-los disponíveis sem mudar a aplicação. O GWLB resolve isso:
+
+- **Transparente** (*bump in the wire*): o tráfego chega aos appliances **sem mudar** os IPs de origem e destino. Para a aplicação, é como se o firewall não existisse.
+- **GENEVE** (porta 6081): o GWLB encapsula os pacotes originais e os envia aos appliances, que devolvem os pacotes aprovados.
+- **Gateway Load Balancer endpoint (GWLBe):** um endpoint colocado na VPC da aplicação (ou em uma VPC de inspeção centralizada). As **route tables** mandam o tráfego para o GWLBe, que o leva ao GWLB, que o distribui entre os appliances.
+- **Escala e alta disponibilidade:** os appliances ficam em um **Auto Scaling group**, com health checks. Se um falha, o GWLB o tira de circulação. O mesmo fluxo (*5-tuple*) sempre vai para o mesmo appliance, para manter o estado da sessão.
+- **Arquitetura centralizada:** uma **VPC de inspeção** com GWLB e appliances, e o tráfego das VPCs das aplicações passando por ela via **Transit Gateway**. Nesse caso, ative o **appliance mode** no attachment do TGW, para que ida e volta passem pelo mesmo appliance.
+
+![Diagrama ELB - Inspeção transparente com Gateway Load Balancer](./img/elastic-load-balancing/elastic-load-balancing-03.png)
+
+> **Obs:** Para inspeção sem appliances de terceiros, a alternativa gerenciada é o **AWS Network Firewall** (ver [Network Firewall](security.md#aws-network-firewall)), que usa endpoints parecidos. O GWLB é a resposta quando o requisito é usar **um produto específico** de firewall ou IDS.
+
+[↑ Índice](#índice)
+
+### Cross-zone load balancing
+
+Cada AZ habilitada no load balancer tem um "nó" do load balancer. O DNS distribui os clientes entre esses nós, normalmente de forma igual. O **cross-zone load balancing** define se cada nó envia tráfego **só aos destinos da própria AZ** ou a **todos os destinos de todas as AZs**:
+
+- **Desligado:** cada AZ recebe a mesma fatia do tráfego (ex: 50%), dividida entre os destinos **daquela AZ**. Se as AZs têm quantidades diferentes de destinos, a carga fica **desigual**. Por exemplo, com 2 destinos na AZ a e 8 na AZ b, cada destino da AZ a recebe 25% do total, e cada um da AZ b, 6,25%.
+- **Ligado:** o tráfego é dividido igualmente entre **todos** os destinos (10% cada), independentemente da AZ.
+
+| | ALB | NLB | GWLB |
+|---|---|---|---|
+| Padrão | **Ligado** | Desligado | Desligado |
+| Custo da transferência entre AZs | Sem custo | **Cobrado** (quando ligado) | **Cobrado** (quando ligado) |
+
+![Diagrama ELB - Cross-zone load balancing](./img/elastic-load-balancing/elastic-load-balancing-04.png)
+
+[↑ Índice](#índice)
+
+### TLS, certificados e o IP do cliente
+
+- **Certificados do ACM** nos listeners HTTPS/TLS, com renovação automática. Com **SNI** (*Server Name Indication*), um mesmo listener pode ter **vários certificados**, um por domínio, e o load balancer escolhe o certo conforme o nome que o cliente pede. É o que permite um ALB atender `api.empresa.com` e `loja.outra.com` na mesma porta 443.
+- **Security policies:** definem as versões de TLS e as cifras aceitas (ex: só TLS 1.2+), para requisitos de compliance.
+- **Terminação vs. ponta a ponta:**
+  - **Terminação no load balancer:** o tráfego até os destinos vai em HTTP. Isso alivia os servidores e permite ao ALB ver o conteúdo para rotear.
+  - **Recriptografia:** HTTPS até os destinos, com certificados neles, para requisitos de **criptografia em trânsito de ponta a ponta**.
+  - **TLS passthrough:** NLB com listener TCP. O load balancer não vê o conteúdo, e o certificado fica só no destino.
+- **IP do cliente:**
+  - **ALB:** o destino vê o **IP do ALB**. O IP do cliente chega no header **`X-Forwarded-For`**, e o protocolo e a porta originais em **`X-Forwarded-Proto`** e **`X-Forwarded-Port`**. A aplicação e os logs precisam ler esses headers.
+  - **NLB:** o IP do cliente é **preservado**, ou chega via **Proxy Protocol v2**.
+
+[↑ Índice](#índice)
+
+### Segurança, logs e operação
+
+- **Internet-facing vs. internal:**
+  - **Internet-facing:** fica em subnets **públicas** e tem IPs públicos.
+  - **Internal:** fica em subnets privadas, só para tráfego interno (ex: entre camadas da aplicação, ou de on-premises via Direct Connect).
+
+  Em ambos os casos, os **destinos** ficam em subnets **privadas**. Um ALB exige subnets em **pelo menos 2 AZs**.
+- **Security groups em cadeia:** o SG do load balancer libera a porta 443 da internet (ou dos clientes), e o SG dos **destinos** libera a porta da aplicação **apenas** a partir do **SG do load balancer**. Assim, os destinos não aceitam conexões diretas.
+- **AWS WAF** (ALB) e **Shield** (proteção contra DDoS; Shield Advanced com resposta especializada e proteção de custo).
+- **Access logs:** um registro por requisição (cliente, URL, status, latência, destino) enviado ao **S3**, para auditoria e análise com Athena. O NLB também tem **connection logs** para TLS.
+- **Métricas no CloudWatch:** `RequestCount`, `TargetResponseTime`, `HTTPCode_Target_5XX_Count`, `UnHealthyHostCount`, `SurgeQueueLength`, `RejectedConnectionCount`. Os 5XX do **load balancer** (ex: 502, 503, 504) e os 5XX dos **destinos** são métricas separadas, o que ajuda a saber de quem é o erro.
+- **Capacidade:** o load balancer escala sozinho, mas leva alguns minutos para acompanhar picos **extremamente repentinos** (ex: o início de um evento ao vivo). Para eventos previstos, é possível **reservar capacidade** (LCU reservation).
+
+[↑ Índice](#índice)
+
+### ALB ou API Gateway?
+
+| Situação | Escolha |
+|---|---|
+| Tráfego HTTP de **alto volume e constante** para containers/instâncias | **ALB** (custo por hora + LCU, mais barato em volume muito alto) |
+| Roteamento por host/path para **vários serviços** em ECS/EKS/EC2 | **ALB** |
+| API com **chaves, cotas por cliente, cache, transformação, validação** | **API Gateway** (REST) |
+| API serverless simples com Lambda e JWT | **API Gateway (HTTP)** ou **Function URL**; ALB com Lambda também funciona |
+| Autenticar usuários **antes** da aplicação, sem código | **ALB** com Cognito/OIDC, ou **API Gateway** com autorizadores |
+| Expor serviço privado para **outras contas/VPCs** | **NLB + PrivateLink** (ou API Gateway privada, VPC Lattice) |
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Rotear `/api` e `/web` (ou domínios diferentes) para serviços diferentes com **um** load balancer" → **ALB** com regras de path/host.
+- "Protocolo **TCP/UDP**, latência ultrabaixa, milhões de requisições" → **NLB**.
+- "Clientes exigem **IP fixo** para allowlist, e a aplicação está atrás de um ALB" → **Global Accelerator** na frente do ALB, ou **NLB (Elastic IPs) com o ALB como destino**.
+- "Expor um serviço para **outras contas/VPCs** sem peering, inclusive com CIDRs sobrepostos" → **NLB + PrivateLink** (endpoint service).
+- "Todo o tráfego deve passar por **firewalls de terceiros**, com escala e alta disponibilidade" → **Gateway Load Balancer** + GWLB endpoints (+ **appliance mode** no TGW em arquitetura centralizada).
+- "A aplicação precisa do **IP do cliente** atrás de um ALB" → header **X-Forwarded-For**. "Atrás de um NLB com destinos IP" → **Proxy Protocol v2** (ou preservação de IP).
+- "Criptografia de ponta a ponta, o load balancer não pode ver o conteúdo" → **NLB com TLS passthrough** (listener TCP). "Criptografia até os destinos com roteamento HTTP" → ALB com **HTTPS também até os destinos**.
+- "Vários domínios com certificados diferentes no mesmo listener" → **SNI** (vários certificados do ACM no listener).
+- "Redirecionar HTTP para HTTPS" → **regra de redirect** no listener HTTP do ALB.
+- "Exigir login antes de acessar a aplicação, sem alterar o código" → **ALB** com autenticação **Cognito/OIDC**.
+- "Carga desigual entre AZs com quantidades diferentes de instâncias" → ligar o **cross-zone load balancing** (no NLB, cobra transferência entre AZs).
+- "Requisições em andamento falham durante o scale-in ou deploy" → **deregistration delay** adequado.
+- "Instâncias novas ficam sobrecarregadas ao entrar" → **slow start**.
+- "Usuários perdem a sessão quando mudam de instância" → **sticky sessions** (paliativo) ou, melhor, sessão no **ElastiCache/DynamoDB**.
+- "Destinos devem aceitar tráfego **somente** do load balancer" → SG dos destinos referenciando o **SG do load balancer**.
+- "Balancear para servidores **on-premises**" → target group do tipo **ip** (via Direct Connect/VPN).
+- "Evento ao vivo com pico repentino e previsto" → **reserva de capacidade** (LCU reservation) do load balancer.
+- "Descobrir se o erro 5XX vem do load balancer ou da aplicação" → métricas `HTTPCode_ELB_5XX` vs. `HTTPCode_Target_5XX` e **access logs**.
+
+[↑ Índice](#índice)
+
 ## AWS Outposts
 
 O **AWS Outposts** leva a **infraestrutura da AWS para dentro do seu data center**: racks e servidores com o mesmo hardware que a AWS usa nas regiões, **instalados, monitorados, atualizados e mantidos pela AWS**, rodando os mesmos serviços, com as mesmas APIs, o mesmo console e as mesmas ferramentas (CloudFormation, CloudWatch, IAM). Para quem desenvolve, uma instância EC2 no Outpost é **igual** a uma instância na região, só que fisicamente no seu prédio.
@@ -3457,6 +3636,19 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | On-prem resolvendo nomes da AWS / AWS resolvendo on-prem | [Inbound / outbound endpoints](#route-53-resolver-dns-híbrido) |
 | DNS compartilhado entre contas | [RAM / Route 53 Profiles](#private-hosted-zones) |
 | Respostas DNS falsificadas | [DNSSEC](#dnssec) |
+
+### Load balancing
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Roteamento por host/path para vários serviços | [ALB](#application-load-balancer-em-detalhe) |
+| TCP/UDP, latência mínima, IP fixo | [NLB](#network-load-balancer-em-detalhe) |
+| IP fixo para uma aplicação atrás de ALB | [Global Accelerator ou NLB → ALB](#network-load-balancer-em-detalhe) |
+| Serviço para outras contas sem peering | [NLB + PrivateLink](#network-load-balancer-em-detalhe) |
+| Firewalls de terceiros inspecionando tudo | [GWLB](#gateway-load-balancer-em-detalhe) |
+| Carga desigual entre AZs | [Cross-zone load balancing](#cross-zone-load-balancing) |
+| IP do cliente / criptografia ponta a ponta / vários certificados | [TLS, certificados e o IP do cliente](#tls-certificados-e-o-ip-do-cliente) |
+| ALB ou API Gateway | [Comparação](#alb-ou-api-gateway) |
 
 ### Outposts e borda
 
