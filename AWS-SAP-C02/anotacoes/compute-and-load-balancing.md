@@ -15,6 +15,7 @@ servicos:
   - Amazon API Gateway
   - AWS AppSync
   - AWS Global Accelerator
+  - Amazon Route 53
   - AWS Outposts
   - AWS Wavelength
   - AWS Local Zones
@@ -25,7 +26,7 @@ servicos:
   - Amazon File Cache
   - Amazon DCV
 criado-em: 2026-11-05
-atualizado-em: 2026-11-13
+atualizado-em: 2026-11-14
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
 tags: [sap-c02, compute, load-balancing]
 ---
@@ -41,7 +42,7 @@ tags: [sap-c02, compute, load-balancing]
 - **Compute:** [Amazon EC2](#amazon-elastic-compute-cloud-ec2) · [Amazon EC2 Auto Scaling](#amazon-ec2-auto-scaling) · [Auto Scaling Update Strategies](#auto-scaling-update-strategies) · [Spot Instances & Spot Fleet](#spot-instances--spot-fleet) · [High Performance Computing (HPC)](#high-performance-computing-hpc)
 - **Containers:** [Containers (conceitos)](#containers) · [Amazon ECS](#amazon-elastic-container-service-ecs) · [Amazon EKS](#amazon-elastic-kubernetes-service-eks)
 - **Serverless:** [AWS Lambda](#aws-lambda) · [Amazon API Gateway](#amazon-api-gateway) · [AWS AppSync](#aws-appsync)
-- **Tráfego global:** [AWS Global Accelerator](#aws-global-accelerator)
+- **Tráfego global:** [AWS Global Accelerator](#aws-global-accelerator) · [Amazon Route 53](#amazon-route-53)
 - **Híbrido e borda:** [AWS Outposts](#aws-outposts) · [AWS Wavelength](#aws-wavelength) · [AWS Local Zones](#aws-local-zones)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
@@ -2539,6 +2540,178 @@ Os três podem ser **combinados**. Por exemplo, CloudFront para o site, Global A
 
 [↑ Índice](#índice)
 
+## Amazon Route 53
+
+O **Amazon Route 53** é o serviço de **DNS** da AWS: ele traduz nomes (`api.empresa.com`) em endereços (IPs, load balancers, distribuições CloudFront). Mas, na SAP-C02, ele é bem mais do que uma "lista telefônica". O Route 53 é uma ferramenta de **roteamento de tráfego** e de **disaster recovery**. Ele decide **para qual região, ambiente ou endpoint** cada usuário vai, conforme latência, localização, pesos e **saúde** dos endpoints, e tira automaticamente do ar os que falham.
+
+O nome vem da **porta 53**, a porta padrão do DNS. É um serviço **global**, com SLA de **100% de disponibilidade** para o plano de dados.
+
+Ele é um dos serviços mais presentes na prova, em cenários de:
+- **multi-região**: ativo-ativo, ativo-passivo, failover;
+- **migrações**: troca gradual de tráfego entre ambientes;
+- **DNS híbrido** entre on-premises e AWS;
+- **ambientes multi-conta**: DNS centralizado e private hosted zones compartilhadas.
+
+> **Comparação com o resto deste arquivo:** o Route 53 já apareceu como alternativa em [Auto Scaling Update Strategies](#auto-scaling-update-strategies), no [API Gateway multi-região](#padrões-arquiteturais) e nas [Local Zones](#arquitetura-e-resiliência). A grande diferença para o [Global Accelerator](#global-accelerator-cloudfront-ou-route-53) é que o Route 53 decide **na resolução do nome**, e a resposta fica em **cache** nos clientes pelo tempo do TTL. Isso é simples e barato, mas uma mudança não chega a todos os clientes na hora.
+
+### Revisão rápida: como o DNS funciona
+
+1. O aplicativo pergunta ao **resolvedor DNS** configurado no sistema: "qual o IP de `api.empresa.com`?". Esse resolvedor pode ser o do provedor de internet, o da rede corporativa ou, dentro de uma VPC, o **Route 53 Resolver**.
+2. Se não tiver a resposta em cache, o resolvedor pergunta aos **root servers**, que indicam os servidores de `.com`.
+3. Os servidores do **TLD** (`.com`) indicam os **servidores autoritativos** do domínio `empresa.com`, que no caso são os **name servers do Route 53** (registros **NS**).
+4. O servidor **autoritativo** (o Route 53) responde com o registro, por exemplo um IP, junto com um **TTL** (*time to live*).
+5. O resolvedor e o cliente **guardam a resposta em cache** durante o TTL, e só perguntam de novo depois que ele expira.
+
+**Consequência para a arquitetura:** o **TTL** é a troca entre **agilidade** e **custo/carga**.
+- **TTL baixo** (ex: 60 s): mudanças e failovers chegam rápido aos clientes, mas há mais consultas, que custam.
+- **TTL alto** (ex: 1 dia): menos consultas, mas mudanças demoram a se propagar.
+
+Antes de uma **migração**, a prática é **reduzir o TTL** com antecedência. Além disso, alguns clientes e resolvedores **ignoram o TTL** e guardam a resposta por mais tempo.
+
+![Diagrama Route 53 - Resolução DNS](./img/amazon-route-53/amazon-route-53-01.png)
+
+[↑ Índice](#índice)
+
+### Hosted zones, registros e alias
+
+- **Registro de domínios:** o Route 53 também é um *registrar*: registra e transfere domínios. É possível usar o Route 53 como DNS de um domínio registrado em **outro lugar**: basta apontar, no registrar, os **NS** do domínio para os name servers da hosted zone.
+- **Hosted zone:** o conjunto de registros de um domínio.
+  - **Pública:** responde para a internet.
+  - **Privada:** responde **só dentro das VPCs associadas** (ver [Private hosted zones](#private-hosted-zones)).
+  - Cada hosted zone tem um custo mensal, e as consultas são cobradas por volume.
+- **Tipos de registro mais cobrados:**
+
+| Tipo | Para quê |
+|---|---|
+| **A / AAAA** | Nome → IPv4 / IPv6 |
+| **CNAME** | Nome → **outro nome**. **Não pode** ser usado no *zone apex* (o domínio "raiz", `empresa.com`) |
+| **Alias** (extensão do Route 53) | Nome → **recurso AWS** (ALB, NLB, CloudFront, API Gateway, S3 website, Global Accelerator, outro registro da mesma zona...). **Funciona no zone apex**, segue automaticamente as mudanças de IP do recurso e as consultas para recursos AWS **não são cobradas** |
+| **MX / TXT / CAA / SRV** | E-mail, verificações e políticas (ex: SPF, validação de certificado), quais autoridades podem emitir certificados, serviços |
+| **NS / SOA** | Delegação da zona (ou de um subdomínio para outra hosted zone) e dados de autoridade |
+
+**Alias vs. CNAME:** para apontar para recursos AWS, **use alias**. Ele funciona no apex (`empresa.com` → ALB), é gratuito para recursos AWS e é resolvido em uma única etapa. O CNAME é para nomes fora da AWS, e não funciona no apex. Uma limitação importante: o alias **não** aponta para uma instância EC2 diretamente, só por IP com registro A, ou para um nome DNS público de outro provedor.
+
+**Delegação de subdomínios:** em ambientes multi-conta, é comum o domínio principal ficar em uma conta central e cada equipe ou conta ter sua **própria hosted zone para um subdomínio** (`pedidos.empresa.com`), delegada por registros **NS** na zona principal.
+
+[↑ Índice](#índice)
+
+### Políticas de roteamento
+
+A política de roteamento define **qual resposta** o Route 53 devolve quando há **vários registros** com o mesmo nome:
+
+| Política | Como decide | Uso típico |
+|---|---|---|
+| **Simple** | Um registro; pode ter vários IPs, que são devolvidos em ordem aleatória. **Sem health check** | Um único recurso |
+| **Weighted** | Por **pesos** (ex: 90 / 10). Peso 0 tira o registro da rotação | Canary, blue/green, migração gradual, teste A/B |
+| **Latency** | A **região AWS com menor latência** para o usuário (medida pela AWS) | Aplicações multi-região ativo-ativo |
+| **Failover** | **Primário** enquanto estiver saudável; **secundário** se o primário falhar. Exige **health check** no primário | Ativo-passivo, DR |
+| **Geolocation** | Pela **localização do usuário** (continente, país, estado nos EUA), com um registro **default** para o resto | Conteúdo por país, restrições legais e de licenciamento, idioma |
+| **Geoproximity** | Pela **distância** entre usuário e recurso, ajustável por um **bias** que aumenta ou reduz a "área de atração" de cada recurso. Usado via **Traffic Flow** | Deslocar tráfego entre regiões de forma gradual e geográfica |
+| **IP-based** | Pelo **IP de origem** do usuário, usando **CIDR collections** que você define | Rotear clientes de certas redes (ex: um provedor) para endpoints específicos |
+| **Multivalue answer** | Devolve **até 8** registros **saudáveis** escolhidos aleatoriamente | Balanceamento simples no DNS, com health checks (não substitui um load balancer) |
+
+**Geolocation vs. latency vs. geoproximity:**
+- **geolocation** decide **por onde o usuário está**: país ou continente, uma regra de negócio;
+- **latency** decide **pelo desempenho**: a região mais rápida para ele;
+- **geoproximity** decide pela **distância**, ajustável pelo bias.
+
+Questões sobre "usuários da Europa devem ser atendidos pela região da Europa por requisitos legais" pedem **geolocation**. Já "o menor tempo de resposta" pede **latency**.
+
+![Diagrama Route 53 - Políticas de roteamento](./img/amazon-route-53/amazon-route-53-02.png)
+
+[↑ Índice](#índice)
+
+### Health checks e failover
+
+Os **health checks** fazem o Route 53 **tirar das respostas** os endpoints que estão falhando. Há três tipos:
+
+- **Endpoint:** verificadores do Route 53 em **várias regiões** fazem requisições **HTTP, HTTPS ou TCP** ao endpoint. Podem verificar se a resposta contém um texto (*string matching*). O endpoint é considerado saudável se **a maioria** dos verificadores concordar. Os verificadores estão na **internet**: o firewall ou security group do endpoint precisa **liberar os IPs dos health checkers** do Route 53.
+- **Calculated:** combina **outros health checks** com uma regra, por exemplo "saudável se pelo menos 2 de 3 estiverem saudáveis". Serve para representar a saúde de uma **aplicação inteira**.
+- **Baseado em alarme do CloudWatch:** o estado de um **alarme** define a saúde. É a forma de monitorar recursos **privados**, que os verificadores da internet não alcançam (ex: um banco em subnet privada, uma fila com mensagens acumuladas), ou métricas de negócio.
+
+- **Evaluate target health:** em registros **alias**, o Route 53 pode usar a saúde do próprio recurso de destino (ex: os targets de um ALB) **sem precisar** de um health check separado.
+- **Notificações:** os health checks geram métricas no CloudWatch, e alarmes sobre elas podem acionar SNS.
+
+**Padrões de failover:**
+
+- **Ativo-passivo:** política **failover**, com primário e secundário (ex: região principal e região de DR).
+- **Ativo-ativo:** políticas **latency**, **weighted** ou **geolocation**, com health checks em todos os registros. Um endpoint que falha some das respostas, e os outros absorvem o tráfego.
+- **Políticas combinadas** (*nested*): por exemplo, **latency** para escolher a região e, dentro de cada região, **failover** entre o ambiente principal e um de reserva, ou **weighted** entre dois ALBs. Isso é montado com **alias para outros registros** da zona, ou visualmente no **Traffic Flow**, que versiona as políticas.
+
+![Diagrama Route 53 - Failover entre regiões com health checks](./img/amazon-route-53/amazon-route-53-03.png)
+
+[↑ Índice](#índice)
+
+### Route 53 Application Recovery Controller (ARC)
+
+Em DR de missão crítica, depender **só** de health checks automáticos tem dois riscos:
+- um **falso positivo** pode disparar um failover indesejado;
+- em um incidente **parcial** (a aplicação lenta, mas "saudável" para o health check), ninguém consegue forçar a troca rapidamente.
+
+O **ARC** resolve isso:
+
+- **Routing controls:** "interruptores" **liga/desliga** ligados a health checks do Route 53. O operador, ou uma automação, **muda o tráfego de região** acionando o interruptor. O plano de dados do ARC é um **cluster distribuído em 5 regiões**, projetado para continuar funcionando **durante** um incidente regional. Ele não depende do console nem da API da região afetada. As **safety rules** impedem erros, como desligar todas as regiões ao mesmo tempo.
+- **Readiness checks:** verificam continuamente se a região de **DR está pronta** para receber tráfego: as **mesmas quotas**, a mesma capacidade (ASG, DynamoDB) e as mesmas configurações da região principal.
+- **Zonal shift / zonal autoshift:** tira **uma AZ** com problemas da rotação em load balancers (ALB/NLB) e outros recursos suportados, por um tempo definido. Com o autoshift, a **própria AWS** faz isso quando detecta um problema na AZ.
+
+[↑ Índice](#índice)
+
+### Private hosted zones
+
+Uma **private hosted zone** responde a consultas **somente** das **VPCs associadas** a ela. É o DNS **interno** da empresa na AWS (ex: `db.interno.empresa.com` → endpoint do RDS).
+
+- **Requisitos da VPC:** os atributos `enableDnsSupport` e `enableDnsHostnames` habilitados.
+- **Várias VPCs e contas:** uma private hosted zone pode ser associada a **várias VPCs**, inclusive de **outras contas**. A associação entre contas é feita por **autorização** na conta da zona e **associação** na conta da VPC, via CLI/API. Uma alternativa mais nova e escalável é o **Route 53 Profiles**, que agrupa private hosted zones, regras do Resolver e regras do DNS Firewall e compartilha tudo de uma vez via **RAM** com VPCs de várias contas.
+- **Split-horizon DNS:** o **mesmo nome** em uma zona **pública** e em uma **privada**. Por exemplo, `app.empresa.com` responde com o IP **público** para a internet e com o IP **privado** de dentro da VPC.
+
+[↑ Índice](#índice)
+
+### Route 53 Resolver: DNS híbrido
+
+Toda VPC tem um **resolvedor DNS** embutido, o **Route 53 Resolver** (ou *AmazonProvidedDNS*), no endereço **base da VPC + 2** (ex: `10.0.0.2`) ou `169.254.169.253`. Ele resolve nomes públicos, private hosted zones associadas e nomes internos da AWS. Em ambientes **híbridos**, ele precisa conversar com o DNS **on-premises**:
+
+- **Inbound endpoint** (on-premises → AWS): IPs na sua VPC que **recebem** consultas da rede on-premises (via Direct Connect/VPN). Assim, os servidores on-premises resolvem nomes das **private hosted zones**. O DNS on-premises encaminha `aws.empresa.com` para esses IPs.
+- **Outbound endpoint + forwarding rules** (AWS → on-premises): as **regras** dizem "consultas para `corp.empresa.com` vão para os DNS on-premises `192.168.1.10` e `.11`". O outbound endpoint envia essas consultas pela rede híbrida.
+- **Compartilhamento:** as **forwarding rules** podem ser compartilhadas via **AWS RAM** com **outras contas** e associadas às VPCs delas. O padrão recomendado é **centralizar** os endpoints em uma **VPC de shared services** (conta de rede) e compartilhar as regras com as VPCs das outras contas, que alcançam a VPC central por Transit Gateway.
+- **Query logging:** registra as consultas DNS feitas pelas VPCs, em CloudWatch Logs, S3 ou Firehose, para auditoria e investigação de segurança.
+- **DNS Firewall:** bloqueia consultas a domínios maliciosos a partir das VPCs (ver [Route 53 Resolver DNS Firewall](security.md#route-53-resolver-dns-firewall)).
+
+![Diagrama Route 53 - DNS híbrido com Resolver endpoints](./img/amazon-route-53/amazon-route-53-04.png)
+
+[↑ Índice](#índice)
+
+### DNSSEC
+
+O **DNSSEC** protege contra **respostas DNS falsificadas** (*DNS spoofing*, *cache poisoning*): as respostas são **assinadas** criptograficamente, e o resolvedor verifica a assinatura.
+
+- **Assinatura (signing)** de hosted zones **públicas**: o Route 53 assina os registros usando uma **chave KMS assimétrica** gerenciada pelo cliente, que precisa estar em **us-east-1**. Depois, é preciso estabelecer a **cadeia de confiança**, adicionando o registro **DS** na zona pai (no registrar).
+- **Validação:** o **Route 53 Resolver** pode **validar** DNSSEC nas respostas que recebe, para as VPCs.
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Apontar o domínio raiz (`empresa.com`) para um ALB/CloudFront" → registro **alias** (CNAME não funciona no apex).
+- "Migração com troca **gradual** de tráfego (10% → 50% → 100%)" → política **weighted**. "Reduzir o tempo de propagação antes da migração" → **baixar o TTL** com antecedência.
+- "Usuários devem ir para a região com **menor latência**" → **latency**. "Usuários de um **país** devem ser atendidos por uma região específica (regra legal/idioma)" → **geolocation** (com registro **default**).
+- "Deslocar mais usuários para uma região aumentando sua área de atendimento" → **geoproximity** com **bias** (Traffic Flow).
+- "Ativo-passivo com DR em outra região" → **failover** + **health check** no primário.
+- "Health check de um recurso **privado**" → health check baseado em **alarme do CloudWatch**.
+- "Health check que considera a saúde de **vários** componentes" → **calculated health check**.
+- "Health checks falham, mas a aplicação está no ar" → liberar os **IPs dos health checkers** do Route 53 no security group/firewall.
+- "Failover de região controlado manualmente, confiável durante um incidente regional, com verificação de prontidão do DR" → **Route 53 ARC** (routing controls + readiness checks).
+- "Tirar uma AZ com problemas da rotação" → **zonal shift / zonal autoshift**.
+- "Servidores **on-premises** precisam resolver nomes de uma **private hosted zone**" → **Resolver inbound endpoint**.
+- "Instâncias na VPC precisam resolver nomes do **DNS on-premises**" → **Resolver outbound endpoint** + **forwarding rules**.
+- "Compartilhar regras de DNS com várias contas" → **forwarding rules via RAM** (ou **Route 53 Profiles**), com endpoints centralizados em uma VPC de shared services.
+- "Associar uma private hosted zone a uma VPC de **outra conta**" → autorização + associação via CLI/API (ou **Route 53 Profiles**).
+- "Mesmo nome com respostas diferentes para a internet e para a VPC" → **split-horizon** (zona pública + zona privada).
+- "Proteger contra falsificação de respostas DNS" → **DNSSEC** (signing com chave KMS em us-east-1 + registro DS no registrar).
+- "Balancear entre vários IPs com health check, sem load balancer" → **multivalue answer**.
+- "Failover sem depender de cache DNS / IPs fixos" → **Global Accelerator**, não Route 53.
+
+[↑ Índice](#índice)
+
 ## AWS Outposts
 
 O **AWS Outposts** leva a **infraestrutura da AWS para dentro do seu data center**: racks e servidores com o mesmo hardware que a AWS usa nas regiões, **instalados, monitorados, atualizados e mantidos pela AWS**, rodando os mesmos serviços, com as mesmas APIs, o mesmo console e as mesmas ferramentas (CloudFormation, CloudWatch, IAM). Para quem desenvolve, uma instância EC2 no Outpost é **igual** a uma instância na região, só que fisicamente no seu prédio.
@@ -3270,6 +3443,20 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Migrar tráfego entre regiões aos poucos | [Traffic dial](#componentes) |
 | Jogador na instância e porta exatas | [Custom routing accelerator](#custom-routing-accelerator) |
 | Global Accelerator, CloudFront ou Route 53 | [Comparação](#global-accelerator-cloudfront-ou-route-53) |
+
+### Route 53
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Domínio raiz para ALB/CloudFront | [Alias](#hosted-zones-registros-e-alias) |
+| Migração gradual de tráfego | [Weighted + TTL baixo](#políticas-de-roteamento) |
+| Menor latência vs. regra por país | [Latency vs. geolocation](#políticas-de-roteamento) |
+| Ativo-passivo multi-região | [Failover + health check](#health-checks-e-failover) |
+| Saúde de recurso privado | [Health check por alarme do CloudWatch](#health-checks-e-failover) |
+| Failover regional controlado e confiável | [Route 53 ARC](#route-53-application-recovery-controller-arc) |
+| On-prem resolvendo nomes da AWS / AWS resolvendo on-prem | [Inbound / outbound endpoints](#route-53-resolver-dns-híbrido) |
+| DNS compartilhado entre contas | [RAM / Route 53 Profiles](#private-hosted-zones) |
+| Respostas DNS falsificadas | [DNSSEC](#dnssec) |
 
 ### Outposts e borda
 
