@@ -48,6 +48,8 @@ tags: [sap-c02, compute, containers, serverless, load-balancing, dns, hybrid, ed
 - **Híbrido e borda:** [AWS Outposts](#aws-outposts) · [AWS Wavelength](#aws-wavelength) · [AWS Local Zones](#aws-local-zones)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
+> **Mapa mental:** [visão geral dos temas no NotebookLM](https://notebooklm.link.google/EBcXYA0BUWTk) (requer login no Google).
+
 ## Amazon Elastic Compute Cloud (EC2)
 
 O Amazon EC2 oferece **servidores virtuais** (instâncias) sob demanda na AWS. Em vez de comprar um servidor físico, você escolhe uma "configuração" de CPU, memória, rede e disco, liga a máquina em minutos e paga apenas pelo tempo de uso. Por baixo, a AWS mantém data centers com milhares de servidores físicos (**hosts**). Cada host é dividido em várias máquinas virtuais por um **hypervisor**, e cada uma delas é uma **instância** que você controla como se fosse um computador seu: escolhe o sistema operacional, instala software, define quem acessa.
