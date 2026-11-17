@@ -7,6 +7,7 @@ servicos:
   - AWS Backup
   - Amazon EFS
   - AWS DataSync
+  - Amazon S3
 criado-em: 2026-11-16
 atualizado-em: 2026-11-17
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
@@ -23,6 +24,7 @@ tags: [sap-c02, storage]
 
 - **Block storage:** [Amazon EBS](#amazon-elastic-block-store-ebs)
 - **File storage:** [Amazon EFS](#amazon-elastic-file-system-efs)
+- **Object storage:** [Amazon S3](#amazon-simple-storage-service-s3)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## Amazon Elastic Block Store (EBS)
@@ -377,6 +379,254 @@ Replicação e backup se complementam. A replicação também copia **exclusões
 
 [↑ Índice](#índice)
 
+## Amazon Simple Storage Service (S3)
+
+### Contexto: armazenamento de objetos
+
+O EBS e o EFS imitam o que um sistema operacional já conhece: um **disco** e uma **pasta de rede**. O S3 parte de outra ideia. Em vez de montar algo na máquina, a aplicação **envia e busca arquivos inteiros por HTTP**, como faria com qualquer API:
+
+- `PUT` grava um arquivo (o **objeto**) com um nome (a **chave**);
+- `GET` lê o objeto pelo nome;
+- não há "abrir o arquivo e mudar a linha 30": para alterar, grava-se o objeto inteiro de novo.
+
+Abrir mão do sistema de arquivos traz vantagens enormes:
+
+- **capacidade praticamente ilimitada**, sem provisionar nada;
+- **11 noves de durabilidade**, com os dados espalhados por várias AZs;
+- acesso de **qualquer lugar** (aplicações, browsers, outros serviços da AWS);
+- **custo muito menor** por GB, com classes que chegam a centavos por TB/mês para arquivamento.
+
+Por isso o S3 é a base de **data lakes**, **backups**, **sites estáticos**, **mídia**, **logs** e da integração entre serviços da AWS. Na prova, ele aparece em quase todos os domínios: custo, DR, migração, segurança e analytics. Ver a comparação com block e file storage em [Contexto: block, file e object storage](#contexto-block-file-e-object-storage).
+
+[↑ Índice](#índice)
+
+### Conceitos do S3: buckets, objetos e chaves
+
+- **Bucket:** o contêiner dos objetos. Pertence a **uma região**, mas o nome é **único no mundo inteiro**. O limite padrão é de 10 mil buckets por conta, e pode ser aumentado.
+- **Objeto:** os dados (até **5 TB**) + **metadados** (`Content-Type`, metadados definidos pelo usuário `x-amz-meta-*`) + até 10 **tags** + **version ID** (com versionamento).
+- **Chave:** o nome completo do objeto, como `fotos/2026/praia.jpg`. **Não existem pastas**: `fotos/2026/` é só um **prefixo** da chave. O console exibe os prefixos como pastas para facilitar a navegação.
+- **Consistência forte:** depois de um `PUT` ou `DELETE` bem-sucedido, o próximo `GET` ou `LIST` já reflete a mudança, para todos os clientes.
+- **Tamanho dos uploads:** um `PUT` único aceita até **5 GB**. Acima disso, o **multipart upload** é obrigatório, e ele é recomendado a partir de 100 MB.
+- **Tipos de bucket:**
+  - **general purpose:** o bucket "normal", usado em quase todos os cenários;
+  - **directory bucket:** usado pelo S3 Express One Zone, em uma única AZ;
+  - **table bucket** (S3 Tables) e **vector bucket** (S3 Vectors): para tabelas Apache Iceberg e vetores de IA.
+
+![Diagrama S3 - Buckets, objetos e chaves](./img/amazon-s3/amazon-s3-01.png)
+
+[↑ Índice](#índice)
+
+### Classes de armazenamento do S3
+
+Todas as classes têm **durabilidade de 11 noves**. O que muda é a **latência de leitura**, a **disponibilidade**, os **mínimos cobrados** e a relação entre o custo de **guardar** e o custo de **ler**:
+
+| Classe | Primeiro byte | AZs | Mínimos cobrados | Taxa de recuperação | Uso típico |
+|---|---|---|---|---|---|
+| **S3 Express One Zone** | ms de **um dígito** | **1** | — | Não | ML, analytics e processamento intensivo, com o compute na mesma AZ |
+| **S3 Standard** | ms | ≥3 | — | Não | Dados acessados com frequência: aplicações, sites, data lakes "quentes" |
+| **S3 Intelligent-Tiering** | ms (camadas opcionais: horas) | ≥3 | Taxa de monitoramento por objeto | Não | **Padrão de acesso desconhecido ou que muda** |
+| **S3 Standard-IA** | ms | ≥3 | **30 dias**, **128 KB** | Sim | Backups e cópias de DR acessados raramente, mas lidos na hora |
+| **S3 One Zone-IA** | ms | **1** | 30 dias, 128 KB | Sim | Cópias secundárias e dados que podem ser recriados |
+| **S3 Glacier Instant Retrieval** | **ms** | ≥3 | **90 dias**, 128 KB | Sim, mais cara | Arquivo acessado ~1 vez por trimestre que precisa de leitura imediata (imagens médicas, acervos de mídia) |
+| **S3 Glacier Flexible Retrieval** | **minutos a horas** | ≥3 | **90 dias** | Sim | Backup e arquivo acessados 1-2 vezes por ano |
+| **S3 Glacier Deep Archive** | **horas** (até 12 h; Bulk até 48 h) | ≥3 | **180 dias** | Sim | Retenção de 7-10 anos por compliance; substitui fitas |
+
+**Como ler as classes Glacier:**
+
+- **Glacier Instant Retrieval** é lido como qualquer objeto, direto pela API.
+- **Glacier Flexible Retrieval** e **Deep Archive** exigem um **restore** antes da leitura. O restore cria uma **cópia temporária** do objeto, que fica disponível por N dias. As opções de velocidade são:
+  - Flexible: **Expedited** (1-5 min), **Standard** (3-5 h) e **Bulk** (5-12 h, gratuito);
+  - Deep Archive: **Standard** (até 12 h) e **Bulk** (até 48 h).
+- O evento `s3:ObjectRestore:Completed` avisa quando o restore termina.
+
+**Como escolher:**
+- acesso imprevisível → **Intelligent-Tiering**;
+- dado que **pode ser recriado** → classes **One Zone**;
+- precisa ler **na hora**, mas quase nunca → **Standard-IA** ou **Glacier Instant Retrieval**;
+- aceita esperar **horas** → **Glacier Flexible** ou **Deep Archive**.
+
+![Diagrama S3 - Classes de armazenamento](./img/amazon-s3/amazon-s3-02.png)
+
+> **Obs:** a cobrança mínima é uma pegadinha comum. Um objeto apagado ou movido do Standard-IA com 10 dias **paga os 30 dias**. Objetos menores que 128 KB pagam como 128 KB no IA. Para milhões de objetos pequenos, as classes IA podem sair **mais caras** que o Standard.
+
+[↑ Índice](#índice)
+
+### Lifecycle rules e Intelligent-Tiering
+
+**Lifecycle rules** automatizam a mudança de classe e a exclusão dos objetos com o tempo. Cada regra se aplica a um **prefixo**, a **tags** ou a uma faixa de **tamanho** de objeto:
+
+- **Transition actions:** mudam a classe depois de N dias da criação (ex: Standard → Standard-IA aos 30 dias → Glacier Flexible aos 90 → Deep Archive aos 365).
+- **Expiration actions:** apagam o objeto depois de N dias (ex: logs com 7 anos).
+- **Versões não atuais:** com versionamento, regras próprias para as versões antigas (ex: mover para Glacier aos 30 dias e apagar aos 365, ou manter só as 3 mais recentes) e para remover **delete markers** que ficaram sem versões.
+- **Multipart uploads incompletos:** uma regra para **abortá-los** (ex: após 7 dias). As partes já enviadas são cobradas e não aparecem na listagem comum.
+- **Restrições:** os objetos precisam ficar **30 dias** no Standard antes de ir para Standard-IA ou One Zone-IA, e as transições seguem um sentido: das classes mais "quentes" para as mais "frias".
+
+**S3 Intelligent-Tiering** faz o mesmo trabalho **sozinho**, objeto por objeto, de acordo com o **último acesso**:
+
+- **Frequent Access** (padrão) → **Infrequent Access** após **30 dias** sem acesso → **Archive Instant Access** após **90 dias**;
+- camadas **opcionais**, ativadas por configuração: **Archive Access** (90+ dias) e **Deep Archive Access** (180+ dias), que exigem restore;
+- ao ser acessado, o objeto volta para **Frequent Access**;
+- **não há taxa de recuperação**; paga-se uma pequena **taxa de monitoramento por objeto**. Objetos menores que **128 KB** não são monitorados e ficam sempre em Frequent.
+
+**Lifecycle ou Intelligent-Tiering?**
+- padrão de acesso **previsível**, como logs que ninguém lê depois de 30 dias → **lifecycle rules**, que é mais barato;
+- padrão **desconhecido ou variável** → **Intelligent-Tiering**.
+
+Para descobrir o padrão, use o **Storage Class Analysis**, que observa os acessos e recomenda quando mover objetos do Standard para o Standard-IA, ou o **S3 Storage Lens**.
+
+![Diagrama S3 - Lifecycle rules e Intelligent-Tiering](./img/amazon-s3/amazon-s3-03.png)
+
+[↑ Índice](#índice)
+
+### Versionamento e proteção de dados
+
+- **Versionamento:** cada `PUT` cria uma **nova versão** do objeto, e cada `DELETE` cria um **delete marker** em vez de apagar. A versão anterior pode ser recuperada. Uma vez ativado, o versionamento só pode ser **suspenso**, não desativado. É **pré-requisito da replicação** e do **Object Lock**.
+- **MFA Delete**, **Object Lock** (WORM, modos governance e compliance) e **Legal hold:** ver [S3 Object Lock (WORM)](security.md#s3-object-lock-worm) e [Amazon S3 Security](security.md#amazon-s3-security).
+- **AWS Backup para S3:** backups contínuos (restauração a um ponto no tempo nos últimos 35 dias) ou periódicos, com cópia entre contas e **Vault Lock**. É útil quando a governança de backup é centralizada para vários serviços.
+
+[↑ Índice](#índice)
+
+### Replicação (CRR e SRR)
+
+A replicação copia objetos **de forma assíncrona** de um bucket para outro:
+
+- **CRR (Cross-Region Replication):** para outra região. Atende **DR**, **compliance** (cópia em outra geografia) e **latência** para usuários de outra região.
+- **SRR (Same-Region Replication):** na mesma região. Atende **agregação de logs** de vários buckets, cópia de **produção para teste** e cópia para **outra conta** sem mudar de região.
+
+**Requisitos e opções:**
+
+- **Versionamento ativo** na origem e no destino, e uma **IAM role** que o S3 assume para replicar.
+- O destino pode estar em **outra conta**. Nesse caso, é preciso uma bucket policy no destino; a opção **owner override** torna a conta de destino dona das réplicas.
+- Pode **trocar a classe** no destino (ex: replicar direto para Glacier Deep Archive na região de DR).
+- Objetos criptografados com **SSE-KMS** são replicados se a regra indicar a chave KMS do destino.
+- **S3 Replication Time Control (RTC):** **99,99%** dos objetos replicados em até **15 minutos**, com SLA e métricas. É a resposta para "RPO de replicação previsível".
+
+**Regras que mais caem:**
+
+- Só objetos **novos** (criados depois da regra) são replicados. Para os **existentes** ou os que falharam, use o **S3 Batch Replication**.
+- **Não há encadeamento:** com A → B → C, os objetos criados em A não chegam a C.
+- **Delete markers** podem ser replicados (opcional). A exclusão de uma **versão específica** **nunca** é replicada, o que protege o destino contra exclusão maliciosa na origem.
+- **Replicação bidirecional:** duas regras (A → B e B → A) + **replica modification sync**. Costuma ser usada com **Multi-Region Access Points** para arquiteturas ativo/ativo. Ver [Multi-Region Access Points](security.md#multi-region-access-points).
+
+![Diagrama S3 - Replicação CRR e SRR](./img/amazon-s3/amazon-s3-04.png)
+
+[↑ Índice](#índice)
+
+### Desempenho do S3
+
+- **Escala por prefixo:** cada prefixo suporta pelo menos **3.500** `PUT/COPY/POST/DELETE` e **5.500** `GET/HEAD` por segundo, e não há limite de prefixos por bucket. Para mais requisições, distribua as chaves entre **vários prefixos**. O S3 escala particionando os prefixos automaticamente, mas um aumento brusco pode gerar erros **503 Slow Down** temporários; a aplicação deve fazer **retry com backoff**.
+- **Multipart upload:** divide o arquivo em partes (até 10.000) enviadas **em paralelo**. Uma parte que falha é reenviada sozinha. É obrigatório acima de 5 GB e recomendado acima de 100 MB.
+- **S3 Transfer Acceleration:** o cliente envia para a **edge location** mais próxima, e os dados seguem pela **rede da AWS** até o bucket. Usa um endpoint próprio (`bucket.s3-accelerate.amazonaws.com`) e só cobra quando de fato acelera. É a resposta para **uploads de usuários distantes** da região do bucket.
+- **Byte-range fetches:** o cabeçalho `Range` baixa **partes** do objeto em paralelo (mais throughput) ou só um trecho (ex: o cabeçalho de um arquivo).
+- **Leituras com muito acesso repetido:** **CloudFront** na frente do bucket, que armazena em cache nas edge locations e reduz requisições ao S3.
+- **Latência mínima:** **S3 Express One Zone** (directory buckets), com latência de milissegundos de um dígito e centenas de milhares de requisições por segundo, colocando o compute na **mesma AZ**.
+- **Consultas dentro do objeto:** para filtrar dados sem baixar o objeto inteiro, use o **Athena**. O S3 Select foi fechado para novos clientes.
+
+![Diagrama S3 - Multipart, Transfer Acceleration, byte-range e prefixos](./img/amazon-s3/amazon-s3-05.png)
+
+[↑ Índice](#índice)
+
+### Eventos do S3
+
+O S3 pode avisar outros serviços quando algo acontece no bucket: objeto criado, removido, restaurado do Glacier, replicação que falhou, entre outros.
+
+- **Event Notifications** (nativo):
+  - destinos: **SNS**, **SQS** (fila standard) e **Lambda**;
+  - filtro só por **prefixo e sufixo** da chave (ex: `uploads/` e `.jpg`);
+  - o destino precisa de uma **resource policy** que permita o S3 publicar.
+- **Amazon EventBridge** (ativado no bucket):
+  - **todos** os eventos do S3 vão para o EventBridge;
+  - as regras filtram por **metadados, tamanho, chave** e outros campos;
+  - **vários destinos** por evento (Step Functions, Kinesis, API destinations, outra conta ou região);
+  - **archive e replay** dos eventos.
+- **Qual escolher:**
+  - para um gatilho simples (ex: gerar a miniatura de uma imagem com Lambda), **Event Notifications** bastam;
+  - para filtros avançados, vários consumidores ou orquestração, use o **EventBridge**.
+- **Entrega:** os eventos chegam normalmente em segundos, mas podem ser **duplicados** ou, raramente, perdidos. O processamento deve ser **idempotente**.
+
+![Diagrama S3 - Event Notifications e EventBridge](./img/amazon-s3/amazon-s3-06.png)
+
+[↑ Índice](#índice)
+
+### Operações em larga escala
+
+- **S3 Inventory:** um relatório **diário ou semanal** (CSV, ORC ou Parquet) com a lista dos objetos e seus metadados: classe, tamanho, criptografia, status de replicação e de Object Lock. É mais barato e rápido que chamar `LIST` em bilhões de objetos, e pode ser consultado com o **Athena**.
+- **S3 Batch Operations:** executa **uma operação em bilhões de objetos** a partir de uma lista (o Inventory ou um CSV), com retries, acompanhamento e **relatório de conclusão**. Operações possíveis:
+  - **copiar** objetos (ex: para **criptografar objetos existentes** ou mudar a classe);
+  - **invocar uma Lambda** para cada objeto;
+  - substituir **tags**, metadados ou ACLs;
+  - **restaurar** do Glacier;
+  - aplicar **Object Lock**;
+  - **Batch Replication**.
+- **S3 Storage Lens:** um painel de **uso e atividade** de todos os buckets da **organização**, por conta, região, bucket e prefixo. Traz recomendações de custo e proteção de dados (ex: buckets sem versionamento, multipart uploads incompletos). As métricas gratuitas são básicas; as **avançadas** são pagas.
+
+[↑ Índice](#índice)
+
+### Site estático e Requester Pays
+
+- **Static website hosting:**
+  - o bucket serve HTML, CSS, JS e imagens por um **website endpoint** (`bucket.s3-website-<região>.amazonaws.com`), com página de índice, página de erro e regras de redirecionamento;
+  - o objeto precisa ser **público**, e o endpoint só fala **HTTP**;
+  - para **HTTPS**, domínio próprio com certificado, cache e um bucket **privado**, coloque o **CloudFront com Origin Access Control (OAC)** na frente. Ver [CloudFront com Origin Access Control (OAC)](security.md#cloudfront-com-origin-access-control-oac).
+- **Requester Pays:** quem **baixa** os dados paga as **requisições e a transferência**, e não o dono do bucket. É usado para compartilhar **grandes datasets** com outras contas. O solicitante precisa estar autenticado na AWS, sem acesso anônimo.
+
+[↑ Índice](#índice)
+
+### Segurança do S3
+
+A segurança do S3 está em [Amazon S3 Security](security.md#amazon-s3-security) e em [Amazon S3 Access Points](security.md#amazon-s3-access-points). Os pontos que mais se cruzam com storage são:
+
+- **Bucket policies** e **IAM policies**; **Block Public Access** ativado por padrão; **ACLs desabilitadas** por padrão (Object Ownership = bucket owner enforced).
+- **Criptografia:** **SSE-S3** é aplicada por padrão a todo objeto novo. As alternativas são SSE-KMS, DSSE-KMS e SSE-C. O **S3 Bucket Key** reduz as chamadas e o custo do KMS. Para criptografar **objetos já existentes**, use o **Batch Operations** (copy).
+- **Acesso privado a partir da VPC:** **gateway endpoint**, gratuito e só para a mesma região, ou **interface endpoint**, pago e acessível de on-premises e de outras regiões.
+- **Pre-signed URLs:** acesso temporário a um objeto sem credenciais AWS (ex: download ou upload direto pelo browser).
+
+[↑ Índice](#índice)
+
+### Custo do S3
+
+O custo do S3 tem cinco componentes:
+
+1. **Armazenamento:** GB/mês, de acordo com a classe.
+2. **Requisições:** `PUT`, `COPY`, `POST` e `LIST` custam mais que `GET`. Nas classes IA e Glacier, as requisições são mais caras.
+3. **Recuperação:** por GB lido nas classes IA e Glacier.
+4. **Transferência:** **entrada** gratuita; **saída** para a internet é paga; para o **CloudFront** é gratuita; entre **regiões** é paga, o que inclui a replicação CRR; dentro da mesma região, para EC2, é gratuita.
+5. **Gestão e recursos:** Inventory, Storage Lens avançado, monitoramento do Intelligent-Tiering, RTC e Transfer Acceleration.
+
+**Formas de reduzir:**
+- **lifecycle rules** ou **Intelligent-Tiering**;
+- abortar **multipart uploads incompletos**;
+- apagar **versões antigas**;
+- **gateway endpoint** em vez de NAT Gateway para o tráfego da VPC ao S3;
+- **CloudFront** para reduzir a saída de dados;
+- **Requester Pays** para datasets compartilhados.
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Padrão de acesso **desconhecido ou variável**, reduzir custo sem esforço operacional" → **S3 Intelligent-Tiering**.
+- "Logs acessados nos primeiros 30 dias e guardados por 7 anos" → **lifecycle**: Standard → Standard-IA → Glacier Flexible/Deep Archive → **expiração**.
+- "Arquivo raramente acessado que precisa ser lido **em milissegundos**" → **Glacier Instant Retrieval** (ou Standard-IA, se o acesso for mais frequente).
+- "Retenção de 7-10 anos ao **menor custo**, leitura em até 48 h" → **Glacier Deep Archive**.
+- "Dados que podem ser **recriados**, acesso raro, menor custo" → **One Zone-IA**.
+- "Milhões de objetos **pequenos**" → cuidado: IA e Glacier cobram mínimo de **128 KB** (e metadados extras no Glacier). O Standard pode sair mais barato.
+- "Custo de armazenamento crescendo sem explicação" → **multipart uploads incompletos** e **versões antigas**: lifecycle para abortar e expirar. Diagnóstico com o **Storage Lens**.
+- "Cópia em outra região para DR/compliance" → **CRR**. "Com RPO previsível de 15 minutos" → **CRR + RTC**. "Objetos que já existiam no bucket" → **S3 Batch Replication**.
+- "Proteger as réplicas contra exclusão maliciosa na conta de origem" → replicação para **outra conta** (+ **Object Lock** no destino). Exclusões de versões não são replicadas.
+- "Ativo/ativo com buckets em várias regiões e um endpoint único" → **Multi-Region Access Points** + **replicação bidirecional**.
+- "Uploads lentos de usuários em outro continente" → **Transfer Acceleration**. "Arquivos grandes" → **multipart upload**. "Download mais rápido de arquivos grandes" → **byte-range fetches**.
+- "Erros **503 Slow Down** com muitas requisições" → distribuir chaves em **mais prefixos** + retry com backoff.
+- "Latência de **milissegundos de um dígito** para treino de ML ou analytics intensivo" → **S3 Express One Zone**.
+- "Processar cada arquivo enviado (miniatura, antivírus, ETL)" → **Event Notifications** → Lambda/SQS. "Vários consumidores, filtros por metadados" → **EventBridge**.
+- "Executar uma operação em **bilhões de objetos** (copiar, criptografar existentes, mudar tags, restaurar)" → **S3 Batch Operations** com lista do **S3 Inventory**.
+- "Visão de uso e custo do S3 em **toda a organização**" → **S3 Storage Lens**.
+- "Site estático com **HTTPS** e domínio próprio" → **CloudFront + OAC** na frente do bucket (o website endpoint é só HTTP).
+- "Compartilhar um dataset enorme sem pagar a transferência" → **Requester Pays**.
+- "Instâncias em subnet privada acessando o S3 **sem NAT**, sem custo" → **gateway endpoint**.
+
+[↑ Índice](#índice)
+
 ## Revisão: qual serviço usar
 
 Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas seções de cada serviço.
@@ -410,5 +660,22 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Exigir TLS / criptografar file system existente | [File system policy / novo FS + DataSync](#segurança-e-controle-de-acesso) |
 | DR entre regiões vs. recuperar versão anterior | [EFS Replication vs. AWS Backup](#replicação-e-backup-do-efs) |
 | Migrar NAS on-premises para o EFS | [DataSync](#migração-e-integração) |
+
+[↑ Índice](#índice)
+
+### Object storage (S3)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Acesso imprevisível / previsível ao longo do tempo | [Intelligent-Tiering / lifecycle rules](#lifecycle-rules-e-intelligent-tiering) |
+| Raro, mas leitura imediata / retenção longa ao menor custo | [Glacier Instant Retrieval / Deep Archive](#classes-de-armazenamento-do-s3) |
+| Dados recriáveis, acesso raro | [One Zone-IA](#classes-de-armazenamento-do-s3) |
+| Recuperar versões apagadas ou sobrescritas | [Versionamento](#versionamento-e-proteção-de-dados) |
+| Cópia em outra região / RPO de 15 min / objetos existentes | [CRR / RTC / Batch Replication](#replicação-crr-e-srr) |
+| Upload de longe / arquivos grandes / 503 Slow Down | [Transfer Acceleration / multipart / prefixos](#desempenho-do-s3) |
+| Latência de um dígito de ms | [S3 Express One Zone](#desempenho-do-s3) |
+| Reagir a uploads (simples vs. vários consumidores) | [Event Notifications vs. EventBridge](#eventos-do-s3) |
+| Operação em bilhões de objetos / visão da organização | [Batch Operations + Inventory / Storage Lens](#operações-em-larga-escala) |
+| Site estático com HTTPS / dataset pago por quem baixa | [CloudFront + OAC / Requester Pays](#site-estático-e-requester-pays) |
 
 [↑ Índice](#índice)
