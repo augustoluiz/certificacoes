@@ -5,8 +5,10 @@ servicos:
   - Amazon EBS
   - Amazon Data Lifecycle Manager
   - AWS Backup
+  - Amazon EFS
+  - AWS DataSync
 criado-em: 2026-11-16
-atualizado-em: 2026-11-16
+atualizado-em: 2026-11-17
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
 tags: [sap-c02, storage]
 ---
@@ -20,6 +22,7 @@ tags: [sap-c02, storage]
 ## Índice
 
 - **Block storage:** [Amazon EBS](#amazon-elastic-block-store-ebs)
+- **File storage:** [Amazon EFS](#amazon-elastic-file-system-efs)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## Amazon Elastic Block Store (EBS)
@@ -184,6 +187,196 @@ Como o EBS fica **em uma AZ**, a disponibilidade além da AZ é responsabilidade
 
 [↑ Índice](#índice)
 
+## Amazon Elastic File System (EFS)
+
+### Contexto: por que um file system compartilhado
+
+O EBS resolve o "disco de **uma** máquina". Muitas aplicações, porém, precisam que **várias máquinas leiam e gravem os mesmos arquivos ao mesmo tempo**:
+
+- um site com várias instâncias atrás de um load balancer, em que os uploads dos usuários precisam aparecer para todas;
+- containers que compartilham configuração, modelos de machine learning ou conteúdo;
+- diretórios home de usuários, pipelines de mídia, ferramentas de CI e aplicações legadas que esperam gravar em uma "pasta".
+
+Antes da nuvem, isso era um **NAS** (*Network Attached Storage*): um servidor de arquivos na rede, que as máquinas "montam" como uma pasta pelo protocolo **NFS** (Linux) ou **SMB** (Windows). Manter um NAS significa dimensionar discos, cuidar da alta disponibilidade e expandir a capacidade.
+
+O **EFS** é esse NAS como serviço gerenciado: um sistema de arquivos **NFS** que você monta em instâncias, containers e funções, que **cresce e diminui sozinho** e que, por padrão, guarda os dados em **várias AZs**. Ver a comparação entre block, file e object storage em [Contexto: block, file e object storage](#contexto-block-file-e-object-storage).
+
+[↑ Índice](#índice)
+
+### O que é o EFS
+
+- **NFS v4.0/4.1, só Linux:** o EFS segue a semântica de arquivos POSIX (permissões, locks, hierarquia de diretórios). **Não** funciona com Windows nem SMB. Para isso, o serviço certo é o **FSx for Windows File Server**.
+- **Elástico:** não há tamanho a provisionar. Você grava e o file system cresce até petabytes; apaga e ele diminui. Paga-se o **armazenamento usado** (GB/mês), diferente do EBS, que cobra o provisionado.
+- **Milhares de clientes simultâneos:** instâncias EC2, tasks ECS/Fargate, pods EKS, funções Lambda e servidores on-premises podem montar o mesmo file system ao mesmo tempo.
+- **Durabilidade de 11 noves** e consistência *close-to-open*: o que um cliente grava e fecha fica visível para os outros na próxima abertura do arquivo.
+- **Custo:** o armazenamento do EFS Standard custa **bem mais** por GB que o EBS gp3 e muito mais que o S3. A economia vem das **classes IA e Archive** e de pagar só pelo que está gravado.
+
+[↑ Índice](#índice)
+
+### Arquitetura: mount targets e acesso
+
+O file system é um recurso **regional**, fora da sua VPC. Para que os clientes cheguem a ele, você cria **mount targets**:
+
+- um **mount target** é uma **interface de rede (ENI)** com um IP privado em uma subnet da sua VPC, protegida por **security group**;
+- cria-se **um mount target por AZ** (no máximo um por AZ), normalmente em todas as AZs onde há clientes;
+- o cliente monta pelo **nome DNS** do file system (`fs-123.efs.us-east-1.amazonaws.com`), que resolve para o mount target **da mesma AZ**. Isso evita latência e custo de tráfego entre AZs;
+- o security group do mount target precisa liberar a **porta TCP 2049 (NFS)** a partir dos clientes.
+
+**Quem pode montar:**
+
+- **EC2:** com o **mount helper** (`amazon-efs-utils`), que facilita TLS e IAM: `sudo mount -t efs -o tls fs-123:/ /mnt/efs`. Para montar no boot, use o `/etc/fstab`.
+- **ECS e Fargate:** o volume EFS é declarado na **task definition**. É a forma padrão de dar **armazenamento persistente e compartilhado** a tasks Fargate, que não têm disco persistente próprio.
+- **EKS:** pelo **EFS CSI driver**, como volume persistente (`PersistentVolume`) com acesso **ReadWriteMany**, ou seja, vários pods em vários nós gravando ao mesmo tempo.
+- **Lambda:** a função precisa estar **conectada à VPC** e usar um **access point**. É usado para arquivos grandes (modelos de ML, bibliotecas) ou para compartilhar estado entre execuções.
+- **On-premises:** via **Direct Connect** ou **Site-to-Site VPN**, montando pelo **IP** do mount target, porque o nome DNS do EFS só resolve dentro da VPC, a menos que se use o Route 53 Resolver.
+- **Outras VPCs ou contas:** via **VPC peering** ou **Transit Gateway**, também pelo IP do mount target.
+
+![Diagrama EFS - Arquitetura com mount targets por AZ](./img/amazon-efs/amazon-efs-01.png)
+
+[↑ Índice](#índice)
+
+### Regional vs. One Zone
+
+| | **Regional** (recomendado) | **One Zone** |
+|---|---|---|
+| Onde ficam os dados | Em **3 ou mais AZs** da região | Em **uma AZ** |
+| Mount targets | Em várias AZs | Só na AZ do file system |
+| Disponibilidade | 99,99% | 99,9%; **perde dados** se a AZ for destruída |
+| Custo | Maior | Aproximadamente **metade** do preço |
+| Uso típico | Produção, dados que precisam de alta disponibilidade | Dev/teste, dados que podem ser recriados, cópias secundárias |
+
+Clientes de outras AZs ainda podem montar um file system One Zone, mas pagam **transferência entre AZs** e ficam sem acesso se a AZ cair. Em file systems One Zone, os **backups automáticos do AWS Backup** já vêm ativados.
+
+[↑ Índice](#índice)
+
+### Classes de armazenamento e lifecycle
+
+O EFS tem três classes. Os dados novos sempre são gravados no **Standard**:
+
+| Classe | Latência | Para dados acessados | Custo |
+|---|---|---|---|
+| **EFS Standard** | Abaixo de 1 ms (SSD) | Com frequência | Armazenamento mais caro; sem taxa de acesso |
+| **EFS Infrequent Access (IA)** | Dezenas de ms | Poucas vezes **por trimestre** | Armazenamento bem mais barato + **taxa por GB lido** |
+| **EFS Archive** | Dezenas de ms | Poucas vezes **por ano** | O mais barato + taxa de acesso; **mínimo de 90 dias** de armazenamento; exige o modo de throughput **Elastic** |
+
+O **lifecycle management** move cada **arquivo** entre as classes de acordo com o **último acesso** a ele, sem mudar nada para a aplicação. O caminho do arquivo continua o mesmo, só muda onde ele está guardado:
+
+- **TransitionToIA:** arquivos sem acesso há N dias (ex: 30) vão para o IA;
+- **TransitionToArchive:** arquivos sem acesso há mais tempo (ex: 90 dias) vão para o Archive;
+- **TransitionToPrimaryStorageClass = AFTER_1_ACCESS:** no **primeiro acesso**, o arquivo volta para o Standard. Sem essa opção, ele fica na classe fria e cada leitura paga a taxa de acesso.
+
+Esse comportamento lembra o **S3 Intelligent-Tiering**: é a resposta para "reduzir o custo de um file system em que a maior parte dos arquivos é raramente acessada, sem mudar a aplicação". Arquivos no IA e no Archive são cobrados por no mínimo **128 KiB**, e o **AWS Backup** não paga taxa de acesso ao ler dados nessas classes.
+
+![Diagrama EFS - Classes de armazenamento e lifecycle management](./img/amazon-efs/amazon-efs-02.png)
+
+[↑ Índice](#índice)
+
+### Modos de desempenho e throughput
+
+**Performance mode** (escolhido na criação):
+
+- **General Purpose** (padrão e **recomendado**): a menor latência por operação. É o único modo dos file systems One Zone. A métrica `PercentIOLimit` mostra se o file system está perto do limite de operações.
+- **Max I/O:** modo da **geração anterior**, para cargas muito paralelas que toleram latência maior. Não funciona com One Zone nem com o throughput Elastic. Em questões antigas, aparecia como resposta para "milhares de instâncias em paralelo" (big data, mídia); hoje a AWS recomenda General Purpose com Elastic.
+
+**Throughput mode** (pode ser trocado depois):
+
+| Modo | Como funciona | Cobrança | Quando usar |
+|---|---|---|---|
+| **Elastic** (padrão e **recomendado**) | Escala o throughput **automaticamente** conforme a demanda, até dezenas de GiB/s de leitura | Por **GB lido e gravado** | Cargas **imprevisíveis ou com picos**; uso médio baixo comparado ao pico |
+| **Provisioned** | Você define o throughput, **independente do tamanho** armazenado | Pelo throughput provisionado acima do incluído | Carga **conhecida e constante**, com throughput alto em relação ao volume de dados |
+| **Bursting** | Throughput **proporcional ao tamanho** no Standard (50 MiB/s por TiB), com **créditos** para picos de até 100 MiB/s por TiB | Incluído no armazenamento | Cargas em que o throughput cresce junto com os dados |
+
+O problema clássico do Bursting: um file system **pequeno** (poucos GB) tem throughput base baixo, os créditos acabam (`BurstCreditBalance` chega a zero) e a aplicação fica lenta. A solução é mudar para **Elastic** ou **Provisioned**, não gravar arquivos falsos para "aumentar o tamanho", como se fazia antigamente.
+
+> **Obs:** depois de mudar para Provisioned ou alterar o valor provisionado, é preciso esperar **24 horas** para voltar para outro modo ou diminuir o valor.
+
+[↑ Índice](#índice)
+
+### Segurança e controle de acesso
+
+Uma requisição ao EFS passa por várias camadas, e todas precisam permitir:
+
+1. **Rede:** o **security group do mount target** libera a porta 2049 a partir dos clientes. O padrão é referenciar o SG dos clientes, e não faixas de IP.
+2. **IAM:**
+   - a **file system policy** é uma política **baseada em recurso** (como uma bucket policy do S3). Usos comuns: **exigir TLS** (`aws:SecureTransport`), negar acesso **root**, permitir só leitura ou liberar acesso a outra conta;
+   - a **identity policy** do cliente (role da instância, task role, role da Lambda) concede ações como `elasticfilesystem:ClientMount` e `ClientWrite`;
+   - para que o IAM seja avaliado, o cliente monta com `-o iam`. Sem uma file system policy, qualquer cliente que alcance o mount target pela rede tem acesso completo.
+3. **Access points:** pontos de entrada **por aplicação**, que:
+   - forçam uma **identidade POSIX** (UID/GID), ignorando o usuário que o cliente informar;
+   - definem um **diretório raiz**, de modo que a aplicação só enxerga aquele diretório como `/`;
+   - podem criar o diretório com dono e permissões definidos.
+
+   São a forma de **várias aplicações ou tenants compartilharem um file system com isolamento**, e são obrigatórios para a Lambda.
+4. **Permissões POSIX:** usuário, grupo e outros nos arquivos e diretórios, como em qualquer Linux.
+
+**Criptografia:**
+
+- **Em repouso:** com KMS, definida **na criação** do file system. **Não é possível ativar depois.** Para criptografar um file system existente, crie um novo file system criptografado e copie os dados com o **DataSync** (ou restaure um backup). Uma **SCP** ou uma regra do AWS Config podem exigir criptografia na criação (`elasticfilesystem:Encrypted`).
+- **Em trânsito:** **TLS**, ativado na montagem com o mount helper (`-o tls`). A file system policy pode **negar** conexões sem TLS.
+
+![Diagrama EFS - Camadas de controle de acesso e access points](./img/amazon-efs/amazon-efs-03.png)
+
+[↑ Índice](#índice)
+
+### Replicação e backup do EFS
+
+- **EFS Replication:** replica o file system para **outra região** (ou a mesma), inclusive para **outra conta**.
+  - RPO de **15 minutos** para a maioria dos file systems; RTO de minutos;
+  - a réplica é **somente leitura** enquanto a replicação está ativa;
+  - **failover:** apagar a configuração de replicação, o que torna a réplica gravável, e apontar a aplicação para ela;
+  - **failback:** criar a replicação **no sentido inverso** para levar de volta o que mudou durante o failover, depois recriar a original;
+  - é a resposta para **DR do EFS entre regiões** com o menor esforço.
+- **AWS Backup:** backups **point-in-time**, incrementais, ativados **por padrão** em file systems novos criados pelo console. Permite:
+  - **cópia entre regiões e contas** e **Vault Lock** (imutabilidade);
+  - restaurar o file system inteiro ou **arquivos específicos**.
+
+Replicação e backup se complementam. A replicação também copia **exclusões e corrupções** em minutos. Para voltar a uma versão anterior dos dados, o caminho é o **backup**.
+
+![Diagrama EFS - Replicação entre regiões e AWS Backup](./img/amazon-efs/amazon-efs-04.png)
+
+[↑ Índice](#índice)
+
+### Migração e integração
+
+- **AWS DataSync:** copia dados de um NAS on-premises (NFS/SMB), de outro EFS ou do S3 **para o EFS**, com criptografia em trânsito, verificação de integridade, agendamento e controle de banda. É a resposta para **migrar** um file server para o EFS ou **copiar dados entre file systems** (ex: para mudar a criptografia ou a região sem usar a replicação).
+- **AWS Transfer Family:** expõe o EFS (ou o S3) por **SFTP, FTPS e FTP**, para parceiros que enviam arquivos por esses protocolos.
+- **Aplicações legadas que gravam em diretório:** o EFS permite levá-las para várias instâncias ou containers sem mudar o código.
+
+[↑ Índice](#índice)
+
+### Monitoramento e custo do EFS
+
+- **CloudWatch:**
+  - `BurstCreditBalance` (modo Bursting): créditos perto de zero indicam que o throughput vai cair;
+  - `PercentIOLimit` (General Purpose): perto de 100% indica o limite de operações;
+  - `MeteredIOBytes` e `PermittedThroughput`: uso e limite de throughput;
+  - `StorageBytes` (por classe), `ClientConnections` e `TimeSinceLastSync` (atraso da replicação).
+- **Otimização de custo:**
+  - ativar o **lifecycle management** com IA e Archive;
+  - usar **One Zone** para dados que podem ser recriados;
+  - escolher **Elastic** para cargas com picos e **Provisioned** para cargas altas e constantes;
+  - se os dados são acessados como **objetos inteiros** por API, e não como arquivos montados, o **S3** é muito mais barato.
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Várias instâncias EC2 em **várias AZs** precisam **ler e gravar os mesmos arquivos**" (Linux) → **EFS**. Se for **Windows/SMB/Active Directory** → **FSx for Windows File Server**.
+- "Armazenamento **persistente e compartilhado** para tasks **Fargate**" ou "volume **ReadWriteMany** no EKS" → **EFS**.
+- "Função Lambda precisa de arquivos grandes ou de um sistema de arquivos compartilhado" → **EFS** com a Lambda **na VPC** e um **access point**.
+- "Reduzir custo de um file system em que a maioria dos arquivos é pouco acessada, **sem mudar a aplicação**" → **lifecycle management** para IA/Archive, com volta ao Standard no primeiro acesso.
+- "Dados que podem ser recriados, ao menor custo" → **EFS One Zone** (+ lifecycle).
+- "File system pequeno com **throughput insuficiente**" ou "créditos de burst esgotados" → mudar para **Elastic** (picos) ou **Provisioned** (carga constante).
+- "Montar o EFS a partir do data center" → **Direct Connect/VPN** + **IP do mount target**. "Migrar o NAS on-premises para o EFS" → **DataSync**.
+- "Isolar várias aplicações ou tenants no mesmo file system" → **access points** (UID/GID e diretório raiz forçados).
+- "Exigir criptografia em trânsito" → **file system policy** negando conexões sem `aws:SecureTransport` + montagem com `-o tls`.
+- "Criptografar em repouso um file system existente" → **criar um novo criptografado e copiar com DataSync**. Não dá para ativar depois.
+- "DR do EFS em outra região com RPO de minutos" → **EFS Replication**. "Recuperar arquivos apagados ou corrompidos" / "backups imutáveis entre contas" → **AWS Backup** (+ Vault Lock).
+- "Clientes não conseguem montar (timeout)" → security group do mount target sem a **porta 2049**, ou falta de mount target na AZ/subnet.
+- "Compartilhar arquivos entre servidores, mas o acesso é por **API** e o volume é enorme" → **S3**, não EFS.
+
+[↑ Índice](#índice)
+
 ## Revisão: qual serviço usar
 
 Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas seções de cada serviço.
@@ -201,5 +394,21 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Snapshots automáticos vs. backup centralizado multi-conta | [DLM vs. AWS Backup](#snapshots) |
 | Criptografar volume existente / todo volume novo | [Snapshot + cópia / encryption by default](#criptografia) |
 | Snapshot criptografado para outra conta | [Customer managed key](#criptografia) |
+
+[↑ Índice](#índice)
+
+### File storage (EFS)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Arquivos compartilhados entre instâncias e AZs (Linux/NFS) | [EFS](#o-que-é-o-efs) |
+| Armazenamento persistente para Fargate / ReadWriteMany no EKS / arquivos para Lambda | [EFS montado em containers e funções](#arquitetura-mount-targets-e-acesso) |
+| Dados recriáveis ao menor custo | [EFS One Zone](#regional-vs-one-zone) |
+| Maioria dos arquivos raramente acessada | [Lifecycle para IA/Archive](#classes-de-armazenamento-e-lifecycle) |
+| Throughput insuficiente / créditos esgotados | [Elastic ou Provisioned](#modos-de-desempenho-e-throughput) |
+| Isolar aplicações no mesmo file system | [Access points](#segurança-e-controle-de-acesso) |
+| Exigir TLS / criptografar file system existente | [File system policy / novo FS + DataSync](#segurança-e-controle-de-acesso) |
+| DR entre regiões vs. recuperar versão anterior | [EFS Replication vs. AWS Backup](#replicação-e-backup-do-efs) |
+| Migrar NAS on-premises para o EFS | [DataSync](#migração-e-integração) |
 
 [↑ Índice](#índice)
