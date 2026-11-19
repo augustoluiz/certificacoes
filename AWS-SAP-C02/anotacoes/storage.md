@@ -14,14 +14,14 @@ servicos:
 criado-em: 2026-11-16
 atualizado-em: 2026-11-19
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
-tags: [sap-c02, storage]
+tags: [sap-c02, storage, backup, data-transfer, data-sharing]
 ---
 
 # Storage
 
-> **Escopo:** _(em uma frase, o que este arquivo cobre)_
+> **Escopo:** armazenamento na AWS em bloco (EBS), arquivos (EFS e a família FSx) e objetos (S3), com backup, replicação e criptografia, e os serviços de transferência e compartilhamento de dados (DataSync, Data Exchange e Transfer Family).
 >
-> **Por que cai na prova:** _(o ângulo que a SAP-C02 costuma explorar)_
+> **Por que cai na prova:** a SAP-C02 cobra a escolha do **storage certo** para cada carga (protocolo, clientes, desempenho, durabilidade), o **menor custo** com classes de armazenamento e lifecycle, a **proteção e o DR** (snapshots, versionamento, replicação entre regiões e contas, AWS Backup) e a **migração** de dados on-premises com a ferramenta adequada (DataSync, Snowball, Transfer Family, Storage Gateway).
 
 ## Índice
 
@@ -1240,6 +1240,23 @@ O workflow tem um **fluxo de exceção** separado, executado se alguma etapa fal
 
 Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas seções de cada serviço.
 
+### Visão geral: qual storage usar
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Disco de **uma instância** (sistema operacional, banco de dados) | [EBS](#o-que-é-o-ebs) |
+| Disco temporário com **IOPS máximas**, sem custo extra | [Instance store](compute-and-load-balancing.md#armazenamento) |
+| Arquivos compartilhados **Linux/NFS**, elástico, serverless | [EFS](#o-que-é-o-efs) |
+| Arquivos **Windows/SMB**, **NetApp**, **HPC** ou **ZFS** | [Família FSx](#como-escolher-entre-efs-e-fsx) |
+| Objetos via API, ilimitado, data lake, backup, site estático | [S3](#conceitos-do-s3-buckets-objetos-e-chaves) |
+| Arquivamento de longo prazo ao menor custo | [S3 Glacier Deep Archive](#classes-de-armazenamento-do-s3) |
+| Migrar ou sincronizar dados para S3/EFS/FSx pela rede | [DataSync](#o-que-é-o-datasync) |
+| Assinar ou vender dados de terceiros | [Data Exchange](#o-que-é-o-data-exchange) |
+| Parceiros trocam arquivos por SFTP/FTPS/FTP/AS2 | [Transfer Family](#o-que-é-o-transfer-family) |
+| Como levar os dados para a AWS (online, offline, híbrido)? | [DataSync vs. outras opções](#datasync-vs-outras-opções-de-transferência) |
+
+[↑ Índice](#índice)
+
 ### Block storage (EBS)
 
 | Pergunta do cenário | Solução |
@@ -1341,5 +1358,23 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Decriptar PGP e mover arquivos recebidos | [Managed workflows](#processamento-managed-workflows) |
 | Buscar ou enviar arquivos no SFTP do parceiro / EDI via AS2 | [SFTP connectors / AS2](#saída-sftp-connectors-e-as2) |
 | Transfer Family, DataSync, Storage Gateway ou Snowball? | [Comparação](#transfer-family-vs-outras-opções) |
+
+[↑ Índice](#índice)
+
+### Custo relativo de armazenamento
+
+Ordem aproximada do preço por GB/mês, do mais caro para o mais barato (us-east-1, valores de referência; confira a página de preços de cada serviço):
+
+| Faixa | Storage | Observação |
+|---|---|---|
+| Mais caro (≈ US$ 0,15 a 0,30) | **EFS Standard**, **EFS One Zone** | Paga pelo uso real, elástico e compartilhado |
+| ≈ US$ 0,08 a 0,125 | **EBS io2/io1** (+ IOPS provisionadas), **EBS gp2/gp3** | Paga pelo **provisionado**, não pelo usado |
+| ≈ US$ 0,045 | **EBS st1** | HDD de throughput |
+| ≈ US$ 0,023 | **S3 Standard** | Mais requisições e transferência |
+| ≈ US$ 0,01 a 0,016 | **S3 Standard-IA / One Zone-IA**, **EFS IA**, **EBS sc1** | Taxa de recuperação e cobrança mínima (IA) |
+| ≈ US$ 0,004 a 0,008 | **S3 Glacier Instant/Flexible Retrieval**, **EFS Archive** | Duração mínima e custo de leitura |
+| Mais barato (≈ US$ 0,001) | **S3 Glacier Deep Archive** | Restauração em horas, mínimo de 180 dias |
+
+> **Obs:** o FSx não entra na tabela porque o preço depende do tipo, do armazenamento (SSD, HDD, Intelligent-Tiering) e do throughput provisionado. Na prova, a pergunta raramente é o preço exato: é **qual opção reduz o custo** sem quebrar o requisito, por exemplo gp2 → **gp3**, EFS com **lifecycle**, S3 com **Intelligent-Tiering** ou **lifecycle rules**, e dados recriáveis em **One Zone**.
 
 [↑ Índice](#índice)
