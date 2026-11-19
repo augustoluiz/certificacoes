@@ -8,9 +8,10 @@ servicos:
   - Amazon EFS
   - Amazon FSx
   - AWS DataSync
+  - AWS Data Exchange
   - Amazon S3
 criado-em: 2026-11-16
-atualizado-em: 2026-11-18
+atualizado-em: 2026-11-19
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
 tags: [sap-c02, storage]
 ---
@@ -26,7 +27,7 @@ tags: [sap-c02, storage]
 - **Block storage:** [Amazon EBS](#amazon-elastic-block-store-ebs)
 - **File storage:** [Amazon EFS](#amazon-elastic-file-system-efs) · [Amazon FSx](#amazon-fsx)
 - **Object storage:** [Amazon S3](#amazon-simple-storage-service-s3)
-- **Transferência de dados:** [AWS DataSync](#aws-datasync)
+- **Transferência e compartilhamento de dados:** [AWS DataSync](#aws-datasync) · [AWS Data Exchange](#aws-data-exchange)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## Amazon Elastic Block Store (EBS)
@@ -997,6 +998,122 @@ O DataSync também move dados **dentro da AWS**, sem agente na maioria dos casos
 
 [↑ Índice](#índice)
 
+## AWS Data Exchange
+
+### Contexto: dados de terceiros
+
+Muitas análises dependem de dados que a empresa **não produz**: cotações financeiras, dados de clima, notícias, cadastros de empresas, dados demográficos, dados de saúde anonimizados, localização de estabelecimentos. Esses dados são **vendidos por provedores especializados** (Reuters, Dun & Bradstreet, Foursquare, entre outros). Tradicionalmente, comprar e receber esses dados era trabalhoso:
+
+- negociar um contrato com cada provedor e pagar por fora da nuvem;
+- receber arquivos por **FTP**, e-mail ou disco, com formatos e periodicidades diferentes;
+- escrever scripts para **buscar as atualizações** e carregar no data lake;
+- do lado do provedor: manter servidores de entrega, controlar **quem pode acessar** e **cortar o acesso** quando o contrato acaba.
+
+O **AWS Data Exchange** resolve os dois lados. O assinante **encontra, assina e recebe** dados de terceiros direto na conta AWS, pagando pela fatura da AWS. O provedor **publica e licencia** os dados sem montar infraestrutura de entrega. Na prova, ele é a resposta para **"usar dados de terceiros"** ou **"vender/licenciar dados para outras empresas"** dentro da AWS.
+
+[↑ Índice](#índice)
+
+### O que é o Data Exchange
+
+Um serviço para **trocar dados entre contas AWS de organizações diferentes**, com controle de **direito de acesso** (entitlement):
+
+- **Catálogo:** milhares de produtos de dados listados no **AWS Marketplace**, na categoria *Data*. Muitos são **gratuitos**, inclusive os do programa **Open Data on AWS**.
+- **Cobrança:** a assinatura é paga pela **fatura da AWS**, com prazos de **1 a 36 meses**. O uso dos serviços de análise (S3, Athena, Redshift) é cobrado à parte, normalmente.
+- **Entrega contínua:** o provedor publica **novas versões** dos dados, e o assinante recebe as atualizações automaticamente.
+- **Controle de acesso:** quando a assinatura termina, o acesso aos dados compartilhados é **revogado automaticamente**.
+- **Integração:** os dados chegam ao **S3**, ao **Redshift** ou por **API**, prontos para Athena, Glue, EMR, QuickSight e SageMaker.
+
+![Diagrama Data Exchange - Visão geral](./img/aws-data-exchange/aws-data-exchange-01.png)
+
+[↑ Índice](#índice)
+
+### Conceitos: produtos, data sets, revisions e data grants
+
+- **Data set:** o conjunto de dados que o provedor organiza, como "cotações diárias da bolsa".
+- **Revision:** uma **versão publicada** do data set. Cada atualização do provedor é uma nova revision. As revisions de arquivos são **imutáveis**, então o assinante sempre sabe que versão usou.
+- **Asset:** o dado em si, dentro da revision: um arquivo, uma tabela compartilhada, um endpoint de API.
+- **Produto:** o que é listado no Marketplace. Agrupa um ou mais data sets, com descrição, amostras e **ofertas**.
+- **Ofertas:**
+  - **pública**: preço e prazo visíveis para todos no catálogo;
+  - **privada**: condições negociadas para um cliente específico;
+  - **BYOS (Bring Your Own Subscription)**: o cliente já tem contrato com o provedor fora da AWS e passa a receber os dados pelo Data Exchange **sem pagar de novo**;
+  - **gratuita**.
+- **Verificação de assinatura:** o provedor pode exigir que o assinante **peça acesso** e informe dados da empresa e o uso pretendido. O provedor aprova ou recusa. É comum em dados regulados ou sensíveis.
+- **Data grant:** compartilha um data set **direto com outra conta AWS**, **sem listar no Marketplace** e sem cobrança, com prazo de acesso definido. Qualquer conta pode criar data grants. É útil para compartilhar dados com parceiros, clientes ou outras unidades da empresa.
+
+> **Obs:** para **vender** dados no Marketplace, o provedor precisa estar registrado como **vendedor do AWS Marketplace** e passar pela qualificação da AWS. Hoje, só empresas sediadas nos **EUA** ou na **União Europeia** podem. Os **data grants** não têm essa exigência.
+
+[↑ Índice](#índice)
+
+### Tipos de data set e formas de entrega
+
+| Tipo | Como o assinante recebe | Cópia na conta do assinante? | Quem paga o uso |
+|---|---|---|---|
+| **Files** | **Export** das revisions para um bucket S3 próprio (manual, por job, ou **auto-export** a cada nova revision) | **Sim** | O assinante paga o storage da cópia |
+| **Amazon S3 data access** | Lê os objetos **no bucket do provedor**, por um **S3 access point**. O bucket usa **Requester Pays** | **Não** (dados no lugar) | O assinante paga **requisições e transferência** |
+| **Amazon Redshift** | **Datashare** do Redshift: consulta **somente leitura** das tabelas do provedor, **sem ETL** | **Não** (dados ao vivo) | O assinante paga o **compute** do próprio Redshift |
+| **API** | Chama a API do provedor (hospedada no **API Gateway**) pelo SDK da AWS, com **autenticação IAM (SigV4)** | **Não** | Assinatura, e pode haver **preço por chamada** (metered) |
+| **AWS Lake Formation** (preview) | Recebe permissões em tabelas do **data lake** do provedor, gerenciadas pelo Lake Formation | **Não** | O assinante paga as consultas |
+
+![Diagrama Data Exchange - Tipos de data set](./img/aws-data-exchange/aws-data-exchange-02.png)
+
+Como escolher, do ponto de vista do cenário:
+
+- **Files:** o assinante quer **uma cópia** para processar livremente, guardar o histórico ou juntar com os próprios dados.
+- **S3 data access:** datasets **muito grandes** ou que mudam muito, em que **copiar** seria caro ou lento. O provedor mantém **uma única cópia**, e cada assinante lê no lugar.
+- **Redshift:** o assinante já usa Redshift e quer **consultar com SQL na hora**, com dados sempre atualizados, sem pipeline de carga.
+- **API:** dados **sob demanda** ou em tempo real (ex: consultar um CNPJ, uma cotação, a previsão do tempo de um ponto).
+
+[↑ Índice](#índice)
+
+### Automação da ingestão
+
+O Data Exchange publica **eventos no EventBridge** quando o provedor publica uma nova revision, por exemplo. Combinado com o **auto-export**, isso permite montar um pipeline sem servidores:
+
+1. O provedor publica uma nova **revision**.
+2. O **auto-export** copia os arquivos para o bucket S3 do assinante (criptografados com **SSE-S3 ou SSE-KMS**).
+3. Uma regra do **EventBridge** dispara uma **Lambda** ou uma **Step Functions** para validar e transformar os dados, ou iniciar um **Glue crawler**.
+4. Os dados ficam disponíveis no Glue Data Catalog para **Athena**, **QuickSight** e **SageMaker**.
+
+![Diagrama Data Exchange - Automação da ingestão](./img/aws-data-exchange/aws-data-exchange-03.png)
+
+> **Obs:** o bucket de destino do auto-export precisa de uma **bucket policy** que permita ao Data Exchange gravar nele. Se usar **SSE-KMS**, a key policy também precisa liberar o serviço.
+
+[↑ Índice](#índice)
+
+### Data Exchange vs. outras formas de compartilhar dados
+
+| Necessidade | Solução |
+|---|---|
+| **Assinar** dados de terceiros, ou **vender/licenciar** dados com cobrança e controle de acesso | **AWS Data Exchange** (produto no Marketplace) |
+| Compartilhar um data set com **outra conta**, com prazo de acesso, **sem cobrança** | Data Exchange **data grant**, ou mecanismos nativos abaixo |
+| Dar acesso a um bucket para outra conta da **mesma organização** | **Bucket policy** / **S3 Access Points** / roles entre contas |
+| Compartilhar tabelas do Redshift entre clusters ou contas da empresa | **Redshift data sharing** (sem Data Exchange) |
+| Governança de acesso a um **data lake** entre contas (tabela, coluna, linha) | **Lake Formation** cross-account |
+| Duas empresas **analisam dados combinados sem expor os dados brutos** uma para a outra | **AWS Clean Rooms** |
+| Parceiros enviam arquivos para você por **SFTP** | **AWS Transfer Family** |
+| Migrar ou sincronizar **seus próprios** dados para a AWS | **DataSync** |
+
+> **Obs:** a diferença entre Data Exchange e Clean Rooms costuma cair na prova. No **Data Exchange**, o dado **é entregue** (ou lido) pelo assinante. No **Clean Rooms**, os dados **não saem** das contas, e só o **resultado** de consultas aprovadas é compartilhado.
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Enriquecer análises com **dados de terceiros**" (financeiros, clima, demográficos) **com o mínimo de esforço** → **AWS Data Exchange**.
+- "Empresa quer **vender ou licenciar** seus dados para outras empresas na AWS, sem construir infraestrutura de entrega e cobrança" → **Data Exchange** (produto no Marketplace).
+- "Receber **automaticamente** as atualizações do provedor no S3 e processar" → **auto-export** + **EventBridge** + Lambda/Glue.
+- "Dataset **muito grande**, evitar copiar para cada assinante" → **Amazon S3 data access** (access point + **Requester Pays**).
+- "Consultar dados do provedor com **SQL no Redshift**, sempre atualizados, sem ETL" → **Data Exchange for Amazon Redshift** (datashare).
+- "Consumir **API** de terceiros com autenticação e cobrança da AWS" → **Data Exchange for APIs**.
+- "Já tem **contrato com o provedor** fora da AWS e quer receber os dados no S3" → oferta **BYOS**.
+- "Provedor precisa **aprovar** quem assina (dados sensíveis)" → **verificação de assinatura**.
+- "Compartilhar um data set com uma conta de parceiro **por tempo limitado**, sem Marketplace" → **data grant**.
+- "Acesso termina quando o contrato acaba" → entitlement do Data Exchange **revoga automaticamente** (exceto cópias já exportadas).
+- "Analisar dados com um parceiro **sem que nenhum veja os dados brutos** do outro" → **AWS Clean Rooms**, não Data Exchange.
+
+[↑ Índice](#índice)
+
 ## Revisão: qual serviço usar
 
 Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas seções de cada serviço.
@@ -1076,5 +1193,17 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Copiar bucket ou file system para outra conta | [Transferências entre contas](#transferências-entre-serviços-e-contas-da-aws) |
 | Auditar a migração | [Task reports](#monitoramento-e-custo-do-datasync) |
 | DataSync, Snowball, Storage Gateway, Transfer Family ou S3 Replication? | [Comparação](#datasync-vs-outras-opções-de-transferência) |
+
+[↑ Índice](#índice)
+
+### Compartilhamento de dados (Data Exchange)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Usar dados de terceiros / vender ou licenciar dados | [Data Exchange](#o-que-é-o-data-exchange) |
+| Contrato já existente com o provedor / aprovar assinantes / compartilhar sem Marketplace | [BYOS / verificação / data grant](#conceitos-produtos-data-sets-revisions-e-data-grants) |
+| Cópia no S3 vs. ler no lugar vs. SQL no Redshift vs. API | [Tipos de data set](#tipos-de-data-set-e-formas-de-entrega) |
+| Receber e processar atualizações automaticamente | [Auto-export + EventBridge](#automação-da-ingestão) |
+| Data Exchange, Clean Rooms, Lake Formation ou bucket policy? | [Comparação](#data-exchange-vs-outras-formas-de-compartilhar-dados) |
 
 [↑ Índice](#índice)
