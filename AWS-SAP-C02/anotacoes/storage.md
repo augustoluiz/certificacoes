@@ -6,10 +6,11 @@ servicos:
   - Amazon Data Lifecycle Manager
   - AWS Backup
   - Amazon EFS
+  - Amazon FSx
   - AWS DataSync
   - Amazon S3
 criado-em: 2026-11-16
-atualizado-em: 2026-11-17
+atualizado-em: 2026-11-18
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
 tags: [sap-c02, storage]
 ---
@@ -23,7 +24,7 @@ tags: [sap-c02, storage]
 ## Índice
 
 - **Block storage:** [Amazon EBS](#amazon-elastic-block-store-ebs)
-- **File storage:** [Amazon EFS](#amazon-elastic-file-system-efs)
+- **File storage:** [Amazon EFS](#amazon-elastic-file-system-efs) · [Amazon FSx](#amazon-fsx)
 - **Object storage:** [Amazon S3](#amazon-simple-storage-service-s3)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
@@ -379,6 +380,189 @@ Replicação e backup se complementam. A replicação também copia **exclusões
 
 [↑ Índice](#índice)
 
+## Amazon FSx
+
+### Contexto: file systems de mercado na nuvem
+
+O EFS é um file system **criado pela AWS**: simples, elástico, só NFS e só Linux. Muitas empresas, porém, dependem de file systems **específicos**, com recursos que as aplicações e as equipes já usam:
+
+- o **Windows File Server**, com compartilhamentos SMB, permissões do Active Directory e "versões anteriores" no Explorer;
+- o **NetApp ONTAP**, storage corporativo com snapshots, replicação SnapMirror e acesso por NFS, SMB e iSCSI ao mesmo tempo;
+- o **Lustre**, file system paralelo usado em supercomputadores e clusters de HPC;
+- o **ZFS**, comum em servidores Linux e appliances NFS.
+
+Migrar essas cargas para o EFS exigiria mudar aplicações, permissões ou processos. O **Amazon FSx** oferece **esses mesmos file systems como serviço gerenciado**. A AWS cuida de hardware, patches, alta disponibilidade e backups, e você mantém os recursos e o comportamento que conhece. Na prova, o desafio é reconhecer, pelas palavras do cenário, **qual dos quatro** atende o caso, ou quando o **EFS** basta.
+
+[↑ Índice](#índice)
+
+### Visão geral da família FSx
+
+| | **Windows File Server** | **Lustre** | **NetApp ONTAP** | **OpenZFS** |
+|---|---|---|---|---|
+| Protocolos | **SMB** | Lustre (cliente Linux) | **NFS, SMB, iSCSI, NVMe/TCP** | **NFS** (v3, v4.x) |
+| Clientes | Windows (e Linux/macOS via SMB) | Linux | Linux, Windows, macOS | Linux, macOS (e Windows com cliente NFS) |
+| Identidade | **Active Directory**, ACLs NTFS | POSIX | AD (SMB) e POSIX (NFS) | POSIX |
+| Disponibilidade | Single-AZ ou **Multi-AZ** | **Uma AZ** (Scratch ou Persistent) | Single-AZ ou **Multi-AZ** | Single-AZ ou **Multi-AZ** |
+| Destaque | DFS, shadow copies, dedup, quotas | **Centenas de GB/s**, integração com **S3** | **Multiprotocolo**, SnapMirror, tiering, FlexClone | Latência muito baixa, **clones instantâneos** |
+| Gatilho na prova | "Windows", "SMB", "Active Directory" | "HPC", "ML", "processar dados do S3" | "NetApp", "Linux **e** Windows", "iSCSI" | "ZFS", "migrar NFS on-premises", "clones" |
+
+![Diagrama FSx - Família FSx](./img/amazon-fsx/amazon-fsx-01.png)
+
+[↑ Índice](#índice)
+
+### FSx for Windows File Server
+
+Um **file server Windows** gerenciado, acessado por **SMB**, com o sistema de arquivos **NTFS**:
+
+- **Active Directory:** o file system entra em um domínio, que pode ser o **AWS Managed Microsoft AD** ou um **AD autogerenciado** (on-premises via Direct Connect/VPN, ou em EC2). As permissões são as **ACLs do Windows**, por usuários e grupos do domínio.
+- **Implantação:**
+  - **Single-AZ:** um file server em uma AZ, com os dados replicados dentro dela;
+  - **Multi-AZ:** um file server **preferido** em uma AZ e um **standby** em outra, com **replicação síncrona**. Na falha, o **failover é automático**: o nome DNS passa a apontar para o standby e os clientes reconectam. É a resposta para **alta disponibilidade** de file shares Windows.
+- **Armazenamento e desempenho:** **SSD** (latência baixa, bancos e aplicações) ou **HDD** (home dirs e compartilhamentos gerais, mais barato). Você provisiona a **capacidade** (só pode aumentar) e o **throughput**, que pode ser ajustado depois.
+- **Recursos de Windows Server:**
+  - **DFS Namespaces:** juntam vários file systems (ou shares on-premises) em **um caminho único** (`\\corp.local\dados`). É assim que se escala além de um file system ou se migra sem mudar o caminho para os usuários;
+  - **Shadow Copies:** o usuário restaura versões anteriores dos arquivos pelo Explorer, sem chamar a equipe de TI;
+  - **deduplicação de dados**, **quotas por usuário**, **auditoria de acesso** (para CloudWatch Logs ou Kinesis Data Firehose) e **SMB Multichannel**;
+  - **continuously available shares** para **SQL Server** em cluster.
+- **Usos típicos:** home dirs e pastas de departamento, aplicações .NET e de linha de negócio, SQL Server, SharePoint, conteúdo para **Amazon WorkSpaces**.
+
+![Diagrama FSx - FSx for Windows File Server Multi-AZ](./img/amazon-fsx/amazon-fsx-02.png)
+
+> **Obs:** o **Amazon FSx File Gateway** (do Storage Gateway), que fazia cache local de um FSx for Windows em escritórios remotos, não aceita mais novos clientes. Em questões antigas, ele aparece como resposta para "acesso de baixa latência ao FSx a partir das filiais".
+
+[↑ Índice](#índice)
+
+### FSx for Lustre
+
+**Lustre** é um file system **paralelo**: os arquivos são divididos entre vários servidores de armazenamento, e milhares de clientes leem e gravam pedaços diferentes **ao mesmo tempo**. Por isso, ele entrega **centenas de GB/s**, milhões de IOPS e latência abaixo de 1 ms. Ver o contexto de HPC em [High Performance Computing (HPC)](compute-and-load-balancing.md#high-performance-computing-hpc).
+
+- **Clientes Linux** com o cliente Lustre: clusters de EC2 (inclusive com **EFA** e **GPUDirect Storage** no Persistent 2), **SageMaker**, **AWS Batch**, **ParallelCluster** e EKS.
+- **Integração com o S3**, a característica que mais cai na prova: com uma **Data Repository Association (DRA)**, um diretório do Lustre fica ligado a um bucket ou prefixo do S3.
+  - **import:** os **metadados** dos objetos aparecem na hora como arquivos; os **dados** são carregados do S3 no **primeiro acesso** (*lazy loading*);
+  - **export:** arquivos novos ou alterados voltam para o S3, de forma **automática** ou por **data repository task**.
+
+  O padrão é: o **S3 é a fonte da verdade** (barato e durável), e o Lustre é a **camada de alto desempenho** usada durante o processamento.
+- **Tipos de implantação:**
+  - **Scratch:** armazenamento **temporário**, **sem replicação**. Se um servidor falha, os arquivos dele ficam indisponíveis. É o mais barato, com burst alto. Serve para **processamento curto** em que os dados estão seguros no S3.
+  - **Persistent (1 e 2):** os dados são **replicados na AZ** e os servidores com falha são **substituídos** automaticamente. Serve para cargas **longas** ou que não podem perder dados. O Persistent 2 é a geração atual, com mais throughput por TiB.
+- **Classes de armazenamento:**
+  - **SSD:** latência sub-ms em todos os dados;
+  - **HDD:** mais barato, com cache SSD opcional;
+  - **Intelligent-Tiering:** **elástico**, paga-se o que está armazenado; move os dados frios para camadas mais baratas sem taxa de recuperação.
+- **Uma AZ:** os clientes devem estar na mesma AZ para melhor desempenho. A durabilidade de longo prazo vem do S3 e dos backups.
+
+![Diagrama FSx - FSx for Lustre com S3](./img/amazon-fsx/amazon-fsx-03.png)
+
+[↑ Índice](#índice)
+
+### FSx for NetApp ONTAP
+
+O sistema operacional de storage da **NetApp** como serviço gerenciado. É o "canivete suíço" da família:
+
+- **Multiprotocolo:** **NFS**, **SMB**, **iSCSI** e **NVMe/TCP** no mesmo file system. Os **mesmos dados** podem ser acessados por **Linux e Windows**, e há volumes de **bloco** (LUNs) para bancos de dados e VMware.
+- **Organização:** um file system contém **SVMs** (*storage virtual machines*, servidores de arquivos lógicos, cada um com seus endpoints e seu domínio AD), e cada SVM contém **volumes**.
+- **Single-AZ ou Multi-AZ**, com failover automático. Implantações **scale-out**, com vários pares de servidores, atendem cargas maiores.
+- **Armazenamento em duas camadas:**
+  - **SSD tier:** dados ativos, capacidade provisionada;
+  - **capacity pool:** dados frios, **elástico e barato**. O **tiering** entre as camadas é **automático**, por política de volume.
+
+  Junto com **compressão, deduplicação e compactação**, isso reduz bastante o custo por GB efetivo.
+- **Recursos NetApp:**
+  - **Snapshots:** instantâneos e eficientes em espaço;
+  - **FlexClone:** cópias **instantâneas** e graváveis de volumes, sem duplicar os dados, para **dev/test**;
+  - **SnapMirror:** replicação para outro FSx ONTAP (**DR entre regiões**) ou de/para um **NetApp on-premises** (**migração** e DR híbrido);
+  - **SnapLock:** WORM;
+  - **FlexCache:** cache remoto;
+  - integração com antivírus.
+- **Usos típicos:**
+  - migração de **NetApp on-premises** sem mudar os processos;
+  - dados compartilhados por **Linux e Windows**;
+  - **datastore** para **VMware Cloud on AWS**;
+  - bancos de dados via iSCSI;
+  - ambientes de dev/test com clones.
+
+![Diagrama FSx - FSx for NetApp ONTAP](./img/amazon-fsx/amazon-fsx-04.png)
+
+[↑ Índice](#índice)
+
+### FSx for OpenZFS
+
+O file system **ZFS** gerenciado, acessado por **NFS** (v3 e v4.x):
+
+- **Latência muito baixa** (abaixo de 1 ms) e alto número de IOPS, com cache em memória e em disco nos servidores.
+- **Snapshots** e **clones instantâneos**: criar uma cópia gravável de um volume leva segundos, sem copiar os dados. Serve para ambientes de **dev/test**, CI e análises sobre uma cópia da produção.
+- **Compressão** (LZ4, Zstandard), que reduz o espaço e muitas vezes melhora o desempenho.
+- Single-AZ ou **Multi-AZ**.
+- **Usos típicos:** migração de servidores **ZFS** ou de file servers **NFS on-premises** (Linux) que precisam de desempenho previsível e baixa latência, sem a complexidade do ONTAP.
+
+**OpenZFS ou EFS?** Os dois são NFS para Linux.
+
+| Precisa de... | Use |
+|---|---|
+| Capacidade **elástica**, sem gerenciar, com clientes em várias AZs | **EFS** |
+| **Latência mínima**, **clones**, compatibilidade com ZFS, ou desempenho de IOPS acima do que o EFS entrega com bom custo | **OpenZFS** |
+
+[↑ Índice](#índice)
+
+### Recursos comuns do FSx
+
+- **Rede:** o file system cria **ENIs na sua VPC**, protegidas por **security groups**. O acesso on-premises e de outras VPCs é feito pela rede privada (**Direct Connect**, **VPN**, **VPC peering**, **Transit Gateway**).
+- **Criptografia:**
+  - **em repouso** com **KMS**, sempre ativa;
+  - **em trânsito** de acordo com o protocolo: criptografia SMB 3 no Windows, Kerberos ou IPsec no ONTAP, e criptografia automática em instâncias Nitro compatíveis.
+- **Backups:**
+  - **automáticos diários**, incrementais, guardados no S3 de forma gerenciada, com retenção configurável;
+  - backups **manuais**, que ficam até serem apagados;
+  - **AWS Backup** para políticas centralizadas, **cópia entre regiões e contas** e Vault Lock.
+
+  O FSx for Lustre **Scratch** não tem backup, porque os dados devem estar no S3.
+- **Capacidade provisionada:** diferente do EFS, a maioria das opções exige definir **capacidade de armazenamento** e **throughput**. A capacidade pode aumentar, mas **não diminuir**. As exceções elásticas são o capacity pool do ONTAP e a classe Intelligent-Tiering do Lustre e do OpenZFS.
+- **Monitoramento:** métricas no **CloudWatch** (throughput, IOPS, capacidade livre, uso de CPU dos servidores de arquivos) e API no **CloudTrail**.
+
+[↑ Índice](#índice)
+
+### Migração para o FSx
+
+- **AWS DataSync:** copia de file servers **SMB ou NFS** on-premises (ou de outros serviços de storage) para **qualquer FSx**, com agendamento, verificação e controle de banda. É a resposta padrão para migração online de arquivos.
+- **FSx for Windows:** além do DataSync, o **Robocopy** preserva as ACLs. Os **DFS Namespaces** permitem migrar share por share **sem mudar o caminho** que os usuários acessam.
+- **FSx for NetApp ONTAP:** **SnapMirror** a partir do NetApp on-premises, que replica os volumes com os snapshots e as permissões.
+- **FSx for Lustre:** os dados geralmente **já estão no S3**, e a **DRA** os importa sob demanda.
+- **Grandes volumes com pouca banda:** **AWS Snowball** para levar os dados até a AWS, depois DataSync para a sincronização final.
+
+[↑ Índice](#índice)
+
+### Como escolher entre EFS e FSx
+
+Uma sequência de perguntas resolve a maioria dos cenários:
+
+1. Clientes **Windows**, **SMB** e **Active Directory**? → **FSx for Windows File Server**.
+2. **Linux e Windows** nos **mesmos dados**, vindo de **NetApp**, ou precisa de **iSCSI**? → **FSx for NetApp ONTAP**.
+3. **HPC ou ML**, com **throughput extremo** e dados no **S3**? → **FSx for Lustre**.
+4. Linux NFS vindo de **ZFS**, **latência mínima** ou **clones** instantâneos? → **FSx for OpenZFS**.
+5. Linux NFS **elástico**, sem gerenciar capacidade, para EC2, containers e Lambda? → **Amazon EFS**.
+
+![Diagrama FSx - Qual file storage usar](./img/amazon-fsx/amazon-fsx-05.png)
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "File share **Windows** com integração ao **Active Directory**" → **FSx for Windows File Server**. "Com **alta disponibilidade**" → **Multi-AZ**.
+- "Usuários precisam **restaurar versões anteriores** dos próprios arquivos" → **Shadow Copies** no FSx for Windows.
+- "Juntar vários file shares em **um caminho único**" ou "migrar sem mudar o caminho" → **DFS Namespaces**.
+- "Processar dados do **S3** com **file system de alto desempenho** para HPC/ML" → **FSx for Lustre** com **DRA** (lazy loading + export).
+- "Processamento **temporário** e de **menor custo**, dados já salvos no S3" → Lustre **Scratch**. "Carga longa, não pode perder dados" → Lustre **Persistent**.
+- "Mesmos dados via **NFS e SMB**" ou "aplicações **Linux e Windows** compartilhando arquivos" → **FSx for NetApp ONTAP**.
+- "Migrar **NetApp on-premises** mantendo snapshots e replicação" → **FSx for NetApp ONTAP** + **SnapMirror**.
+- "Storage de **bloco iSCSI** gerenciado e compartilhado" ou "datastore para **VMware Cloud on AWS**" → **FSx for NetApp ONTAP**.
+- "Reduzir custo de file storage com muitos dados frios, sem mudar a aplicação" → ONTAP com **capacity pool** (tiering), EFS com **lifecycle**, ou Lustre/OpenZFS com **Intelligent-Tiering**.
+- "Migrar servidor **ZFS** ou NFS on-premises com baixa latência" ou "**clones** instantâneos para dev/test" → **FSx for OpenZFS** (ou FlexClone no ONTAP).
+- "Migrar arquivos de um NAS on-premises para o FSx/EFS" → **DataSync**.
+- "Linux NFS, elástico, serverless, várias AZs" → **EFS**, não FSx.
+- "Backup do FSx em outra região/conta" → **AWS Backup** (cópia entre regiões e contas). "DR do ONTAP com RPO baixo" → **SnapMirror** para outra região.
+
+[↑ Índice](#índice)
+
 ## Amazon Simple Storage Service (S3)
 
 ### Contexto: armazenamento de objetos
@@ -660,6 +844,20 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Exigir TLS / criptografar file system existente | [File system policy / novo FS + DataSync](#segurança-e-controle-de-acesso) |
 | DR entre regiões vs. recuperar versão anterior | [EFS Replication vs. AWS Backup](#replicação-e-backup-do-efs) |
 | Migrar NAS on-premises para o EFS | [DataSync](#migração-e-integração) |
+
+[↑ Índice](#índice)
+
+### File storage (FSx)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| File share Windows, SMB, Active Directory, alta disponibilidade | [FSx for Windows Multi-AZ](#fsx-for-windows-file-server) |
+| Restaurar versões anteriores / caminho único para vários shares | [Shadow Copies / DFS Namespaces](#fsx-for-windows-file-server) |
+| HPC/ML com dados no S3 / temporário vs. longo | [FSx for Lustre + DRA / Scratch vs. Persistent](#fsx-for-lustre) |
+| Linux e Windows nos mesmos dados / iSCSI / NetApp on-premises | [FSx for NetApp ONTAP](#fsx-for-netapp-ontap) |
+| NFS de baixa latência, ZFS, clones instantâneos | [FSx for OpenZFS](#fsx-for-openzfs) |
+| Migrar NAS on-premises para FSx | [DataSync / SnapMirror / Robocopy](#migração-para-o-fsx) |
+| EFS ou FSx? | [Como escolher](#como-escolher-entre-efs-e-fsx) |
 
 [↑ Índice](#índice)
 
