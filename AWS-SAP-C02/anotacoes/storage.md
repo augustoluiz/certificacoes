@@ -31,6 +31,8 @@ tags: [sap-c02, storage, backup, data-transfer, data-sharing]
 - **Transferência e compartilhamento de dados:** [AWS DataSync](#aws-datasync) · [AWS Data Exchange](#aws-data-exchange) · [AWS Transfer Family](#aws-transfer-family)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
+> **Mapa mental:** [visão geral dos temas no NotebookLM](https://notebooklm.link.google/iLDgx0N8p0v7) (requer login no Google).
+
 ## Amazon Elastic Block Store (EBS)
 
 ### Contexto: block, file e object storage
