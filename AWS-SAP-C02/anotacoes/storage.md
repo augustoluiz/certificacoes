@@ -26,6 +26,7 @@ tags: [sap-c02, storage]
 - **Block storage:** [Amazon EBS](#amazon-elastic-block-store-ebs)
 - **File storage:** [Amazon EFS](#amazon-elastic-file-system-efs) · [Amazon FSx](#amazon-fsx)
 - **Object storage:** [Amazon S3](#amazon-simple-storage-service-s3)
+- **Transferência de dados:** [AWS DataSync](#aws-datasync)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## Amazon Elastic Block Store (EBS)
@@ -811,6 +812,191 @@ O custo do S3 tem cinco componentes:
 
 [↑ Índice](#índice)
 
+## AWS DataSync
+
+### Contexto: mover dados para a AWS
+
+Escolher onde guardar os dados (EBS, EFS, FSx, S3) é só metade do problema. A outra metade é **levar os dados até lá**. Em uma migração, as empresas costumam ter **terabytes ou petabytes** em NAS, file servers Windows, clusters Hadoop ou em outra nuvem. Copiar isso com `rsync`, `robocopy` ou `aws s3 cp` funciona em pequena escala, mas, em grande escala, exige:
+
+- servidores e scripts para **paralelizar** a cópia e usar toda a banda disponível;
+- **reiniciar** do ponto onde parou depois de uma falha de rede;
+- **verificar** que os dados chegaram íntegros;
+- preservar **permissões, donos e datas** dos arquivos;
+- **sincronizar** as mudanças que acontecem enquanto a migração não termina;
+- **limitar a banda** para não derrubar a rede da empresa em horário comercial.
+
+O **AWS DataSync** é o serviço gerenciado que faz tudo isso. Na prova, ele é a resposta padrão para **transferência online** de arquivos e objetos para (ou de, ou entre) os storages da AWS. O desafio é diferenciá-lo de serviços parecidos, como **Snowball**, **Storage Gateway**, **Transfer Family** e **S3 Replication**.
+
+[↑ Índice](#índice)
+
+### O que é o DataSync
+
+Um serviço de **transferência de dados online**, que copia arquivos e objetos entre um storage de **origem** e um de **destino**:
+
+- **Velocidade:** usa protocolo próprio, com paralelismo e compressão. Uma única task consegue usar **todo um link de 10 Gbps**.
+- **Segurança:** os dados trafegam com **TLS** e são **verificados** (checksums) durante e no fim da transferência.
+- **Incremental:** cada execução copia **só o que mudou** desde a anterior. Isso permite uma carga inicial seguida de sincronizações até o dia do **cutover**.
+- **Metadados:** preserva permissões **POSIX** (UID, GID, modo) e datas em NFS/EFS, e **ACLs NTFS** (donos, DACLs, SACLs) de SMB para o FSx for Windows. No S3, os metadados de arquivo viram **metadados do objeto**.
+- **Gerenciado:** agendamento, filtros, limite de banda, logs e métricas, sem servidores de cópia para manter.
+
+**Usos típicos:**
+
+- **migrar** file servers e NAS para S3, EFS ou FSx;
+- **arquivar** dados frios on-premises direto em classes **Glacier** do S3;
+- **replicar** dados para a AWS como cópia de proteção ou DR;
+- mover dados entre **serviços da AWS** (ex: EFS → FSx, S3 → EFS) ou **entre contas e regiões**;
+- trazer dados de **outras nuvens** (Azure Blob, Azure Files, Google Cloud Storage);
+- levar dados para processamento na nuvem (analytics, ML) e trazer os resultados de volta.
+
+[↑ Índice](#índice)
+
+### Componentes: agente, locations e tasks
+
+- **Agente:** uma máquina virtual que **lê ou grava** no storage que a AWS não alcança sozinha, como NAS, file servers, HDFS e object storage on-premises. Ele roda em **VMware ESXi, Hyper-V, KVM ou Nutanix AHV**, ou como **AMI em EC2**. O agente só faz conexões **de saída** (porta 443) para o serviço DataSync, então não é preciso abrir portas de entrada no firewall. Para mais throughput, use **vários agentes** ou várias tasks.
+- **Location:** a definição de **onde** estão os dados: tipo (NFS, SMB, S3, EFS etc.), caminho e credenciais. Toda task tem uma location de **origem** e uma de **destino**.
+- **Task:** liga origem e destino e define **o que** copiar e **como** (filtros, verificação, metadados, banda, agendamento). Cada vez que a task roda, cria uma **task execution**, que passa pelas fases *preparing* (lista e compara), *transferring* e *verifying*.
+
+![Diagrama DataSync - Arquitetura híbrida](./img/aws-datasync/aws-datasync-01.png)
+
+**Quando o agente é necessário:**
+
+| Cenário | Agente? |
+|---|---|
+| NFS, SMB, HDFS ou object storage **on-premises** | **Sim**, perto da origem (VM no data center) |
+| Entre serviços AWS (**S3, EFS, FSx**) na **mesma conta** | **Não** |
+| **S3 → S3** em outra **conta** ou **região** | **Não** (role do DataSync + bucket policy) |
+| **EFS/FSx** em **outra conta** | **Sim**, agente em **EC2**, que monta o file system |
+| **Outra nuvem** (Azure Blob, GCS) → S3 | **Não** no modo Enhanced; no Basic, agente em EC2 ou na outra nuvem |
+
+> **Obs:** o agente fica **próximo da origem**, porque o tráfego entre o agente e o storage usa protocolos de LAN (NFS/SMB), enquanto o trecho agente → AWS usa o protocolo otimizado do DataSync. Um agente em EC2 lendo um NAS on-premises pela VPN seria lento.
+
+[↑ Índice](#índice)
+
+### Modos de task: Basic e Enhanced
+
+| | **Basic** | **Enhanced** |
+|---|---|---|
+| Como processa | Fases em **sequência** (prepara, transfere, verifica) | Fases **em paralelo** |
+| Quantidade de arquivos | Sujeita a **cotas** por execução | **Praticamente ilimitada** |
+| Verificação | Por padrão, verifica **todos** os dados | Verifica **só os transferidos** |
+| Logs | Não estruturados | **Estruturados (JSON)** e mais métricas |
+| Locations | Todas | Todas, menos S3 on Outposts |
+| Custo | Por GB transferido | Por GB transferido **+ taxa por execução** |
+
+- O modo é escolhido **na criação** da task e **não pode ser alterado** depois.
+- NFS, SMB e HDFS on-premises exigem um **agente compatível com Enhanced** para usar esse modo.
+- Na prova, a regra prática: **datasets enormes** (milhões ou bilhões de arquivos) ou **outras nuvens sem agente** → **Enhanced**.
+
+[↑ Índice](#índice)
+
+### Opções da task
+
+![Diagrama DataSync - Location, task e execução](./img/aws-datasync/aws-datasync-02.png)
+
+- **O que copiar:** **filtros** de inclusão e exclusão por caminho (ex: só `/projetos`, sem `*.tmp`) ou um **manifest** com a lista exata de arquivos.
+- **Como copiar:**
+  - **só dados alterados** (padrão) ou **tudo**;
+  - **manter ou apagar** no destino arquivos que não existem mais na origem (para um espelho exato);
+  - **sobrescrever ou não** arquivos do destino;
+  - quais **metadados** preservar (dono, permissões, datas, tags de objeto).
+- **Verificação de integridade:** checksums durante a transferência e, opcionalmente, uma comparação no fim, dos arquivos transferidos ou de todo o dataset.
+- **Limite de banda:** em MB/s, ajustável **durante a execução**. Assim, a migração não satura o link da empresa em horário comercial.
+- **Agendamento:** execuções **de hora em hora, diárias ou semanais** (ou sob demanda, por API, Lambda ou EventBridge Scheduler). Não é replicação contínua em tempo real.
+- **Classe de armazenamento no S3:** o DataSync grava direto em qualquer classe, inclusive **Glacier Flexible Retrieval** e **Deep Archive**.
+
+> **Obs:** o DataSync **não é replicação em tempo real**. Para mudanças contínuas e com RPO baixo, use **S3 Replication**, **EFS Replication** ou **SnapMirror** (FSx for ONTAP). O DataSync sincroniza em **execuções agendadas**.
+
+[↑ Índice](#índice)
+
+### Rede e segurança do DataSync
+
+- **Endpoint do serviço:** o agente pode se conectar a um endpoint:
+  - **público** (pela internet, com TLS);
+  - **FIPS** (para requisitos regulatórios);
+  - **VPC endpoint (PrivateLink)**: o tráfego sai do data center por **Direct Connect ou VPN** e entra na VPC por uma interface privada, **sem passar pela internet**. É a resposta quando o cenário exige que os dados **não trafeguem pela internet pública**.
+- **O tipo de endpoint é escolhido na ativação do agente** e não muda depois.
+- **Acesso aos destinos AWS:**
+  - **S3:** por uma **role IAM** que o DataSync assume;
+  - **EFS e FSx:** o DataSync cria **ENIs na sua VPC** e monta o file system, então os **security groups** precisam liberar NFS (2049) ou SMB (445). Para o EFS, é possível usar **access points** e **autorização IAM**.
+- **Credenciais da origem** (usuário SMB, chaves de object storage, Azure) podem ficar no **Secrets Manager**.
+- **Criptografia:** TLS em trânsito. Em repouso, vale a criptografia do destino (SSE-S3, SSE-KMS, KMS no EFS/FSx).
+
+[↑ Índice](#índice)
+
+### Transferências entre serviços e contas da AWS
+
+O DataSync também move dados **dentro da AWS**, sem agente na maioria dos casos:
+
+- **Mesma conta:** entre S3, EFS e FSx, em qualquer combinação, inclusive **entre regiões**. Exemplos:
+  - **EFS → FSx for OpenZFS** para ganhar desempenho;
+  - **EFS → novo EFS criptografado**;
+  - **S3 → EFS** para uma aplicação que precisa de arquivos.
+- **S3 → S3 em outra conta:**
+  1. a task fica na conta **de origem**, com uma **role do DataSync**;
+  2. a **bucket policy** do bucket de destino **libera essa role**;
+  3. o bucket de destino fica com **ACLs desativadas** (Object Ownership = bucket owner enforced), para que a conta de destino seja dona dos objetos;
+  4. se os objetos usam **SSE-KMS**, a key policy também precisa liberar a role.
+- **EFS/FSx em outra conta:** um **agente em EC2** na conta que roda a task monta o file system da outra conta, por VPC peering ou Transit Gateway, como se fosse um NAS on-premises.
+
+![Diagrama DataSync - Transferências entre contas, serviços e nuvens](./img/aws-datasync/aws-datasync-03.png)
+
+> **Obs:** para **copiar uma vez** um bucket inteiro para outra conta, o DataSync é uma boa opção. Para **manter** os buckets sincronizados continuamente, a resposta é **S3 Replication** (CRR/SRR). Para objetos **já existentes** com a replicação configurada, a resposta é **S3 Batch Replication**.
+
+[↑ Índice](#índice)
+
+### Monitoramento e custo do DataSync
+
+- **CloudWatch:** métricas de bytes e arquivos transferidos, e logs da execução no **CloudWatch Logs** (inclusive de cada arquivo, no nível de log `TRANSFER`).
+- **EventBridge:** eventos de **mudança de estado** da task e da execução. Por exemplo, para disparar o processamento quando a cópia terminar.
+- **Task reports:** um relatório detalhado de **cada arquivo** (transferido, ignorado, verificado, com erro), gravado no **S3**. É a resposta para **auditoria** e prova de que a migração foi completa.
+- **Custo:**
+  - uma taxa **por GB transferido** (fixa, maior no modo Enhanced);
+  - no **Enhanced**, uma **taxa por execução** da task;
+  - o agente **não é cobrado**;
+  - à parte: requisições do S3 (LIST, GET, PUT), armazenamento do destino, transferência entre regiões ou para fora da AWS, PrivateLink e CloudWatch.
+
+> **Obs:** em uma migração para o **S3** com **milhões de arquivos pequenos**, o custo das **requisições** (PUT) pode superar o custo por GB. Uma alternativa é agrupar os arquivos antes, quando a aplicação permitir.
+
+[↑ Índice](#índice)
+
+### DataSync vs. outras opções de transferência
+
+| Serviço | Quando usar | Palavras do cenário |
+|---|---|---|
+| **AWS DataSync** | Cópia **online**, única ou **agendada**, de arquivos e objetos para, de ou entre S3, EFS e FSx | "migrar NAS", "sincronizar", "verificar integridade", "preservar permissões", "limitar banda" |
+| **AWS Snowball Edge** | Transferência **offline** em dispositivo físico, quando a rede é lenta ou inexistente | "pouca banda", "levaria semanas", "petabytes", "local remoto sem conexão" |
+| **AWS Storage Gateway** | Acesso **híbrido contínuo**: aplicações on-premises continuam usando NFS/SMB/iSCSI com **cache local**, e os dados ficam no S3 | "manter acesso on-premises", "cache local", "backup em fita virtual" |
+| **AWS Transfer Family** | **Parceiros** e sistemas legados enviam arquivos por **SFTP, FTPS, FTP ou AS2** para o S3 ou o EFS | "parceiros", "SFTP", "sem mudar o processo de envio" |
+| **S3 Replication** | Cópia **contínua** e assíncrona de objetos **S3 → S3** | "toda nova versão", "outra região", "RPO de 15 min" (RTC) |
+| **S3 Transfer Acceleration** | Uploads de usuários **distantes** pela rede de borda da AWS | "upload global lento" |
+| **EFS Replication / SnapMirror** | Réplica contínua de **file systems** para DR | "DR do EFS", "RPO baixo", "ONTAP" |
+
+![Diagrama DataSync - Como levar os dados para a AWS](./img/aws-datasync/aws-datasync-04.png)
+
+**Calculando se a rede basta:** 100 TB em um link de **1 Gbps** com uso total levam cerca de **9 a 10 dias** (100 × 8.000 Gb ÷ 1 Gbps ≈ 800.000 s). Se o prazo é menor, ou se o link não pode ser usado inteiro, a resposta tende a ser **Snowball**. Um padrão comum combina os dois: **Snowball** leva a **carga inicial**, e o **DataSync** sincroniza as **mudanças incrementais** até o cutover.
+
+> **Obs:** o **AWS DataSync Discovery**, que analisava o storage on-premises para recomendar o destino na AWS, foi descontinuado. Em questões antigas, ele aparece como resposta para "avaliar o storage on-premises antes da migração".
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Migrar NAS/file server **NFS ou SMB** on-premises para S3, EFS ou FSx, **online**" → **DataSync** com **agente** on-premises.
+- "Preservar **permissões e ACLs** do Windows na migração para o FSx for Windows" → **DataSync** (SMB → FSx for Windows), ou Robocopy.
+- "Os dados **não podem trafegar pela internet** pública" → agente com **VPC endpoint (PrivateLink)** sobre **Direct Connect/VPN**.
+- "Migração não pode **saturar o link** em horário comercial" → **limite de banda** na task (ou agendamento fora do horário).
+- "Garantir que todos os arquivos chegaram íntegros" / "auditar a migração" → **verificação de integridade** + **task reports** no S3.
+- "Carga inicial e depois **sincronizar mudanças** até o cutover" → **DataSync agendado** (execuções incrementais). Com pouca banda → **Snowball** + DataSync.
+- "Copiar **milhões/bilhões** de arquivos" ou "de **Azure Blob/GCS** para o S3 **sem agente**" → DataSync no modo **Enhanced**.
+- "Mover dados entre **EFS, FSx e S3**" ou "copiar um file system para **outra região**" → **DataSync**, sem agente.
+- "Copiar um bucket para **outra conta** uma vez" → DataSync (role + **bucket policy**). "Manter sincronizado continuamente" → **S3 Replication**.
+- "Arquivar dados frios on-premises direto no **Glacier Deep Archive**" → **DataSync** com a classe de armazenamento de destino.
+- "Aplicações on-premises **continuam** acessando os arquivos" → **Storage Gateway**, não DataSync.
+- "Parceiros enviam arquivos por **SFTP**" → **Transfer Family**, não DataSync.
+- "Dezenas de TB, **link lento**, prazo curto" → **Snowball Edge**.
+
+[↑ Índice](#índice)
+
 ## Revisão: qual serviço usar
 
 Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas seções de cada serviço.
@@ -875,5 +1061,20 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Reagir a uploads (simples vs. vários consumidores) | [Event Notifications vs. EventBridge](#eventos-do-s3) |
 | Operação em bilhões de objetos / visão da organização | [Batch Operations + Inventory / Storage Lens](#operações-em-larga-escala) |
 | Site estático com HTTPS / dataset pago por quem baixa | [CloudFront + OAC / Requester Pays](#site-estático-e-requester-pays) |
+
+[↑ Índice](#índice)
+
+### Transferência de dados (DataSync)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Migrar NAS NFS/SMB on-premises online | [DataSync + agente](#componentes-agente-locations-e-tasks) |
+| Precisa de agente? (on-prem, entre contas, outra nuvem) | [Tabela do agente](#componentes-agente-locations-e-tasks) |
+| Milhões de arquivos / outra nuvem sem agente | [Modo Enhanced](#modos-de-task-basic-e-enhanced) |
+| Limitar banda / sincronizar até o cutover / arquivar no Glacier | [Opções da task](#opções-da-task) |
+| Não trafegar pela internet | [VPC endpoint + Direct Connect/VPN](#rede-e-segurança-do-datasync) |
+| Copiar bucket ou file system para outra conta | [Transferências entre contas](#transferências-entre-serviços-e-contas-da-aws) |
+| Auditar a migração | [Task reports](#monitoramento-e-custo-do-datasync) |
+| DataSync, Snowball, Storage Gateway, Transfer Family ou S3 Replication? | [Comparação](#datasync-vs-outras-opções-de-transferência) |
 
 [↑ Índice](#índice)
