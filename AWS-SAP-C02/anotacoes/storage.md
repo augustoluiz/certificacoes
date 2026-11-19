@@ -9,6 +9,7 @@ servicos:
   - Amazon FSx
   - AWS DataSync
   - AWS Data Exchange
+  - AWS Transfer Family
   - Amazon S3
 criado-em: 2026-11-16
 atualizado-em: 2026-11-19
@@ -27,7 +28,7 @@ tags: [sap-c02, storage]
 - **Block storage:** [Amazon EBS](#amazon-elastic-block-store-ebs)
 - **File storage:** [Amazon EFS](#amazon-elastic-file-system-efs) · [Amazon FSx](#amazon-fsx)
 - **Object storage:** [Amazon S3](#amazon-simple-storage-service-s3)
-- **Transferência e compartilhamento de dados:** [AWS DataSync](#aws-datasync) · [AWS Data Exchange](#aws-data-exchange)
+- **Transferência e compartilhamento de dados:** [AWS DataSync](#aws-datasync) · [AWS Data Exchange](#aws-data-exchange) · [AWS Transfer Family](#aws-transfer-family)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## Amazon Elastic Block Store (EBS)
@@ -1114,6 +1115,127 @@ O Data Exchange publica **eventos no EventBridge** quando o provedor publica uma
 
 [↑ Índice](#índice)
 
+## AWS Transfer Family
+
+### Contexto: troca de arquivos com parceiros
+
+Muitas empresas ainda trocam dados com o mundo externo por **arquivos**: um banco recebe o arquivo de remessa de clientes, um varejista manda pedidos aos fornecedores, uma operadora de saúde recebe lotes de guias, um parceiro envia o relatório diário. Essa troca usa protocolos antigos e consolidados, que os **parceiros já usam e não vão mudar**:
+
+- **SFTP** (transferência de arquivos sobre SSH);
+- **FTPS** (FTP com TLS) e **FTP** (sem criptografia);
+- **AS2**, padrão de troca de documentos **EDI** entre parceiros comerciais (varejo, logística, saúde).
+
+Manter um servidor SFTP próprio dá trabalho: alta disponibilidade, patches, cadastro de usuários e chaves, armazenamento, integração com o resto da empresa. Ao migrar para a nuvem, a empresa quer que os arquivos caiam direto no **S3** (ou no **EFS**), **sem que os parceiros percebam a mudança**. O **AWS Transfer Family** é esse servidor de arquivos **gerenciado**. Na prova, ele é a resposta quando o cenário cita **SFTP, FTPS, FTP ou AS2** e pede para **não mudar os clientes** ou **reduzir a operação** de servidores de transferência.
+
+[↑ Índice](#índice)
+
+### O que é o Transfer Family
+
+Um serviço gerenciado que expõe **endpoints SFTP, FTPS, FTP e AS2** e grava os arquivos no **Amazon S3** ou no **Amazon EFS**:
+
+- **Servidor (server):** o endpoint que os clientes acessam. Um servidor pode ter **vários protocolos** habilitados. É **Multi-AZ** e escala sozinho.
+- **Clientes inalterados:** os parceiros continuam usando os mesmos clientes (FileZilla, WinSCP, scripts `sftp`) e, com um **nome DNS próprio** (Route 53 ou outro DNS apontando para o endpoint), o mesmo endereço.
+- **Acesso ao storage:** cada usuário tem uma **IAM role**, que define o que ele pode ler e gravar no bucket ou no file system.
+- **Logical directories:** o usuário vê um caminho simples (`/`), mapeado para um prefixo do bucket (`s3://bucket/parceiros/joao`). Ele fica **preso a esse diretório** (chroot), sem ver o nome do bucket nem as pastas dos outros.
+- **Web apps:** uma interface **no navegador** para usuários que não usam clientes SFTP, com login pelo **IAM Identity Center** e permissões por **S3 Access Grants**. Só funciona com S3.
+- **Monitoramento:** logs de cada sessão e arquivo no **CloudWatch Logs**, e chamadas de API no **CloudTrail**.
+- **Custo:** por **hora de cada protocolo habilitado** no endpoint, mesmo sem uso, mais **por GB** enviado ou baixado. Há preços próprios para connectors, mensagens AS2, web apps e decriptação PGP.
+
+![Diagrama Transfer Family - Visão geral](./img/aws-transfer-family/aws-transfer-family-01.png)
+
+> **Obs:** como a cobrança é **por hora de protocolo habilitado**, desligar os protocolos que ninguém usa e evitar servidores ociosos reduz o custo. Um único servidor pode atender muitos usuários.
+
+[↑ Índice](#índice)
+
+### Autenticação: identity providers
+
+| Identity provider | Como autentica | Protocolos |
+|---|---|---|
+| **Service managed** | Usuários cadastrados **no próprio Transfer Family**, com **chave SSH** pública | **Só SFTP** (sem senha) |
+| **AWS Directory Service (Microsoft AD)** | **Usuário e senha do AD** (AWS Managed Microsoft AD ou AD on-premises via AD Connector). Acesso por **grupos do AD** | SFTP, FTPS, FTP (sem chave SSH) |
+| **Custom** | Uma **Lambda** ou uma **API no API Gateway** valida o usuário em qualquer sistema: **Okta, Entra ID, LDAP**, banco de dados, Secrets Manager | **Todos** |
+
+- O provedor custom recebe o **IP de origem** do cliente, então dá para **restringir o acesso por IP** por usuário. Ele também pode exigir **senha e chave** juntas (MFA de fator duplo).
+- O provedor devolve ao serviço a **IAM role**, a **session policy** e o **home directory** do usuário.
+- **Session policy (scope-down):** uma política aplicada em tempo de execução que restringe a role ao **prefixo do próprio usuário** (com a variável `${transfer:UserName}`). Assim, **uma role** atende **todos os usuários**, cada um isolado no seu diretório.
+
+> **Obs:** o **AS2** não usa usuários. A confiança é feita por **certificados** e **agreements** entre a empresa e cada parceiro.
+
+[↑ Índice](#índice)
+
+### Tipos de endpoint
+
+| | **Público** | **VPC, acesso interno** | **VPC, internet-facing** |
+|---|---|---|---|
+| Acesso | Pela internet | Só pela VPC, peering, **VPN ou Direct Connect** | Pela internet, via **Elastic IP** |
+| Endereço IP | Gerenciado pela AWS, **pode mudar** (use o nome DNS) | **IPs privados** fixos | **Elastic IPs fixos** (inclusive BYOIP) |
+| Controle por IP de origem | **Não** (sem security group) | **Security groups** e NACLs | **Security groups** |
+| FTP | Não | **Sim (único tipo que aceita FTP)** | Não |
+
+![Diagrama Transfer Family - Tipos de endpoint](./img/aws-transfer-family/aws-transfer-family-02.png)
+
+- **Parceiro exige um IP fixo para liberar no firewall** dele → **VPC internet-facing com Elastic IP**.
+- **Só aceitar conexões de IPs conhecidos** → endpoint na **VPC**, com **security group**. O endpoint público não permite.
+- **FTP** (texto puro) só é permitido **dentro da VPC**. Para tráfego pela internet, use **SFTP ou FTPS**.
+
+[↑ Índice](#índice)
+
+### Processamento: managed workflows
+
+Depois que um arquivo chega por SFTP, FTPS ou FTP, um **managed workflow** pode processá-lo automaticamente, em etapas:
+
+- **decrypt:** decriptar arquivos **PGP** (comum em bancos e saúde);
+- **copy / move:** copiar para outro bucket ou prefixo (ex: `entrada/` → `processar/`);
+- **tag:** marcar o objeto com tags (só S3), por exemplo para lifecycle ou controle de acesso;
+- **custom:** chamar uma **Lambda** para validar, transformar ou acionar outros sistemas;
+- **delete:** apagar o arquivo original.
+
+O workflow tem um **fluxo de exceção** separado, executado se alguma etapa falhar (ex: mover para `quarentena/` e notificar). A alternativa, mais flexível, é usar um **evento do S3** ou do **EventBridge** para disparar Lambda ou Step Functions.
+
+[↑ Índice](#índice)
+
+### Saída: SFTP connectors e AS2
+
+Às vezes a empresa precisa ser o **cliente**, ou seja, enviar ou buscar arquivos em **servidores de terceiros**:
+
+- **SFTP connectors:** copiam arquivos entre o **S3** e um **servidor SFTP externo** (do parceiro), nos dois sentidos. A transferência é iniciada pela API `StartFileTransfer`, que pode ser agendada pelo **EventBridge Scheduler** ou chamada por uma Lambda. As credenciais ficam no **Secrets Manager**, e a chave do servidor remoto é verificada (host key).
+- **AS2:** o Transfer Family **recebe** mensagens AS2 (por **agreements** com cada parceiro) e **envia** por **AS2 connectors**, com assinatura, criptografia e recibos de entrega (**MDN**). As mensagens ficam no S3. O AS2 não suporta o EFS.
+
+![Diagrama Transfer Family - Workflows e connectors](./img/aws-transfer-family/aws-transfer-family-03.png)
+
+[↑ Índice](#índice)
+
+### Transfer Family vs. outras opções
+
+| Necessidade | Solução |
+|---|---|
+| Parceiros e sistemas legados **enviam ou baixam** arquivos por **SFTP/FTPS/FTP/AS2**, sem mudar os clientes | **Transfer Family** |
+| **Migrar** um NAS ou file server para S3/EFS/FSx, com verificação e sincronização agendada | **DataSync** |
+| Aplicações on-premises **continuam** acessando arquivos via NFS/SMB, com **cache local** | **Storage Gateway** (File Gateway) |
+| Transferência **offline** de grandes volumes | **Snowball Edge** |
+| **Assinar ou vender** datasets de terceiros | **Data Exchange** |
+| Usuários fazem **upload pelo navegador** para o S3 | **Transfer Family web apps**, ou aplicação própria com **presigned URLs** |
+| Upload rápido de usuários **distantes** via HTTP | **S3 Transfer Acceleration** |
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Parceiros enviam arquivos via **SFTP**, migrar o servidor para a AWS **sem mudar** os clientes" → **Transfer Family** (SFTP) gravando no **S3**, com **nome DNS** próprio (Route 53).
+- "Reduzir a **operação** de servidores SFTP em EC2" → **Transfer Family** (gerenciado, Multi-AZ).
+- "Autenticar com **usuários do Active Directory**" → identity provider **AWS Directory Service**. "Com **Okta/Entra ID/LDAP**" ou "restringir por **IP de origem** por usuário" → identity provider **custom** (Lambda ou API Gateway).
+- "Usuários só com **chave SSH**, sem diretório" → **service managed**.
+- "Cada parceiro só pode ver **sua própria pasta**" → **logical directories** (chroot) e/ou **session policy** com `${transfer:UserName}`.
+- "Parceiro exige **IP fixo** para liberar no firewall" → endpoint **VPC internet-facing** com **Elastic IP**.
+- "Permitir acesso **só de IPs conhecidos**" → endpoint na **VPC** com **security group**, não o público.
+- "Suportar **FTP**" → só endpoint **VPC interno**. FTP pela internet → trocar por **SFTP/FTPS**.
+- "**Decriptar PGP** e mover os arquivos recebidos automaticamente" → **managed workflows**.
+- "Enviar ou buscar arquivos **no servidor SFTP do parceiro**" → **SFTP connector** (+ EventBridge Scheduler).
+- "Troca de documentos **EDI** com parceiros comerciais via **AS2**" → Transfer Family **AS2**.
+- "Usuários de negócio fazem upload pelo **navegador**, sem cliente SFTP" → **Transfer Family web apps** (Identity Center + S3 Access Grants).
+
+[↑ Índice](#índice)
+
 ## Revisão: qual serviço usar
 
 Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas seções de cada serviço.
@@ -1205,5 +1327,19 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Cópia no S3 vs. ler no lugar vs. SQL no Redshift vs. API | [Tipos de data set](#tipos-de-data-set-e-formas-de-entrega) |
 | Receber e processar atualizações automaticamente | [Auto-export + EventBridge](#automação-da-ingestão) |
 | Data Exchange, Clean Rooms, Lake Formation ou bucket policy? | [Comparação](#data-exchange-vs-outras-formas-de-compartilhar-dados) |
+
+[↑ Índice](#índice)
+
+### Transferência de arquivos com parceiros (Transfer Family)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Parceiros usam SFTP/FTPS/FTP, migrar sem mudar os clientes | [Transfer Family + S3/EFS + DNS próprio](#o-que-é-o-transfer-family) |
+| Usuários do AD / Okta, Entra ID, LDAP / só chave SSH | [Directory Service / custom / service managed](#autenticação-identity-providers) |
+| Cada parceiro só vê sua pasta | [Logical directories + session policy](#autenticação-identity-providers) |
+| IP fixo / allow list por IP / FTP | [VPC internet-facing com EIP / VPC + SG / VPC interno](#tipos-de-endpoint) |
+| Decriptar PGP e mover arquivos recebidos | [Managed workflows](#processamento-managed-workflows) |
+| Buscar ou enviar arquivos no SFTP do parceiro / EDI via AS2 | [SFTP connectors / AS2](#saída-sftp-connectors-e-as2) |
+| Transfer Family, DataSync, Storage Gateway ou Snowball? | [Comparação](#transfer-family-vs-outras-opções) |
 
 [↑ Índice](#índice)
