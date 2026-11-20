@@ -22,6 +22,8 @@ tags: [sap-c02, caching, cdn, edge, in-memory, scalability]
 - **Cache em memória:** [Amazon ElastiCache](#amazon-elasticache)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar) · [Lidando com taxas extremas](#lidando-com-taxas-extremas)
 
+> **Mapa mental:** [visão geral dos temas no NotebookLM](https://notebooklm.link.google/fBW0jhl2bKtM) (requer login no Google).
+
 ## Amazon CloudFront
 
 ### Contexto: por que cache na borda
