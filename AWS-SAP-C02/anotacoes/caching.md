@@ -3,10 +3,11 @@ titulo: Caching
 certificacao: AWS Certified Solutions Architect - Professional (SAP-C02)
 servicos:
   - Amazon CloudFront
+  - Amazon ElastiCache
 criado-em: 2026-11-19
 atualizado-em: 2026-11-19
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
-tags: [sap-c02, caching, cdn, edge]
+tags: [sap-c02, caching, cdn, edge, in-memory]
 ---
 
 # Caching
@@ -18,6 +19,7 @@ tags: [sap-c02, caching, cdn, edge]
 ## Índice
 
 - **Cache na borda (CDN):** [Amazon CloudFront](#amazon-cloudfront)
+- **Cache em memória:** [Amazon ElastiCache](#amazon-elasticache)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## Amazon CloudFront
@@ -262,6 +264,195 @@ O objetivo é que os usuários **só** acessem o conteúdo **pelo CloudFront**, 
 
 [↑ Índice](#índice)
 
+## Amazon ElastiCache
+
+### Contexto: por que um cache em memória
+
+O CloudFront guarda conteúdo **na borda**, perto do usuário. Mas boa parte do custo de uma aplicação está **dentro** dela: consultas ao banco de dados que se repetem milhares de vezes por segundo, cálculos caros, chamadas a APIs lentas. Um banco relacional lê do **disco** e responde em **milissegundos**. Quando a carga de leitura cresce, a solução tradicional é aumentar a instância ou criar réplicas, o que é **caro** e tem limite.
+
+Um **cache em memória** guarda os resultados mais usados na **RAM**, que responde em **microssegundos**, e evita repetir o trabalho. Ele também resolve outro problema: aplicações com várias instâncias precisam de um lugar **compartilhado** para guardar o estado do usuário (sessão, carrinho), para que qualquer instância possa atendê-lo. Assim, a aplicação fica **stateless**.
+
+O **Amazon ElastiCache** é o cache em memória **gerenciado** da AWS, compatível com **Valkey**, **Redis OSS** e **Memcached**. Ele está para os caches como o RDS está para os bancos relacionais: a AWS cuida de instalação, patches, monitoramento, failover e backups. Na prova, ele é a resposta para **reduzir a carga de leitura** do banco, **guardar sessões** e **baixar a latência** com dados em memória.
+
+[↑ Índice](#índice)
+
+### O que é o ElastiCache
+
+- **Armazenamento chave-valor em memória**, com latência de **microssegundos** e centenas de milhares de operações por segundo por nó.
+- **Gerenciado:** provisionamento, patches, substituição de nós com falha, failover Multi-AZ, backups e métricas.
+- **Fica na VPC:** a aplicação acessa por um **endpoint** privado, protegido por **security groups**. Não há acesso público direto.
+- **Exige mudança no código:** a aplicação precisa **decidir** o que guardar, quando ler do cache e quando invalidar. Não é transparente como o CloudFront ou o DAX.
+- **Duas formas de uso:**
+  - **ElastiCache Serverless:** sem gerenciar nós; escala automaticamente e cobra por **dados armazenados** e por **ECPUs** (unidades de processamento) consumidas;
+  - **clusters baseados em nós:** você escolhe o **tipo e a quantidade de nós**, com mais controle e custo previsível (inclusive com **reserved nodes**).
+
+[↑ Índice](#índice)
+
+### Engines: Valkey, Redis OSS e Memcached
+
+| | **Valkey / Redis OSS** | **Memcached** |
+|---|---|---|
+| Estruturas de dados | Ricas: strings, hashes, listas, sets, **sorted sets**, streams, geoespacial, JSON | Só **strings** (chave-valor simples) |
+| Replicação e Multi-AZ | **Sim**: até 5 réplicas por shard, **failover automático** | **Não** |
+| Sharding | **Cluster mode enabled** (gerenciado pelo serviço) | Pelo **cliente** (cada nó é independente) |
+| Persistência e backup | **Snapshots** (backup e restore) | Não nos clusters de nós (só no Serverless) |
+| Recursos extras | **Pub/Sub**, transações, scripts Lua, TTL por chave, **Global Datastore** | **Multi-thread**, simples |
+| Quando usar | A **maioria** dos casos: alta disponibilidade, sessões, rankings, dados que não podem sumir | Cache **simples** e descartável, que precisa usar vários núcleos por nó |
+
+- **Valkey** é o fork **open source** do Redis, mantido pela Linux Foundation depois que o Redis mudou de licença. É compatível com o Redis OSS e é a **opção recomendada** pela AWS: custa **até 33% menos** no Serverless e **20% menos** em nós.
+- Na prova, ainda aparece só "**Redis vs. Memcached**". A regra é: precisa de **alta disponibilidade, replicação, persistência ou estruturas de dados** → **Redis/Valkey**. Precisa de um cache **simples, multi-thread e descartável** → **Memcached**.
+
+[↑ Índice](#índice)
+
+### Estratégias de cache
+
+O cache só ajuda se a aplicação souber **o que guardar** e **por quanto tempo**. As estratégias clássicas:
+
+- **Lazy loading (cache-aside):**
+  1. a aplicação procura no cache;
+  2. se **encontrar** (*cache hit*), responde;
+  3. se **não encontrar** (*cache miss*), lê no banco e **grava no cache** para as próximas leituras.
+
+  O cache só guarda o que é **realmente lido**, e uma falha do cache não derruba a aplicação, que volta a ler do banco. Em compensação, a primeira leitura é **mais lenta** (três viagens) e o dado pode ficar **desatualizado** se o banco mudar.
+- **Write-through:** a cada **escrita** no banco, a aplicação também atualiza o cache. O cache fica **sempre atualizado**, mas cada escrita fica mais lenta, e o cache pode guardar dados que ninguém vai ler.
+- **TTL (time to live):** cada chave **expira** depois de um tempo. Limita quanto um dado pode ficar desatualizado e libera memória. É usado **junto** com as duas estratégias anteriores.
+- **Na prática:** **lazy loading + TTL** para quase tudo, e **write-through** para os dados que **não podem ficar desatualizados**.
+
+![Diagrama ElastiCache - Lazy loading e write-through](./img/amazon-elasticache/amazon-elasticache-01.png)
+
+**Cuidados que caem em questões:**
+
+- **Memória cheia:** quando a memória acaba, o ElastiCache **expulsa** chaves (*eviction*), normalmente as menos usadas (LRU). Muitas evictions indicam que é preciso **mais memória** (nó maior ou mais shards) ou TTLs menores.
+- **Thundering herd:** quando uma chave muito acessada expira, muitas requisições dão miss ao mesmo tempo e todas vão ao banco. Use TTLs com **variação aleatória** (*jitter*), **pré-aquecimento** do cache ou um **lock** para que só uma requisição recarregue a chave.
+- **O que não cachear:** dados que mudam a cada leitura, que precisam de **consistência forte** ou que quase nunca se repetem.
+
+[↑ Índice](#índice)
+
+### Casos de uso
+
+- **Cache de banco de dados:** resultados de consultas caras ao RDS, Aurora ou DynamoDB. Reduz a **carga de leitura** e o **custo** do banco, que pode ficar menor.
+- **Session store:** guardar a **sessão** do usuário fora das instâncias. Qualquer instância atende qualquer usuário, o **Auto Scaling** pode remover instâncias sem derrubar sessões, e o ALB não precisa de **sticky sessions**.
+- **Rankings (leaderboards):** os **sorted sets** mantêm a ordem automaticamente (top 10 de um jogo, produtos mais vendidos) com operações em tempo constante ou logarítmico.
+- **Rate limiting e contadores:** incrementos atômicos (`INCR`) com TTL, para limitar requisições por usuário ou contar visualizações.
+- **Pub/Sub e filas leves:** mensagens em tempo real (chat, notificações) com Pub/Sub ou Streams.
+- **Dados geoespaciais:** "restaurantes a menos de 2 km" com os comandos geo.
+- **Cache de respostas de APIs** ou de cálculos caros (ex: preços, recomendações).
+
+![Diagrama ElastiCache - Session store](./img/amazon-elasticache/amazon-elasticache-02.png)
+
+> **Obs:** para sessões, a alternativa ao ElastiCache é o **DynamoDB** (serverless, durável, com TTL nativo). O ElastiCache tem **latência menor**. O DynamoDB tem **durabilidade** e não precisa de nós nem VPC.
+
+[↑ Índice](#índice)
+
+### Topologia, alta disponibilidade e escala
+
+- **Cluster mode disabled (Valkey/Redis):**
+  - **um shard**: um nó **primário** (leitura e escrita) e até **5 réplicas** (só leitura);
+  - todos os dados precisam caber na memória **de um nó**;
+  - endpoints: **primary endpoint** (escritas) e **reader endpoint** (distribui as leituras entre as réplicas);
+  - escala **vertical** (tipo do nó) para memória e escrita, e **réplicas** para leitura.
+- **Cluster mode enabled (Valkey/Redis):**
+  - os dados são **particionados** em vários **shards**, cada um com seu primário e suas réplicas;
+  - escala **horizontal** de **memória** e de **escrita**;
+  - **resharding online**: adicionar ou remover shards sem parar;
+  - o cliente usa o **configuration endpoint** e precisa ser *cluster-aware*.
+- **Memcached:** vários nós **independentes**, sem réplicas. O **cliente** distribui as chaves entre os nós. Se um nó cai, os dados dele são **perdidos**, e o cache precisa ser recarregado do banco.
+- **Multi-AZ com failover automático** (Valkey/Redis): as réplicas ficam em **outras AZs**. Se o primário falhar, uma réplica é **promovida** automaticamente, e o **endpoint DNS não muda**. É a resposta para **alta disponibilidade** do cache.
+- **Auto scaling:** nos clusters com **cluster mode enabled**, o número de **shards** e de **réplicas** pode escalar automaticamente por métricas. O **Serverless** escala sozinho.
+- **Data tiering:** nos nós **r6gd**, os itens **menos usados** vão da RAM para **SSD NVMe** local. Isso aumenta a capacidade por um custo bem menor, com alguns **centésimos de milissegundo** a mais de latência nos itens que estão no SSD. Serve para datasets grandes em que só uma parte (até ~20%) é acessada com frequência.
+
+![Diagrama ElastiCache - Topologias](./img/amazon-elasticache/amazon-elasticache-03.png)
+
+[↑ Índice](#índice)
+
+### Global Datastore
+
+- Replica um cluster Valkey/Redis para **até 2 regiões secundárias**.
+- **Uma região primária** recebe as **escritas**. As secundárias são **só leitura** e atendem as aplicações locais com **baixa latência**.
+- A replicação é **assíncrona**, normalmente **abaixo de 1 segundo**.
+- Em um desastre, você **promove** uma secundária a primária (failover **manual**), com **RTO** normalmente abaixo de 1 minuto.
+- Casos de uso:
+  - **leituras locais** em aplicações globais;
+  - **DR entre regiões** do cache. Combina com **Aurora Global Database** ou **DynamoDB Global Tables** na camada de dados.
+
+![Diagrama ElastiCache - Global Datastore](./img/amazon-elasticache/amazon-elasticache-04.png)
+
+[↑ Índice](#índice)
+
+### Segurança do ElastiCache
+
+- **Rede:** o cluster fica em **subnets privadas** da VPC, com **security groups** liberando só a aplicação na porta do engine (6379 para Valkey/Redis, 11211 para Memcached).
+- **Criptografia:**
+  - **em trânsito:** **TLS** entre os clientes e o cache, e entre os nós;
+  - **em repouso:** discos, snapshots e swap criptografados, com chave gerenciada pela AWS ou **customer managed key** do KMS.
+- **Autenticação** (Valkey/Redis):
+  - **AUTH token:** uma senha única para o cluster (modelo antigo);
+  - **RBAC (Role-Based Access Control):** **usuários** com senha e **permissões por comando e por chave** (ex: um serviço só pode ler chaves `sessao:*`);
+  - **autenticação IAM:** o cliente se conecta com um **token IAM temporário**, sem senha guardada na aplicação. É a resposta de **menor esforço** para eliminar senhas.
+- **Credenciais** de RBAC podem ficar no **Secrets Manager**, com rotação.
+
+[↑ Índice](#índice)
+
+### Backup e persistência
+
+- **Snapshots** (Valkey/Redis e Memcached Serverless): **automáticos** (com retenção configurável) ou **manuais**. Servem para **restaurar** um novo cluster, **migrar** entre tipos de nó ou **copiar** para outra região ou conta, exportando para o **S3**.
+- O ElastiCache é um **cache**: os dados vivem na **memória**. Réplicas Multi-AZ e snapshots reduzem a perda, mas **não garantem durabilidade total** (escritas recentes podem se perder em uma falha). O banco de dados continua sendo a **fonte da verdade**.
+- **Precisa de um banco em memória durável** (o Redis como banco **principal**, sem outro banco por trás)? → **Amazon MemoryDB**, que grava cada escrita em um **log transacional Multi-AZ**.
+
+> **Obs:** os slides citam o **AOF** (*Append Only File*) como forma de persistência do Redis. Nas versões recentes do ElastiCache, o AOF não está disponível. A AWS recomenda **Multi-AZ com réplicas** para disponibilidade e o **MemoryDB** para durabilidade.
+
+[↑ Índice](#índice)
+
+### Monitoramento e custo do ElastiCache
+
+- **Métricas no CloudWatch:**
+  - **CPU** (no Valkey/Redis, a `EngineCPUUtilization`, porque o processamento de comandos é principalmente single-thread);
+  - **memória** (`DatabaseMemoryUsagePercentage`) e **`Evictions`**: evictions altas indicam que falta memória;
+  - **`CacheHits` / `CacheMisses`** (taxa de acerto): poucos hits indicam TTL curto ou estratégia ruim;
+  - **conexões** (`CurrConnections`) e **lag de replicação**.
+- **Custo:**
+  - **nós:** por hora do tipo de nó. **Reserved nodes** de 1 ou 3 anos dão desconto, e o **data tiering** reduz o custo por GB;
+  - **Serverless:** por GB armazenado e por ECPU;
+  - **Valkey** é mais barato que Redis OSS e Memcached;
+  - transferência entre AZs e regiões (Global Datastore), e armazenamento de snapshots além do gratuito.
+- O ElastiCache costuma **reduzir o custo total**, porque permite usar um **banco menor** e menos réplicas de leitura.
+
+[↑ Índice](#índice)
+
+### ElastiCache vs. outras opções
+
+| Necessidade | Solução |
+|---|---|
+| Cache de consultas a **RDS/Aurora** ou de qualquer dado da aplicação, com controle total | **ElastiCache** |
+| Cache **transparente** para o **DynamoDB**, sem mudar a lógica de acesso (mesma API) | **DynamoDB Accelerator (DAX)** |
+| Banco **principal** em memória, compatível com Redis/Valkey, **durável** | **Amazon MemoryDB** |
+| Escalar leituras do banco **sem mudar o código** de cache, com dados sempre atualizados | **Read replicas** do RDS/Aurora |
+| Muitas **conexões** de Lambda ou aplicações ao RDS | **RDS Proxy** (pool de conexões, não cache) |
+| Cache de **conteúdo HTTP** perto do usuário | **CloudFront** |
+| Cache de respostas de uma **API REST** sem código | **Cache do API Gateway** (stage cache) |
+| Sessões **duráveis** e serverless | **DynamoDB** com TTL |
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Reduzir a **carga de leitura** do RDS/Aurora" e "a mesma consulta se repete muito" → **ElastiCache** (lazy loading). Se o cenário exige **não mudar o código** → **read replicas**.
+- "Aplicação **stateless**", "usuários perdem a sessão quando o Auto Scaling remove instâncias" → sessões no **ElastiCache** (ou DynamoDB), em vez de **sticky sessions**.
+- "**Ranking** em tempo real de um jogo" → **Valkey/Redis sorted sets**.
+- "Cache com **alta disponibilidade**, **replicação** e **backup**" → **Valkey/Redis** com **Multi-AZ**. "Cache simples, **multi-thread**, sem replicação" → **Memcached**.
+- "Dado no cache **desatualizado**" → **write-through** e/ou **TTL** menor. "Cache enche de dados que ninguém lê" → **lazy loading** + **TTL**.
+- "Muitas **evictions**" → aumentar a memória (nó maior ou mais **shards**). "Dataset maior que a memória de um nó" → **cluster mode enabled**.
+- "Dataset grande com poucos itens quentes, reduzir custo" → **data tiering** (r6gd).
+- "Cache com leituras locais em **várias regiões**" ou "DR do cache entre regiões" → **Global Datastore**.
+- "Capacidade imprevisível, **sem gerenciar nós**" → **ElastiCache Serverless**.
+- "Eliminar senhas da aplicação para acessar o Redis" → **autenticação IAM**. "Permissões por comando e por chave" → **RBAC**.
+- "Criptografar o cache" → **TLS** em trânsito + **KMS** em repouso.
+- "Banco principal compatível com Redis, **sem perder dados**" → **MemoryDB**, não ElastiCache.
+- "Cache para o **DynamoDB** sem mudar o código" → **DAX**, não ElastiCache.
+- "Reduzir custo do ElastiCache com uso estável" → **reserved nodes** e engine **Valkey**.
+
+[↑ Índice](#índice)
+
 ## Revisão: qual serviço usar
 
 Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas seções de cada serviço.
@@ -282,5 +473,20 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Logs em tempo real / testar mudança com parte do tráfego | [Real-time logs / continuous deployment](#monitoramento-e-implantação) |
 | Reduzir custo | [Price classes, cache hit ratio, flat-rate](#custo-do-cloudfront) |
 | CloudFront, Global Accelerator, CRR ou Transfer Acceleration? | [Comparação](#cloudfront-vs-outras-opções) |
+
+[↑ Índice](#índice)
+
+### Cache em memória (ElastiCache)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Reduzir a carga de leitura do banco / guardar sessões | [ElastiCache](#casos-de-uso) |
+| Redis/Valkey ou Memcached? | [Engines](#engines-valkey-redis-oss-e-memcached) |
+| Dado desatualizado / cache cheio de dados inúteis | [Write-through, lazy loading e TTL](#estratégias-de-cache) |
+| Alta disponibilidade / dataset maior que um nó / dados frios mais baratos | [Multi-AZ / cluster mode enabled / data tiering](#topologia-alta-disponibilidade-e-escala) |
+| Leituras locais e DR em várias regiões | [Global Datastore](#global-datastore) |
+| Acesso sem senha / permissões por comando | [IAM / RBAC](#segurança-do-elasticache) |
+| Banco em memória durável | [MemoryDB](#backup-e-persistência) |
+| ElastiCache, DAX, MemoryDB, read replicas ou RDS Proxy? | [Comparação](#elasticache-vs-outras-opções) |
 
 [↑ Índice](#índice)
