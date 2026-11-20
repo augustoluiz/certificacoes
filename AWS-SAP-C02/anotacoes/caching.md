@@ -7,20 +7,20 @@ servicos:
 criado-em: 2026-11-19
 atualizado-em: 2026-11-19
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
-tags: [sap-c02, caching, cdn, edge, in-memory]
+tags: [sap-c02, caching, cdn, edge, in-memory, scalability]
 ---
 
 # Caching
 
-> **Escopo:** _(em uma frase, o que este arquivo cobre)_
+> **Escopo:** cache na borda com o Amazon CloudFront (origens, cache key, segurança, edge functions) e cache em memória com o Amazon ElastiCache (Valkey, Redis OSS, Memcached), além de uma visão de onde cachear em cada camada de uma arquitetura e dos limites que exigem cache.
 >
-> **Por que cai na prova:** _(o ângulo que a SAP-C02 costuma explorar)_
+> **Por que cai na prova:** a SAP-C02 cobra arquiteturas que aguentam **picos e escala global** com **baixa latência** e **menor custo**: colocar o cache na **camada certa**, **proteger a origem** para que só o CloudFront a acesse, escolher entre **CloudFront Functions e Lambda@Edge**, reduzir a **carga do banco** com ElastiCache, DAX ou read replicas, e reconhecer quando um **limite de serviço** (API Gateway, Lambda, S3, KMS, DynamoDB) pede cache ou outra arquitetura.
 
 ## Índice
 
 - **Cache na borda (CDN):** [Amazon CloudFront](#amazon-cloudfront)
 - **Cache em memória:** [Amazon ElastiCache](#amazon-elasticache)
-- **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
+- **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar) · [Lidando com taxas extremas](#lidando-com-taxas-extremas)
 
 ## Amazon CloudFront
 
@@ -457,6 +457,22 @@ O cache só ajuda se a aplicação souber **o que guardar** e **por quanto tempo
 
 Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas seções de cada serviço.
 
+### Visão geral: onde cachear
+
+Uma requisição pode encontrar cache em várias camadas. Quanto **mais perto do usuário**, menor a latência e o custo, e mais requisições deixam de chegar ao backend. Quanto **mais perto do banco**, mais **atualizado** e **personalizado** é o dado guardado.
+
+| Camada | Cache | Quando usar |
+|---|---|---|
+| Cliente | Navegador ou app, controlado por `Cache-Control` e `ETag` | Arquivos estáticos que o próprio usuário repete |
+| DNS | TTL dos registros no **Route 53** | TTL alto reduz consultas; TTL baixo acelera failover |
+| Borda | **CloudFront** | Conteúdo estático e respostas de API iguais para muitos usuários |
+| API | **Cache do stage do API Gateway** (REST) | Respostas de API repetidas, sem escrever código |
+| Aplicação | Memória local da instância ou da função | Dados pequenos e quase fixos (configurações); cada instância tem sua cópia |
+| Cache compartilhado | **ElastiCache** | Consultas ao banco, sessões, rankings, contadores |
+| Banco | **DAX** (DynamoDB), **read replicas** (RDS/Aurora) | Escalar leituras sem lógica de cache na aplicação (DAX) ou com dados sempre atualizados (réplicas) |
+
+[↑ Índice](#índice)
+
 [↑ Índice](#índice)
 
 ### Cache na borda (CloudFront)
@@ -488,5 +504,31 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Acesso sem senha / permissões por comando | [IAM / RBAC](#segurança-do-elasticache) |
 | Banco em memória durável | [MemoryDB](#backup-e-persistência) |
 | ElastiCache, DAX, MemoryDB, read replicas ou RDS Proxy? | [Comparação](#elasticache-vs-outras-opções) |
+
+[↑ Índice](#índice)
+
+### Lidando com taxas extremas
+
+Quando o cenário fala em **milhões de usuários**, **picos repentinos** ou **centenas de milhares de requisições por segundo**, a pergunta é qual camada vai **saturar primeiro**. Cache e serviços que escalam sozinhos aliviam as camadas com limites.
+
+![Diagrama Caching - Cache em cada camada e limites](./img/caching/caching-01.png)
+
+| Camada | Limite ou comportamento (padrões, muitos ajustáveis) | Como aliviar |
+|---|---|---|
+| **CloudFront** | Centenas de milhares de requisições por segundo por distribuição | Já é a camada de maior capacidade: coloque-a na frente de tudo |
+| **API Gateway** | ~**10.000 req/s** por conta e região (burst de 5.000) | Cache do stage, CloudFront na frente, aumento de cota |
+| **Lambda** | **1.000 execuções simultâneas** por região | Aumento de cota, **reserved/provisioned concurrency**, fila (SQS) para absorver picos |
+| **EC2 / ECS com Auto Scaling** | Escala em **minutos** (boot e bootstrap) | Escalonamento preditivo ou agendado, warm pools, **Fargate** ou **Lambda** para picos rápidos |
+| **ElastiCache** | Escala com nós, réplicas e **shards** (ou Serverless) | Cluster mode enabled, réplicas de leitura |
+| **DAX** | Até **11 nós** (1 primário + 10 réplicas) | Nós maiores, mais réplicas |
+| **RDS / Aurora** | Capacidade **provisionada** (instância) | ElastiCache, read replicas, RDS Proxy para conexões, Aurora Serverless v2 |
+| **DynamoDB** | On-demand escala sozinho; **3.000 RCU / 1.000 WCU por partição** | Chaves de partição bem distribuídas, DAX para leituras quentes |
+| **S3** | **3.500 PUT** e **5.500 GET** por segundo **por prefixo** | Distribuir em vários prefixos, CloudFront para leituras |
+| **KMS** | Milhares de req/s por região (cota compartilhada) | **S3 Bucket Keys**, data key caching, aumento de cota |
+| **SQS** | Standard praticamente ilimitado; FIFO **300 msg/s** (3.000 com batch; mais no modo high throughput) | Standard quando a ordem não importa, batch, high throughput FIFO |
+| **Kinesis Data Streams** | **1 MB/s** (ou 1.000 registros/s) de entrada e **2 MB/s** de saída **por shard** | Mais shards, modo on-demand, enhanced fan-out |
+| **EBS / instance store** | gp3 com IOPS provisionadas; **io2 Block Express** para IOPS extremas; instance store com **milhões de IOPS** | Tipo de volume certo, RAID 0, instance store para dados temporários |
+
+> **Obs:** os números acima são **cotas padrão** e mudam com o tempo. Na prova, o que importa é reconhecer **qual camada é o gargalo** e a solução típica: **cache** (CloudFront, API Gateway, ElastiCache, DAX), **desacoplamento com filas** (SQS, Kinesis) ou um serviço que **escala sozinho** (Lambda, Fargate, DynamoDB on-demand).
 
 [↑ Índice](#índice)
