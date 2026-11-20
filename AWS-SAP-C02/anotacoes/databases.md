@@ -5,10 +5,12 @@ servicos:
   - Amazon DynamoDB
   - DynamoDB Accelerator (DAX)
   - Amazon OpenSearch Service
+  - Amazon RDS
+  - Amazon RDS Proxy
 criado-em: 2026-11-20
 atualizado-em: 2026-11-20
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
-tags: [sap-c02, databases, nosql, search]
+tags: [sap-c02, databases, nosql, search, relational]
 ---
 
 # Databases
@@ -21,6 +23,7 @@ tags: [sap-c02, databases, nosql, search]
 
 - **NoSQL:** [Amazon DynamoDB](#amazon-dynamodb)
 - **Busca e análise:** [Amazon OpenSearch Service](#amazon-opensearch-service)
+- **Relacional:** [Amazon RDS](#amazon-rds)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## Amazon DynamoDB
@@ -470,11 +473,235 @@ O **Elasticsearch** se tornou o motor de busca mais popular, e o **OpenSearch** 
 
 [↑ Índice](#índice)
 
+## Amazon RDS
+
+### Contexto: banco relacional gerenciado
+
+Um banco relacional em produção exige muito mais do que instalar o MySQL ou o PostgreSQL em um servidor. A equipe precisa cuidar de:
+
+- **hardware e sistema operacional**, com patches e atualizações de versão do banco;
+- **backups** diários, testes de restauração e retenção;
+- **alta disponibilidade**: uma réplica em outro data center, pronta para assumir em caso de falha;
+- **escala de leitura** com réplicas;
+- **monitoramento**, criptografia, controle de acesso.
+
+Rodar o banco em **EC2** dá controle total, mas deixa todo esse trabalho com você. O **Amazon RDS** (*Relational Database Service*) oferece os bancos relacionais mais usados como **serviço gerenciado**: você escolhe o engine, o tamanho da instância e o armazenamento, e a AWS cuida de provisionamento, patches, backups, failover e monitoramento. Você continua responsável pelo **schema**, pelas **consultas** e pelo **ajuste do banco**. Na prova, o RDS aparece em quase todo cenário de banco relacional: **alta disponibilidade**, **DR entre regiões**, **escala de leitura**, **criptografia**, **migração** e **conexões de Lambda**.
+
+[↑ Índice](#índice)
+
+### O que é o RDS
+
+- **Engines:** **PostgreSQL**, **MySQL**, **MariaDB**, **Oracle**, **SQL Server** e **IBM Db2**. O **Aurora** (MySQL e PostgreSQL compatível) também faz parte da família RDS, mas tem arquitetura própria.
+- **Instância de banco (DB instance):** uma classe de instância (ex: `db.r7g.large`) com armazenamento **EBS** anexado. Escala **verticalmente** trocando a classe (com breve indisponibilidade, ou sem, em Multi-AZ).
+- **Armazenamento:** **gp3** (uso geral) ou **io2 Block Express** (IOPS provisionadas, para cargas críticas). O **storage autoscaling** aumenta o disco automaticamente quando o espaço livre fica baixo, até um limite que você define.
+- **Na VPC:** a instância fica em um **DB subnet group** (subnets privadas, normalmente em várias AZs) e é protegida por **security groups**. A aplicação conecta pelo **endpoint DNS** da instância, não por IP.
+- **O que você não tem:** acesso **SSH** ao servidor nem ao sistema operacional, e alguns recursos que exigem privilégios de administrador do sistema.
+- **RDS Custom** (Oracle e SQL Server): RDS com **acesso ao sistema operacional** e ao banco como administrador, para aplicações legadas que exigem customizações (agentes, patches específicos, configurações do SO). A AWS ainda automatiza backups e monitoramento.
+- **Manutenção:** patches e upgrades de **versão menor** acontecem na **janela de manutenção** que você define. Upgrades de **versão maior** são manuais. Versões fora do suporte padrão entram no **RDS Extended Support**, cobrado à parte.
+
+[↑ Índice](#índice)
+
+### Alta disponibilidade: Multi-AZ
+
+- **Multi-AZ DB instance:**
+  - uma instância **standby** em **outra AZ**, com replicação **síncrona** do armazenamento;
+  - o standby **não atende leituras**: existe só para o **failover**;
+  - em uma falha (instância, AZ, rede, armazenamento) ou em manutenções, o RDS faz o **failover automático**: o **endpoint DNS** passa a apontar para o standby, normalmente em **1 a 2 minutos**;
+  - a aplicação só precisa **reconectar** (e não guardar o IP em cache);
+  - disponível para **todos os engines**. Converter uma instância Single-AZ para Multi-AZ é feito **sem parada**: o RDS tira um snapshot, cria o standby a partir dele e sincroniza.
+- **Multi-AZ DB cluster** (MySQL e PostgreSQL):
+  - **1 writer + 2 standbys legíveis**, em **3 AZs**;
+  - replicação **semissíncrona**: a escrita é confirmada quando pelo menos um standby a recebe;
+  - **failover mais rápido** (normalmente abaixo de 35 segundos) e standbys que **servem leituras** por um **reader endpoint**;
+  - usa armazenamento local mais rápido, com **menor latência de escrita** que o Multi-AZ instance.
+
+> **Obs:** o **Multi-AZ** resolve **disponibilidade** dentro da região, não **escala de leitura** (no modelo de instância) nem **DR entre regiões**. Para leitura, use **read replicas**. Para outra região, use **réplica cross-region**, **cópia de backups** ou o **Aurora Global Database**.
+
+[↑ Índice](#índice)
+
+### Read replicas
+
+- Cópias **somente leitura** da instância primária, atualizadas por replicação **assíncrona** (há **lag**, e as leituras são **eventualmente consistentes**).
+- Até **15 réplicas** (MySQL, MariaDB, PostgreSQL; Oracle e SQL Server têm limites menores), cada uma com **seu próprio endpoint**.
+- Podem estar na **mesma AZ**, em **outra AZ** ou em **outra região** (**cross-region**), e até ser **réplicas de réplicas** (MySQL, MariaDB).
+- Uma réplica pode ter **Multi-AZ** própria e pode ser **promovida** a um banco **independente**, que passa a aceitar escritas e deixa de replicar. Usos: **DR**, **migração** para outra região, separar um ambiente.
+- **Distribuir leituras entre réplicas:** como cada uma tem seu endpoint, a aplicação precisa escolher. Opções:
+  - um **registro ponderado no Route 53** com os endpoints das réplicas e **health checks**;
+  - um **RDS Proxy** com endpoint de leitura;
+  - no **Aurora**, o **reader endpoint** já faz isso.
+- **Custo de rede:** a replicação para réplicas **na mesma região** não tem custo de transferência. Para **outra região**, há cobrança de transferência entre regiões.
+- Usos típicos: **relatórios** e consultas analíticas sem pesar na primária, **leituras** de aplicações com muito acesso, réplica de **DR** em outra região.
+
+![Diagrama RDS - Multi-AZ instance, Multi-AZ cluster e read replicas](./img/amazon-rds/amazon-rds-02.png)
+
+| | **Multi-AZ instance** | **Multi-AZ cluster** | **Read replica** |
+|---|---|---|---|
+| Objetivo | **Alta disponibilidade** | Alta disponibilidade + leituras | **Escala de leitura**, DR |
+| Replicação | **Síncrona** | **Semissíncrona** | **Assíncrona** |
+| Atende leituras | Não | Sim (2 standbys) | Sim |
+| Failover | **Automático**, 1–2 min | **Automático**, < 35 s | **Manual** (promover) |
+| Outra região | Não | Não | **Sim** |
+
+[↑ Índice](#índice)
+
+### Backup, snapshots e recuperação
+
+- **Backups automáticos:**
+  - um **snapshot diário** na janela de backup, mais os **logs de transação** enviados ao S3 a cada **5 minutos**;
+  - **retenção de 1 a 35 dias** (0 desativa);
+  - permitem o **point-in-time recovery (PITR)**: restaurar para **qualquer segundo** dentro da retenção, com perda máxima de cerca de 5 minutos;
+  - são **apagados** junto com a instância, a menos que você os retenha.
+- **Snapshots manuais:** feitos por você a qualquer momento e mantidos **até você apagar**. Usados antes de mudanças arriscadas e para guardar a longo prazo.
+- **Toda restauração cria uma nova instância**, com **novo endpoint**. A aplicação precisa ser reapontada.
+- **Cópia entre regiões e contas:**
+  - **snapshots** podem ser **copiados** para outra região e **compartilhados** com outras contas;
+  - a **replicação de backups automáticos** copia snapshots e logs para outra região, permitindo **PITR na região de DR**;
+  - o **AWS Backup** centraliza os planos, a cópia entre regiões e contas e o **Vault Lock**.
+- **Compartilhar snapshots criptografados:** só funciona com uma **customer managed key** (KMS), com a key policy liberando a conta de destino. Snapshots com a chave `aws/rds` **não podem ser compartilhados**: é preciso **copiá-los** antes, trocando para uma CMK. Detalhes da chave em [AWS KMS](security.md#aws-key-management-service-kms).
+
+![Diagrama RDS - Compartilhar snapshot criptografado entre contas](./img/amazon-rds/amazon-rds-01.png)
+
+- **Backups nativos do engine:**
+  - **SQL Server:** backup e restore **nativos** (`.bak`) de e para o **S3**, útil para migrar;
+  - **MySQL:** importar um backup do **Percona XtraBackup** do S3 para criar uma instância;
+  - **Oracle:** no RDS, use os **backups do RDS**. O **RMAN** pode gerar backups para restaurar **fora** do RDS, mas não para restaurar **dentro** dele.
+- **Parar a instância:** é possível parar uma instância por até **7 dias** (paga só o armazenamento). Depois disso, ela **religa sozinha**. Para economizar por mais tempo, faça um **snapshot** e apague a instância.
+
+[↑ Índice](#índice)
+
+### Segurança do RDS
+
+- **Rede:** subnets **privadas** e **security groups** liberando só a aplicação (ou o security group dela) na porta do banco. A opção **publicly accessible** deve ficar desligada em produção.
+- **Criptografia em repouso** com **KMS**: cobre o armazenamento, os backups, os snapshots e as réplicas. É definida **na criação**. Para criptografar uma instância existente:
+  1. snapshot;
+  2. **cópia do snapshot com criptografia**;
+  3. restaurar uma nova instância a partir da cópia;
+  4. trocar o endpoint na aplicação.
+- **TDE (Transparent Data Encryption)** no **Oracle** e no **SQL Server**: criptografia feita pelo próprio banco.
+- **Em trânsito:** **TLS** em todos os engines. Pode ser **obrigatório** por parâmetro (ex: `rds.force_ssl` no PostgreSQL, `require_secure_transport` no MySQL).
+- **Autenticação:**
+  - **usuário e senha** do banco. A senha do usuário master pode ser **gerenciada pelo Secrets Manager** com **rotação automática** feita pelo próprio RDS. Ver [AWS Secrets Manager](security.md#aws-secrets-manager);
+  - **autenticação IAM** (MySQL, MariaDB, PostgreSQL): a aplicação pede ao RDS um **token** (assinado com **SigV4**, válido por **15 minutos**) e o usa como senha, **sempre com TLS**. Centraliza os acessos no IAM e permite usar a **role** da EC2 ou da Lambda. A **autorização** (o que o usuário pode fazer no banco) continua sendo feita **pelo banco** (`GRANT`);
+  - **Kerberos / Active Directory** (SQL Server, Oracle, MySQL, PostgreSQL) com o **AWS Managed Microsoft AD**.
+- **Auditoria:**
+  - o **CloudTrail** registra as **chamadas à API do RDS** (criar, modificar, apagar), **não as consultas SQL**;
+  - para auditar as consultas, use os **logs do engine** (audit log, pgAudit) enviados ao **CloudWatch Logs**, ou o **Database Activity Streams** (Oracle, SQL Server e Aurora), que envia a atividade para o **Kinesis** em tempo quase real, fora do controle dos DBAs;
+  - o **GuardDuty RDS Protection** detecta **logins anômalos**.
+
+[↑ Índice](#índice)
+
+### RDS Proxy
+
+- Um **proxy gerenciado** entre a aplicação e o banco, que mantém um **pool de conexões** e as **reutiliza**.
+- **Problema que resolve:** cada conexão a um banco relacional consome memória. Aplicações que abrem e fecham muitas conexões, especialmente **Lambda** (milhares de execuções simultâneas, cada uma com sua conexão), esgotam o limite e geram erros **"too many connections"**.
+- **Benefícios:**
+  - **pool de conexões** compartilhado, sem lógica de pool na aplicação;
+  - **failover até 66% mais rápido** e transparente: o proxy mantém as conexões dos clientes enquanto o banco troca de instância;
+  - **autenticação IAM** no proxy e **credenciais no Secrets Manager**: a aplicação não guarda senha;
+  - **endpoints de leitura** para as réplicas.
+- **Nunca é público:** fica na **VPC**. A Lambda precisa estar **na VPC** para usá-lo.
+- Funciona com **RDS** (MySQL, MariaDB, PostgreSQL, SQL Server) e **Aurora**.
+
+![Diagrama RDS - RDS Proxy](./img/amazon-rds/amazon-rds-04.png)
+
+[↑ Índice](#índice)
+
+### DR entre regiões
+
+| Estratégia | RPO | RTO | Custo |
+|---|---|---|---|
+| **Cópia de snapshots** para outra região (manual, AWS Backup, DLM) | Horas (intervalo entre cópias) | Horas (restaurar) | Baixo |
+| **Replicação de backups automáticos** para outra região | **Minutos** (PITR na região de DR) | Restaurar a instância | Baixo |
+| **Read replica cross-region** + promoção | **Segundos** a minutos (lag) | **Minutos** (promover + DNS) | Instância extra |
+| **Aurora Global Database** | ~1 segundo | **Minutos**, failover gerenciado | Maior |
+
+**Automatizando o failover com uma read replica cross-region:**
+
+1. Um **health check do Route 53** chama uma rota da aplicação que testa o banco (ex: `/health-db`), ou monitora um **alarme do CloudWatch**.
+2. Quando o check falha, um **alarme do CloudWatch** dispara uma regra do **EventBridge** (ou um tópico SNS).
+3. Uma **Lambda** **promove a réplica** (`promote-read-replica`) e **atualiza o DNS** no Route 53 para o novo endpoint.
+
+![Diagrama RDS - DR entre regiões com read replica](./img/amazon-rds/amazon-rds-03.png)
+
+> **Obs:** depois de promovida, a réplica é um banco **independente**. A antiga primária **não** volta automaticamente: para retornar à região original, é preciso criar uma nova réplica no sentido inverso.
+
+[↑ Índice](#índice)
+
+### Migração e integração
+
+- **AWS DMS (Database Migration Service):** migra dados de bancos on-premises, EC2 ou outras nuvens para o RDS, com **carga completa + CDC** (captura de mudanças contínua), minimizando a parada. Com o **Schema Conversion Tool / DMS Schema Conversion**, também converte entre engines diferentes (ex: Oracle → PostgreSQL).
+- **Ferramentas nativas:**
+  - **MySQL/MariaDB:** `mysqldump` para exportar e importar, e **replicação por binlog** entre o RDS e um MySQL externo (on-premises ou EC2), em qualquer direção, para migrar com parada mínima;
+  - **PostgreSQL:** `pg_dump` / `pg_restore` e **replicação lógica**;
+  - **SQL Server:** backup nativo `.bak` via S3;
+  - **Oracle:** Data Pump, ou **DMS**.
+- **Oracle RAC** (*Real Application Clusters*) **não é suportado** no RDS. Para RAC, use **Oracle em EC2** (com gestão própria) ou o **Oracle Database@AWS**.
+- **Blue/green deployments:** o RDS cria um ambiente **green** (cópia sincronizada por replicação) onde você aplica upgrade de versão, mudança de parâmetros ou de schema. A **troca** (*switchover*) leva normalmente **menos de um minuto**, sem mudar o endpoint, com **rollback** simples. É a resposta para **upgrades com parada mínima**.
+- **Zero-ETL com o Redshift** (MySQL e PostgreSQL): replica os dados do RDS para o **Redshift** em quase tempo real, para análises, sem montar pipelines.
+- **Eventos do RDS:** notificações de failover, backup, manutenção e mudanças de configuração, entregues ao **EventBridge** e ao **SNS**.
+
+[↑ Índice](#índice)
+
+### Monitoramento e custo do RDS
+
+- **Monitoramento:**
+  - **CloudWatch:** CPU, memória livre, IOPS, latência, `DatabaseConnections`, `FreeStorageSpace`, `ReplicaLag`;
+  - **Enhanced Monitoring:** métricas do **sistema operacional** (processos, memória, CPU por núcleo) com granularidade de até 1 segundo;
+  - **Performance Insights / CloudWatch Database Insights:** mostra as **consultas e esperas** que mais consomem o banco, para encontrar gargalos;
+  - **logs do engine** (erro, slow query, auditoria) exportados para o **CloudWatch Logs**.
+- **Custo:**
+  - horas de **instância** (dobradas em Multi-AZ instance, porque o standby é cobrado);
+  - **armazenamento** e IOPS provisionadas;
+  - **backups** acima do tamanho do banco, snapshots manuais e cópias entre regiões;
+  - transferência de dados entre regiões;
+  - **Extended Support** para versões antigas.
+- **Reduzir custo:**
+  - **Reserved Instances** de 1 ou 3 anos para bancos estáveis;
+  - instâncias **Graviton** (`db.r7g`, `db.m7g`);
+  - **gp3** em vez de io2 quando as IOPS permitirem;
+  - **parar** instâncias de desenvolvimento fora do horário (até 7 dias seguidos);
+  - **rightsizing** com o Compute Optimizer e o Performance Insights;
+  - **ElastiCache** ou read replicas antes de aumentar a primária.
+
+[↑ Índice](#índice)
+
+### RDS vs. outras opções
+
+| Necessidade | Solução |
+|---|---|
+| Banco relacional gerenciado, engine comum, operação mínima | **RDS** |
+| MySQL/PostgreSQL com mais desempenho, failover rápido, até 15 réplicas com reader endpoint, Global Database | **Aurora** |
+| Acesso ao **SO**, customizações, Oracle/SQL Server legados | **RDS Custom** |
+| **Oracle RAC** ou controle total do banco e do SO | **EC2** (ou Oracle Database@AWS) |
+| Escala massiva chave-valor, serverless, sem joins | **DynamoDB** |
+| Reduzir carga de leitura repetida | **ElastiCache** na frente do RDS |
+| Muitas conexões (Lambda) | **RDS Proxy** |
+| Análises e BI sobre os dados do RDS | **Zero-ETL para o Redshift**, ou export para o S3 + Athena |
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "**Alta disponibilidade** do banco com failover automático" → **Multi-AZ**. "Failover em **segundos** e standbys que servem leitura" → **Multi-AZ DB cluster** (ou **Aurora**).
+- "**Relatórios pesados** deixam a aplicação lenta" ou "escalar leituras" → **read replicas** (consistência eventual). Distribuir entre réplicas → **Route 53 ponderado** com health checks, ou **RDS Proxy**.
+- "DR em outra região com RPO de segundos" → **read replica cross-region** + promoção (automatizada com Route 53 health check, CloudWatch, EventBridge e Lambda). "RPO de minutos e menor custo" → **replicação de backups automáticos**.
+- "Restaurar o banco para **antes de um erro**" → **PITR** (cria uma **nova instância**, com novo endpoint).
+- "Criptografar um banco **existente**" → snapshot → **cópia criptografada** → restaurar.
+- "Compartilhar snapshot criptografado com outra conta" → **customer managed key** + key policy liberando a conta. Com `aws/rds`, copiar antes trocando a chave.
+- "Lambda gera **too many connections**" → **RDS Proxy** (Lambda na VPC).
+- "Acessar o banco **sem senha** na aplicação" → **autenticação IAM** (token de 15 min, TLS) ou **RDS Proxy** com IAM + Secrets Manager. "Rotacionar a senha do master" → **Secrets Manager** gerenciado pelo RDS.
+- "Auditar **as consultas** SQL" → logs do engine no CloudWatch Logs ou **Database Activity Streams**. O **CloudTrail** só vê as chamadas de API.
+- "**Upgrade de versão** com parada mínima e rollback" → **blue/green deployments**.
+- "Precisa de **Oracle RAC**" → **EC2**, não RDS. "Acesso ao **sistema operacional** do banco" → **RDS Custom**.
+- "Migrar com **parada mínima**" → **DMS** (carga completa + CDC) ou replicação nativa (binlog do MySQL).
+- "Banco de dev parado à noite e nos fins de semana" → **parar a instância** (religa após 7 dias) ou **snapshot + apagar**.
+- "Disco do banco enchendo sem intervenção" → **storage autoscaling**.
+
+[↑ Índice](#índice)
+
 ## Revisão: qual serviço usar
 
 Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas seções de cada serviço.
-
-[↑ Índice](#índice)
 
 ### NoSQL (DynamoDB)
 
@@ -506,5 +733,22 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Acesso privado / permissões por índice e campo / login SAML | [VPC / fine-grained access control / SAML](#segurança-do-opensearch) |
 | DR em outra região / cluster red | [Cross-cluster replication, snapshots / monitoramento](#backup-replicação-e-monitoramento) |
 | OpenSearch, CloudWatch Logs Insights, Athena ou Redshift? | [Comparação](#opensearch-vs-outras-opções) |
+
+[↑ Índice](#índice)
+
+### Relacional (RDS)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Alta disponibilidade com failover automático / failover em segundos | [Multi-AZ instance / Multi-AZ cluster](#alta-disponibilidade-multi-az) |
+| Escalar leituras / relatórios pesados | [Read replicas](#read-replicas) |
+| Voltar para antes de um erro / snapshot criptografado para outra conta | [PITR / CMK + cópia](#backup-snapshots-e-recuperação) |
+| Criptografar banco existente / acesso sem senha / auditar consultas | [Snapshot + cópia / IAM auth / Activity Streams](#segurança-do-rds) |
+| Too many connections com Lambda | [RDS Proxy](#rds-proxy) |
+| DR em outra região: RPO de segundos vs. minutos | [Read replica cross-region vs. backups replicados](#dr-entre-regiões) |
+| Migrar com parada mínima / upgrade com rollback / Oracle RAC | [DMS / blue/green / EC2](#migração-e-integração) |
+| RDS, Aurora, RDS Custom, EC2 ou DynamoDB? | [Comparação](#rds-vs-outras-opções) |
+
+[↑ Índice](#índice)
 
 [↑ Índice](#índice)
