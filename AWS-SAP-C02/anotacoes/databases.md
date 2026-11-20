@@ -4,10 +4,11 @@ certificacao: AWS Certified Solutions Architect - Professional (SAP-C02)
 servicos:
   - Amazon DynamoDB
   - DynamoDB Accelerator (DAX)
+  - Amazon OpenSearch Service
 criado-em: 2026-11-20
 atualizado-em: 2026-11-20
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
-tags: [sap-c02, databases, nosql]
+tags: [sap-c02, databases, nosql, search]
 ---
 
 # Databases
@@ -19,6 +20,7 @@ tags: [sap-c02, databases, nosql]
 ## Índice
 
 - **NoSQL:** [Amazon DynamoDB](#amazon-dynamodb)
+- **Busca e análise:** [Amazon OpenSearch Service](#amazon-opensearch-service)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## Amazon DynamoDB
@@ -291,6 +293,183 @@ Na tabela, só é possível consultar pela **chave primária**. Para consultar p
 
 [↑ Índice](#índice)
 
+## Amazon OpenSearch Service
+
+### Contexto: busca e análise de texto
+
+Bancos relacionais e o DynamoDB são ótimos para buscar **pela chave** ou por filtros exatos, mas não para perguntas como:
+
+- "produtos cujo nome ou descrição **contém** 'tênis corrida', ordenados por **relevância**, tolerando erros de digitação";
+- "quantos erros **500** houve nos logs da última hora, agrupados por serviço";
+- "os 10 documentos **mais parecidos** com esta pergunta" (busca semântica).
+
+Um `LIKE '%tenis%'` em SQL varre a tabela inteira e não sabe ordenar por relevância. Os **motores de busca** resolvem isso com um **índice invertido**: para cada palavra, uma lista dos documentos que a contêm, já com o peso de cada ocorrência. Assim, buscas textuais e agregações sobre bilhões de documentos respondem em milissegundos.
+
+O **Elasticsearch** se tornou o motor de busca mais popular, e o **OpenSearch** é o seu **fork open source**, mantido pela AWS e pela comunidade depois que o Elasticsearch mudou de licença. O **Amazon OpenSearch Service** é a versão **gerenciada** (o antigo "Amazon Elasticsearch Service"). Na prova, ele é a resposta para **busca textual**, **análise de logs** e **observabilidade**, e cada vez mais para **busca vetorial**.
+
+[↑ Índice](#índice)
+
+### O que é o OpenSearch Service
+
+- **Motor de busca e análise** gerenciado, compatível com **OpenSearch** e com versões legadas do **Elasticsearch** (até 7.10).
+- **Componentes:**
+  - **OpenSearch:** guarda e indexa **documentos JSON** em **índices**, divididos em **shards** distribuídos pelos nós;
+  - **OpenSearch Dashboards** (antigo Kibana): visualizações, buscas interativas, alertas e relatórios;
+  - **ingestão:** **OpenSearch Ingestion** (pipelines gerenciados), **Data Firehose**, **Logstash**, **Fluent Bit**, Lambda.
+- **Duas formas de uso:**
+  - **domínios gerenciados:** você escolhe os **nós** (tipo, quantidade, armazenamento) e a AWS cuida da operação;
+  - **OpenSearch Serverless:** **coleções** que escalam sozinhas, sem nós para dimensionar.
+- **Casos de uso:**
+  - **busca textual** em sites e aplicações (catálogo, documentos, autocomplete);
+  - **análise de logs** e **observabilidade** (logs, métricas, traces);
+  - **análise de segurança** (SIEM);
+  - **clickstream** e análise em tempo real;
+  - **busca vetorial** (k-NN) para **busca semântica**, recomendações e **RAG** com IA generativa.
+- **Não é banco principal:** não tem transações nem garantias de consistência como um banco. O padrão é manter a **fonte da verdade** no DynamoDB, RDS ou S3 e **indexar uma cópia** no OpenSearch para busca.
+
+[↑ Índice](#índice)
+
+### Domínios gerenciados: arquitetura e escala
+
+- **Data nodes:** guardam os shards e executam indexação e buscas. Escalam **horizontalmente** (mais nós) ou verticalmente.
+- **Dedicated cluster manager nodes** (antigos *master nodes*): coordenam o cluster (estado, criação de índices, distribuição de shards), sem guardar dados. Recomendados em produção: **3**, em AZs diferentes, para evitar *split brain*.
+- **Shards e réplicas:** cada índice é dividido em **shards primários**, e cada primário pode ter **réplicas** em outros nós. As réplicas dão **alta disponibilidade** e mais capacidade de **leitura**.
+- **Multi-AZ:**
+  - **2 ou 3 AZs**, com as réplicas distribuídas entre elas;
+  - **Multi-AZ with Standby:** 3 AZs, uma delas em **standby**, pronta para assumir se outra falhar, com SLA de **99,99%**. É a configuração recomendada para produção crítica.
+- **Camadas de armazenamento:**
+  - **hot:** data nodes com EBS/SSD. Indexação e buscas rápidas, para dados **recentes**;
+  - **UltraWarm:** dados no **S3** com cache nos nós. **Só leitura**, custo **bem menor**, para dados **mais antigos** ainda consultados;
+  - **cold:** índices **desanexados**, guardados só no S3. Custo mínimo; precisam ser **reanexados** ao UltraWarm para consulta.
+- **Index State Management (ISM):** políticas que **movem** índices entre as camadas e os **apagam** por idade ou tamanho. Ex: logs ficam 7 dias em hot, 90 em UltraWarm, 1 ano em cold, e depois são apagados.
+- **Instâncias OR1/OR2:** guardam os dados de forma durável no **S3** e reduzem o custo de cargas com muita indexação (logs).
+- **Mudanças de configuração** (tipo de nó, versão) usam **blue/green**: a AWS cria um novo conjunto de nós e migra os dados, sem indisponibilidade.
+
+![Diagrama OpenSearch - Domínio e camadas de armazenamento](./img/amazon-opensearch/amazon-opensearch-01.png)
+
+> **Obs:** a forma de reduzir o custo de **logs** no OpenSearch é a mesma ideia do lifecycle do S3: dados recentes em **hot**, antigos em **UltraWarm** e **cold**, com o **ISM** automatizando a passagem e a exclusão.
+
+[↑ Índice](#índice)
+
+### OpenSearch Serverless
+
+- Em vez de nós, você cria **coleções** de um tipo:
+  - **search:** busca textual em aplicações;
+  - **time series:** logs e métricas;
+  - **vector search:** embeddings para busca semântica e RAG. É o armazenamento vetorial padrão das **Bedrock Knowledge Bases**.
+- A capacidade é medida em **OCUs** (OpenSearch Compute Units), separadas para **indexação** e **busca**, e escala **automaticamente**. Os dados ficam no **S3**.
+- Não há nós, versões, shards ou camadas para gerenciar.
+- **Quando usar:**
+  - carga **variável** ou **imprevisível**;
+  - times que querem **menos operação**;
+  - busca vetorial para IA generativa.
+- **Quando preferir domínios gerenciados:** carga **estável e grande** (custo menor com reserved instances), necessidade de **plugins** específicos, UltraWarm/cold, ou controle fino de configuração.
+
+| | **Domínio gerenciado** | **Serverless** |
+|---|---|---|
+| Capacidade | Nós escolhidos por você | **OCUs** que escalam sozinhas |
+| Operação | Dimensionar nós, shards, camadas | Mínima |
+| Custo | Por hora de instância + EBS (reserved instances disponíveis) | Por OCU-hora + armazenamento no S3 |
+| Ideal para | Cargas grandes e estáveis, controle fino | Cargas variáveis, vector search, menos operação |
+
+[↑ Índice](#índice)
+
+### Ingestão e padrões de arquitetura
+
+- **Busca sobre o DynamoDB:** **DynamoDB Streams → Lambda → OpenSearch**. A aplicação **busca no OpenSearch**, recebe os IDs e **lê os itens completos no DynamoDB**, que continua a fonte da verdade. Hoje, a forma sem código é a integração **zero-ETL** DynamoDB → OpenSearch, via OpenSearch Ingestion.
+- **Logs do CloudWatch no OpenSearch:** um **subscription filter** no log group envia os eventos:
+  - para uma **Lambda gerenciada pela AWS**, em **tempo real**;
+  - ou para o **Data Firehose**, em **quase tempo real** (com buffer, menos chamadas e **backup no S3**).
+- **OpenSearch Ingestion:** pipelines **serverless** (baseados no Data Prepper) que recebem dados de **S3**, **Kinesis**, **MSK**, **HTTP**, **OpenTelemetry** e **Fluent Bit**, e **filtram, enriquecem e transformam** os dados antes de indexar. Substitui o Logstash autogerenciado.
+- **Data Firehose:** entrega streams (inclusive do Kinesis Data Streams) para o OpenSearch, com buffer e backup no S3.
+- **Logstash e Fluent Bit:** agentes de coleta de logs. O Logstash em EC2 é a opção **autogerenciada**, em que você decide retenção e formato.
+- **Consultas diretas (direct query):** o OpenSearch consulta dados que ficam no **S3**, no **CloudWatch Logs** ou no **Security Lake** **sem copiá-los** para o cluster, útil para dados frios e investigações pontuais.
+- **Aplicações relacionais:** **RDS/Aurora** → captura de mudanças (DMS, ou Debezium + MSK) → OpenSearch, para busca textual em dados relacionais.
+
+![Diagrama OpenSearch - Padrões de ingestão](./img/amazon-opensearch/amazon-opensearch-02.png)
+
+[↑ Índice](#índice)
+
+### Segurança do OpenSearch
+
+- **Rede:** o domínio é criado **na VPC** (endpoint privado, com **security groups**) ou com **endpoint público**. A escolha é feita **na criação** e **não pode ser alterada**. Para produção, use a **VPC**.
+- **Políticas de acesso:**
+  - **resource-based policy** do domínio: quais principals IAM (ou IPs, no endpoint público) podem acessar;
+  - **identity-based policies** no IAM.
+- **Fine-grained access control:** usuários e **roles internos** com permissões por **índice**, **documento** e **campo**. Ex: o time de vendas só vê o índice de pedidos e sem o campo de CPF.
+- **Login nos Dashboards:** **SAML** (Okta, Entra ID, Identity Center), **Amazon Cognito** ou usuários internos.
+- **Criptografia:**
+  - **em repouso** com KMS (definida na criação);
+  - **node-to-node encryption** (TLS entre os nós);
+  - **HTTPS obrigatório** para os clientes.
+- **Auditoria:** **audit logs** (quem acessou o quê) enviados ao **CloudWatch Logs**, e chamadas de configuração no **CloudTrail**.
+
+[↑ Índice](#índice)
+
+### Backup, replicação e monitoramento
+
+- **Snapshots automáticos:** a cada hora, guardados pela AWS por **14 dias**, para recuperar o domínio.
+- **Snapshots manuais:** gravados em um **bucket S3 seu**. Servem para **migrar** entre domínios, **restaurar em outra região ou conta** e guardar por mais tempo.
+- **Cross-cluster replication:** replica índices de um domínio **líder** para um domínio **seguidor** (ativo-passivo), inclusive em **outra região**. É usado para **DR** e para leituras com baixa latência em outras regiões.
+- **Cross-cluster search:** uma busca consulta **vários domínios** de uma vez (ex: um domínio por região ou por unidade de negócio).
+- **Monitoramento:**
+  - métricas no **CloudWatch**: `ClusterStatus.red/yellow`, `FreeStorageSpace`, `JVMMemoryPressure`, CPU, latência de indexação e busca, `ThreadpoolWriteRejected`;
+  - **slow logs**, **error logs** e **audit logs** no CloudWatch Logs;
+  - **alertas** do próprio OpenSearch (alerting plugin) e **anomaly detection**.
+- **Status do cluster:**
+  - **red:** algum shard **primário** não está alocado; há dados indisponíveis;
+  - **yellow:** algum shard de **réplica** não está alocado (comum em domínios com um só nó).
+
+[↑ Índice](#índice)
+
+### Custo do OpenSearch
+
+- **Domínios gerenciados:** horas de **instância** (data nodes e cluster managers), **armazenamento EBS**, **UltraWarm** e **cold** (por GB no S3), transferência de dados. **Reserved instances** de 1 ou 3 anos dão desconto.
+- **Serverless:** **OCU-horas** de indexação e busca + armazenamento no S3.
+- **Reduzir custo:**
+  - camadas **UltraWarm** e **cold** com **ISM** para dados antigos;
+  - instâncias **OR1/OR2** ou **Graviton**;
+  - **reserved instances** para cargas estáveis;
+  - apagar ou reduzir **réplicas** de índices pouco críticos;
+  - **direct query** em vez de indexar dados raramente consultados;
+  - dimensionar **shards** corretamente (shards demais desperdiçam memória).
+
+[↑ Índice](#índice)
+
+### OpenSearch vs. outras opções
+
+| Necessidade | Solução |
+|---|---|
+| **Busca textual** com relevância, autocomplete, filtros por vários campos | **OpenSearch** |
+| **Análise e visualização de logs** com dashboards ricos, retenção e consultas flexíveis | **OpenSearch** (com UltraWarm/cold) |
+| Logs de aplicações AWS com o **menor esforço**, consultas pontuais | **CloudWatch Logs + Logs Insights** |
+| Consultar logs ou dados no **S3** com SQL, sem cluster | **Athena** |
+| Data warehouse, **BI** e SQL analítico em grandes volumes estruturados | **Redshift** |
+| Busca pela **chave** com latência baixa e escala massiva | **DynamoDB** |
+| Banco transacional com SQL | **RDS / Aurora** |
+| **Busca vetorial** para RAG | **OpenSearch Serverless** (vector), ou **Aurora PostgreSQL com pgvector**, **S3 Vectors** |
+| SIEM e análise de segurança centralizada | **OpenSearch** (Security Analytics) ou **Security Lake** + ferramentas de análise |
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "**Busca textual**", "pesquisar por qualquer campo", "busca parcial ou por relevância" → **OpenSearch**.
+- "Pesquisar itens do **DynamoDB** por vários atributos ou texto" → **DynamoDB Streams + Lambda → OpenSearch** (ou **zero-ETL**), com o DynamoDB como fonte da verdade.
+- "Enviar logs do **CloudWatch Logs** para o OpenSearch" → **subscription filter**: **Lambda** (tempo real) ou **Data Firehose** (quase tempo real, com backup no S3).
+- "Ingestão de logs **sem gerenciar Logstash**" → **OpenSearch Ingestion**.
+- "Dashboards de logs mais ricos que o CloudWatch" → **OpenSearch Dashboards**.
+- "Reduzir custo de logs antigos no OpenSearch" → **UltraWarm** e **cold storage** com **ISM**.
+- "Alta disponibilidade do domínio" → **Multi-AZ** (de preferência **with Standby**, 3 AZs) + **3 dedicated cluster manager nodes** + réplicas.
+- "Domínio acessível só de dentro da AWS" → domínio **na VPC** (escolhido na criação, não muda depois).
+- "Permissões por **índice, documento ou campo**" → **fine-grained access control**. "Login nos Dashboards com o IdP corporativo" → **SAML**.
+- "DR do OpenSearch em outra região" → **cross-cluster replication** (ou snapshots manuais no S3 copiados para a outra região).
+- "Busca sem dimensionar nós" ou "**vector store** para Bedrock/RAG" → **OpenSearch Serverless**.
+- "Cluster **red**" → shard primário sem alocação (falta de espaço, nó perdido). "**JVMMemoryPressure** alta" → nós maiores ou menos shards.
+- "Consultar logs no S3 sem indexar" → **Athena** ou **direct query** do OpenSearch.
+
+[↑ Índice](#índice)
+
 ## Revisão: qual serviço usar
 
 Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas seções de cada serviço.
@@ -313,5 +492,19 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Leituras em microssegundos sem mudar o código | [DAX](#dynamodb-accelerator-dax) |
 | Cada usuário só acessa seus itens / acesso privado | [LeadingKeys / VPC endpoints](#segurança-do-dynamodb) |
 | DynamoDB, RDS, DocumentDB, Keyspaces ou OpenSearch? | [Comparação](#dynamodb-vs-outras-opções) |
+
+[↑ Índice](#índice)
+
+### Busca e análise (OpenSearch)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Busca textual, relevância, filtros por vários campos | [OpenSearch](#o-que-é-o-opensearch-service) |
+| Alta disponibilidade / custo de logs antigos | [Multi-AZ with Standby / UltraWarm, cold e ISM](#domínios-gerenciados-arquitetura-e-escala) |
+| Sem dimensionar nós / vector store para RAG | [OpenSearch Serverless](#opensearch-serverless) |
+| Buscar itens do DynamoDB / logs do CloudWatch no OpenSearch | [Streams + Lambda, zero-ETL / subscription filter](#ingestão-e-padrões-de-arquitetura) |
+| Acesso privado / permissões por índice e campo / login SAML | [VPC / fine-grained access control / SAML](#segurança-do-opensearch) |
+| DR em outra região / cluster red | [Cross-cluster replication, snapshots / monitoramento](#backup-replicação-e-monitoramento) |
+| OpenSearch, CloudWatch Logs Insights, Athena ou Redshift? | [Comparação](#opensearch-vs-outras-opções) |
 
 [↑ Índice](#índice)
