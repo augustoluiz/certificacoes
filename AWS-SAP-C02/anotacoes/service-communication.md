@@ -6,10 +6,11 @@ servicos:
   - Amazon SQS
   - Amazon MQ
   - Amazon SNS
+  - Amazon EventBridge
 criado-em: 2026-11-21
 atualizado-em: 2026-11-21
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
-tags: [sap-c02, service-communication, orchestration, workflow, serverless, messaging, queue, decoupling, message-broker, pub-sub, notifications]
+tags: [sap-c02, service-communication, orchestration, workflow, serverless, messaging, queue, decoupling, message-broker, pub-sub, notifications, event-driven]
 ---
 
 # Service Communication
@@ -22,6 +23,7 @@ tags: [sap-c02, service-communication, orchestration, workflow, serverless, mess
 
 - **Orquestração:** [AWS Step Functions](#aws-step-functions)
 - **Mensageria:** [Amazon SQS](#amazon-sqs) · [Amazon MQ](#amazon-mq) · [Amazon SNS](#amazon-sns)
+- **Eventos:** [Amazon EventBridge](#amazon-eventbridge)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## AWS Step Functions
@@ -726,6 +728,209 @@ Exemplo de filter policy que recebe só pedidos **criados** acima de **1.000**:
 
 [↑ Índice](#índice)
 
+## Amazon EventBridge
+
+### Contexto: eventos e barramentos de eventos
+
+As seções anteriores usaram **mensagens** (SQS) e **notificações** (SNS). Um **evento** é um tipo específico de mensagem, e vale distinguir os três conceitos:
+
+- **Comando:** um pedido para **fazer algo**, dirigido a um destinatário conhecido ("processe este pagamento"). Quem envia espera que **alguém** execute.
+- **Evento:** o registro de que **algo aconteceu**, no passado ("pagamento aprovado", "instância parada", "arquivo enviado"). Quem publica **não sabe nem se importa** com quem vai reagir. Zero, um ou dez sistemas podem se interessar.
+- **Mensagem:** o envelope que transporta comandos ou eventos.
+
+Outros conceitos por trás do serviço:
+
+- **Barramento de eventos (*event bus*):** um canal central onde produtores publicam eventos e de onde os consumidores recebem os que interessam. Ele funciona como um **roteador**: o produtor publica no barramento, e **regras** decidem para onde cada evento vai.
+- **Roteamento por conteúdo (*content-based routing*):** o destino de um evento é decidido pelo **conteúdo** dele (ex: "eventos de pedidos com valor acima de 1.000 vindos do Brasil"), e não por um nome de fila ou tópico escolhido pelo produtor.
+- **Contrato de eventos (*schema*):** como produtores e consumidores não se conhecem, o **formato** do evento é o único acordo entre eles. Mudar um campo pode quebrar consumidores que o produtor nem conhece. Por isso, *schemas* versionados e documentados são importantes.
+- **Integração de SaaS:** sistemas externos (Salesforce, Zendesk, Datadog, Shopify) também geram eventos de negócio ("ticket criado", "pagamento recebido") que a sua aplicação quer consumir sem precisar fazer polling nas APIs deles.
+
+O **Amazon EventBridge** (antes chamado **CloudWatch Events**) é o **barramento de eventos serverless** da AWS. Ele recebe eventos de **mais de 200 serviços da AWS**, de **parceiros SaaS** e das **suas aplicações**, e os roteia por **regras** para dezenas de tipos de alvo. Na prova, ele aparece em cenários de **reagir a mudanças na conta** (uma instância parou, uma chamada de API sensível aconteceu), **automação e remediação**, **agendamento** (cron), **centralizar eventos de várias contas**, **integração com SaaS** e **arquiteturas orientadas a eventos** entre microsserviços.
+
+[↑ Índice](#índice)
+
+### O que é o EventBridge
+
+- **Event bus:** o barramento que recebe os eventos. Há três tipos:
+  - **default:** já existe em cada conta e região e recebe os eventos dos **serviços da AWS**;
+  - **partner:** recebe eventos de **parceiros SaaS** integrados (Zendesk, Datadog, PagerDuty, Auth0, Shopify...);
+  - **custom:** criado por você para os eventos das **suas aplicações**, publicados com `PutEvents`.
+- **Evento:** um JSON com um envelope padrão. Os campos `source` e `detail-type` identificam o tipo do evento, e `detail` traz os dados específicos.
+
+```json
+{
+  "version": "0",
+  "id": "6a7e8feb-b491-4cf7-a9f1-bf3703467718",
+  "detail-type": "EC2 Instance State-change Notification",
+  "source": "aws.ec2",
+  "account": "111122223333",
+  "time": "2026-11-21T12:00:00Z",
+  "region": "us-east-1",
+  "resources": ["arn:aws:ec2:us-east-1:111122223333:instance/i-0abc123"],
+  "detail": { "instance-id": "i-0abc123", "state": "stopped" }
+}
+```
+
+- **Regras:** cada regra tem um **event pattern** (quais eventos casam) ou uma **agenda** (cron/rate) e até **5 alvos**. Um mesmo evento pode casar com **várias regras**, e cada uma entrega aos seus alvos.
+- **Alvos:**
+  - **computação:** Lambda, Step Functions, tasks do ECS, jobs do Batch;
+  - **integração:** SQS, SNS, Kinesis Data Streams, Data Firehose;
+  - **operação:** SSM Automation e Run Command, ações do EC2 (parar, reiniciar, snapshot), CodePipeline, CodeBuild;
+  - **externos:** **API destinations** (qualquer API HTTP) e event buses em **outras contas ou regiões**.
+- **Input transformer:** ajusta o JSON entregue ao alvo, extraindo campos do evento e montando o payload que o alvo espera, sem uma Lambda intermediária.
+- **Entrega:** **at-least-once**, com **retries** por até **24 horas** (até 185 tentativas, configurável) e **DLQ** (fila SQS) **por alvo** para os eventos que não puderam ser entregues.
+- **Limites:** eventos de até **256 KB**. A vazão de `PutEvents` é de milhares de eventos por segundo por região (cota ajustável).
+
+![Diagrama EventBridge - Fontes, event buses, regras e alvos](./img/amazon-eventbridge/amazon-eventbridge-01.png)
+
+[↑ Índice](#índice)
+
+### Regras e event patterns
+
+Um **event pattern** é um JSON com a **mesma estrutura** do evento. Ele lista só os campos que importam e os valores aceitos. Exemplo de regra que casa quando uma instância EC2 é **parada ou encerrada** em produção:
+
+```json
+{
+  "source": ["aws.ec2"],
+  "detail-type": ["EC2 Instance State-change Notification"],
+  "detail": {
+    "state": ["stopped", "terminated"],
+    "instance-id": [{ "prefix": "i-" }]
+  }
+}
+```
+
+- **Operadores:**
+  - **valor exato** e listas (OU entre os valores);
+  - **prefixo** e **sufixo**;
+  - **anything-but** (qualquer valor exceto);
+  - **numérico** (`>`, `<=`, intervalos);
+  - **exists**, **endereço IP** (CIDR), **igualdade sem diferenciar maiúsculas** e **wildcard**;
+  - **`$or`** para combinar condições alternativas.
+- **Combinação:** campos diferentes se combinam com **E**.
+- **Sandbox:** o console permite testar um pattern contra um evento de exemplo antes de criar a regra.
+
+[↑ Índice](#índice)
+
+### Interceptando chamadas de API com o CloudTrail
+
+- O **CloudTrail** registra as chamadas de API da conta, e o EventBridge recebe essas chamadas como eventos do tipo **"AWS API Call via CloudTrail"**. Assim, uma regra pode reagir a **qualquer ação** feita na conta, mesmo em serviços que não emitem eventos próprios para aquela operação.
+- **Exemplos clássicos:**
+  - alertar quando alguém **apaga uma tabela** do DynamoDB (`DeleteTable`);
+  - detectar `AssumeRole` em uma **role sensível**;
+  - reagir a `AuthorizeSecurityGroupIngress` que **abre a porta 22** para `0.0.0.0/0` e **remover a regra** automaticamente com uma Lambda;
+  - avisar sobre o **login do usuário root** (evento "AWS Console Sign In via CloudTrail").
+- **Detalhes que caem:**
+  - eventos de **serviços globais** (IAM, STS, login no console) chegam ao EventBridge na região **us-east-1**. A regra precisa estar **lá**;
+  - chamadas **somente leitura** (`Get*`, `List*`, `Describe*`) **não** geram esses eventos;
+  - **data events** (ex: `GetObject` no S3, `Invoke` na Lambda) só chegam se uma **trail** tiver esses eventos habilitados.
+
+![Diagrama EventBridge - Interceptando chamadas de API via CloudTrail para alerta e remediação](./img/amazon-eventbridge/amazon-eventbridge-02.png)
+
+[↑ Índice](#índice)
+
+### Agendamento: regras agendadas e EventBridge Scheduler
+
+- **Regras agendadas:** uma regra com expressão **cron** ou **rate** (ex: `rate(1 hour)`, `cron(0 3 * * ? *)`) dispara os alvos periodicamente. É o "cron" serverless da AWS: substitui uma instância EC2 só para rodar scripts agendados.
+- **EventBridge Scheduler:** um serviço de agendamento mais completo, recomendado para casos novos:
+  - agendas **únicas** (*one-time*, "às 15h de amanhã") e recorrentes;
+  - **fuso horário** e horário de verão;
+  - **milhões de agendas** por conta;
+  - **janela flexível** (*flexible time window*), para espalhar as execuções e não sobrecarregar o destino;
+  - **retries** e **DLQ**;
+  - chama milhares de ações de API de **centenas de serviços** diretamente (*universal targets*), sem passar por um event bus.
+- **Uso típico do Scheduler:** um lembrete por cliente, expirar um recurso 30 dias depois de criado, desligar ambientes de desenvolvimento à noite.
+
+[↑ Índice](#índice)
+
+### Multi-conta e multi-região
+
+- **Resource-based policy do event bus:** controla **quem pode publicar** no barramento. Permite receber eventos de **outras contas** ou de **toda a organização**, com a condição `aws:PrincipalOrgID`.
+- **Barramento central:**
+  - **Como funciona:** cada conta da organização tem uma regra que envia os eventos relevantes (achados do GuardDuty e do Security Hub, chamadas de API sensíveis, mudanças do Config) para um **event bus central** em uma conta de **segurança ou auditoria**. Lá, as regras disparam alertas, remediação ou o envio a um SIEM.
+  - **Na prova:** é o padrão para "**agregar os eventos de todas as contas** da organização em uma conta e região".
+- **Cross-Region:** uma regra pode ter como alvo um event bus em **outra região**, para centralizar ou replicar eventos.
+- **Global endpoints:**
+  - **Como funcionam:** um endpoint que publica em um event bus **primário** e faz **failover automático** para uma **região secundária**, guiado por um health check do Route 53. A **replicação** de eventos entre as duas regiões pode ser ativada.
+  - **Na prova:** é a resposta para "event bus **resiliente a falha regional**".
+
+![Diagrama EventBridge - Barramento central multi-conta com resource-based policy](./img/amazon-eventbridge/amazon-eventbridge-03.png)
+
+[↑ Índice](#índice)
+
+### Archive, replay e schema registry
+
+- **Archive:** guarda os eventos publicados em um barramento, **todos** ou só os que casam com um **pattern**, por um período definido ou **indefinidamente**.
+- **Replay:** reenvia eventos arquivados de um intervalo de tempo para o barramento de origem, onde as regras os processam de novo. Usos típicos:
+  - **reprocessar** depois de corrigir um bug em um consumidor;
+  - **alimentar** um consumidor novo com o histórico;
+  - **testar** uma nova regra com eventos reais.
+- **Schema registry:**
+  - **schema discovery:** o EventBridge analisa os eventos de um barramento e **infere o schema** de cada tipo de evento;
+  - **registro:** os schemas ficam **versionados** e pesquisáveis, junto com os schemas de todos os eventos da AWS;
+  - **code bindings:** o registro gera classes em **Java, Python, TypeScript e Go**, para que o código saiba de antemão a estrutura dos eventos.
+
+[↑ Índice](#índice)
+
+### Pipes e API destinations
+
+- **EventBridge Pipes:** conecta **uma origem** a **um alvo**, ponto a ponto, sem código de cola (a "Lambda que só lê de uma fila e chama outro serviço").
+  - **Origens:** SQS, Kinesis Data Streams, DynamoDB Streams, Amazon MQ, MSK e Kafka autogerenciado.
+  - **Filtro:** um event pattern descarta os eventos que não interessam. Você **não paga** pelos descartados.
+  - **Enriquecimento** (opcional): busca dados extras antes de entregar, via Lambda, Step Functions Express, API Gateway ou API destination.
+  - **Alvos:** os mesmos tipos das regras (Step Functions, event bus, SQS, SNS, ECS, Batch, Firehose...).
+  - **Diferença para as regras:** uma regra processa eventos **publicados no barramento** (muitos para muitos). Um pipe **lê de uma origem que faz polling** (fila ou stream) e entrega a **um** alvo, preservando a **ordem** quando a origem é ordenada.
+- **API destinations:** permitem que uma regra ou um pipe chame **qualquer API HTTP** (SaaS ou sistema próprio) como alvo.
+  - A **connection** guarda a autenticação (API key, OAuth ou Basic) no **Secrets Manager**.
+  - Um **limite de invocações por segundo** protege a API de destino.
+- **Partner event sources:** integrações prontas em que o **SaaS publica eventos** no seu partner event bus, sem você precisar fazer polling ou expor webhooks.
+
+![Diagrama EventBridge - Pipes: origem, filtro, enriquecimento e alvo](./img/amazon-eventbridge/amazon-eventbridge-04.png)
+
+[↑ Índice](#índice)
+
+### Segurança do EventBridge
+
+- **Permissões para os alvos:** a regra usa uma **IAM role** para invocar alvos como Step Functions, Kinesis e ECS. Para Lambda, SNS e SQS, a permissão costuma ficar na **resource-based policy** do alvo, que deve permitir `events.amazonaws.com`, com a condição `aws:SourceArn` igual ao ARN da regra.
+- **Quem publica:** a **resource-based policy do event bus** controla quais contas e organizações podem publicar. Políticas IAM controlam `events:PutEvents` nas identidades.
+- **Criptografia:** eventos criptografados em repouso, com opção de **chave KMS gerenciada pelo cliente** em custom buses e archives.
+- **Rede:** **interface VPC endpoint** para publicar eventos a partir de subnets privadas.
+- **Auditoria:** as chamadas à API do EventBridge ficam no **CloudTrail**.
+
+[↑ Índice](#índice)
+
+### EventBridge vs. SNS
+
+| | **EventBridge** | **SNS** |
+|---|---|---|
+| Modelo | Barramento com **regras** (roteamento por conteúdo) | Tópico com **assinaturas** (fan-out) |
+| Filtragem | **Rica**, sobre qualquer campo do evento | Filter policy por assinatura |
+| Fontes | **Serviços da AWS** (nativamente), **SaaS** e apps | Apps e serviços que publicam no tópico |
+| Destinos | **Dezenas** de serviços, APIs HTTP, outras contas e regiões | SQS, Lambda, Firehose, HTTP/S, **e-mail, SMS, push** |
+| Escala de destinatários | Até 5 alvos por regra, centenas de regras por barramento | **Milhões** de assinaturas por tópico |
+| Extras | **Archive/replay**, **schema registry**, Pipes, Scheduler | Notificações a pessoas (A2P), FIFO |
+| Quando escolher | Reagir a **eventos da AWS** e de **SaaS**, roteamento complexo, integração entre microsserviços | **Fan-out** de alto volume, **notificações a pessoas** |
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Reagir a uma mudança em um recurso da AWS" (instância parou, build falhou, objeto criado) → **regra do EventBridge** no **default bus**.
+- "Ser alertado ou remediar quando alguém faz uma **chamada de API** específica" → **CloudTrail** + regra do EventBridge (**"AWS API Call via CloudTrail"**) → SNS ou Lambda.
+- "Alerta de **login do root**" ou "ação no **IAM**" → regra em **us-east-1**.
+- "Rodar uma tarefa **a cada hora** sem servidor" → **regra agendada** ou **EventBridge Scheduler**.
+- "Milhões de agendas **únicas**, com fuso horário" → **EventBridge Scheduler**.
+- "Agregar eventos de **todas as contas** da organização em uma conta central" → **event bus central** com **resource-based policy** (`aws:PrincipalOrgID`).
+- "Receber eventos de um **SaaS** (Zendesk, Datadog, Shopify) sem polling" → **partner event bus**.
+- "**Reprocessar** eventos depois de corrigir um bug" → **archive + replay**.
+- "Gerar código a partir do formato dos eventos" ou "descobrir a estrutura dos eventos" → **schema registry** (com schema discovery).
+- "Ligar uma fila SQS ou um stream a um alvo, com **filtro** e **enriquecimento**, **sem Lambda de cola**" → **EventBridge Pipes**.
+- "Enviar eventos para uma **API HTTP externa** com autenticação e limite de taxa" → **API destinations**.
+- "Event bus **resiliente a falha regional**" → **global endpoints**.
+- "Roteamento por **conteúdo** do evento entre microsserviços" → **EventBridge**; "fan-out para **milhões** de assinantes ou **SMS/e-mail**" → **SNS**.
+
+[↑ Índice](#índice)
+
 ## Revisão: qual serviço usar
 
 Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas seções de cada serviço.
@@ -786,5 +991,21 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Entregas falhando, endpoint fora do ar | [Retries e DLQ](#entrega-retries-e-dlq-do-sns) |
 | Cross-account, KMS, VPC endpoint, PII | [Segurança](#segurança-do-sns) |
 | SNS, SQS ou EventBridge? | [Comparação](#sns-vs-sqs-vs-eventbridge) |
+
+[↑ Índice](#índice)
+
+### Eventos (EventBridge)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Reagir a mudanças em recursos da AWS, eventos de SaaS ou das apps | [EventBridge](#o-que-é-o-eventbridge) |
+| Filtrar eventos por conteúdo | [Event patterns](#regras-e-event-patterns) |
+| Alertar ou remediar uma chamada de API (DeleteTable, root login) | [CloudTrail + EventBridge](#interceptando-chamadas-de-api-com-o-cloudtrail) |
+| Cron serverless, agendas únicas com fuso horário | [Scheduler](#agendamento-regras-agendadas-e-eventbridge-scheduler) |
+| Eventos de todas as contas em uma conta central, falha regional | [Multi-conta e multi-região](#multi-conta-e-multi-região) |
+| Reprocessar eventos, descobrir o formato dos eventos | [Archive, replay e schemas](#archive-replay-e-schema-registry) |
+| Fila/stream → alvo sem Lambda de cola, chamar API HTTP externa | [Pipes e API destinations](#pipes-e-api-destinations) |
+| Permissões dos alvos, KMS, VPC endpoint | [Segurança](#segurança-do-eventbridge) |
+| EventBridge ou SNS? | [Comparação](#eventbridge-vs-sns) |
 
 [↑ Índice](#índice)
