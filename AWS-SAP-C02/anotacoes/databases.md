@@ -34,6 +34,8 @@ tags: [sap-c02, databases, nosql, document, graph, time-series, in-memory, searc
 - **Relacional:** [Amazon RDS](#amazon-rds) · [Amazon Aurora](#amazon-aurora)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
+> **Mapa mental:** [visão geral dos temas no NotebookLM](https://notebooklm.link.google/UcSyOwuq56kK) (requer login no Google).
+
 ## Amazon DynamoDB
 
 ### Contexto: bancos relacionais e NoSQL
