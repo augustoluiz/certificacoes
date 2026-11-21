@@ -10,7 +10,7 @@ servicos:
 criado-em: 2026-11-21
 atualizado-em: 2026-11-21
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
-tags: [sap-c02, service-communication, orchestration, workflow, serverless, messaging, queue, decoupling, message-broker, pub-sub, notifications, event-driven]
+tags: [sap-c02, service-communication, orchestration, workflow, serverless, messaging, queue, decoupling, message-broker, pub-sub, notifications, event-driven, integration-patterns]
 ---
 
 # Service Communication
@@ -24,6 +24,7 @@ tags: [sap-c02, service-communication, orchestration, workflow, serverless, mess
 - **Orquestração:** [AWS Step Functions](#aws-step-functions)
 - **Mensageria:** [Amazon SQS](#amazon-sqs) · [Amazon MQ](#amazon-mq) · [Amazon SNS](#amazon-sns)
 - **Eventos:** [Amazon EventBridge](#amazon-eventbridge)
+- **Arquitetura:** [Padrões de integração](#padrões-de-integração)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## AWS Step Functions
@@ -931,6 +932,236 @@ Um **event pattern** é um JSON com a **mesma estrutura** do evento. Ele lista s
 
 [↑ Índice](#índice)
 
+## Padrões de integração
+
+### Contexto: estilos de integração e acoplamento
+
+As seções anteriores descreveram **serviços**. Esta seção olha para o problema de **arquitetura** que esses serviços resolvem: como fazer sistemas independentes trabalharem juntos sem que um dependa demais do outro. Esse problema é antigo e tem vocabulário próprio. O livro ***Enterprise Integration Patterns*** (Hohpe e Woolf, 2003) catalogou 65 padrões de mensageria que continuam sendo a linguagem comum da área. Os guias da AWS (*Prescriptive Guidance*, *Well-Architected*) descrevem como implementar esses padrões com os serviços gerenciados.
+
+O livro identifica **quatro estilos de integração**:
+
+| Estilo | Como funciona | Exemplo na AWS | Problema principal |
+|---|---|---|---|
+| **Transferência de arquivos** | Um sistema exporta um arquivo, o outro importa | S3, [Transfer Family](storage.md#aws-transfer-family), [DataSync](storage.md#aws-datasync) | Dados **atrasados** (lotes), formatos frágeis |
+| **Banco de dados compartilhado** | Vários sistemas leem e escrevem nas mesmas tabelas | Um RDS acessado por vários serviços | **Acoplamento** total ao schema: ninguém muda nada sem quebrar alguém |
+| **Chamada remota (RPC)** | Um sistema chama a API do outro e espera a resposta | API Gateway, ALB, AppSync, invocação síncrona da Lambda | **Acoplamento temporal**: os dois precisam estar no ar ao mesmo tempo |
+| **Mensageria** | Os sistemas trocam mensagens por um canal intermediário | SQS, SNS, EventBridge, Kinesis, Amazon MQ | Complexidade: consistência eventual, duplicatas, ordem |
+
+O critério para escolher entre eles é o **acoplamento**, que tem várias dimensões:
+
+- **Temporal:** os dois lados precisam estar disponíveis **ao mesmo tempo**?
+- **De localização:** o produtor precisa saber **quem** e **onde** está o consumidor?
+- **De formato:** uma mudança no formato dos dados **quebra** o outro lado?
+- **De tecnologia:** os dois lados precisam usar a mesma **plataforma ou protocolo**?
+
+Arquiteturas modernas combinam os estilos: **chamadas síncronas** onde o usuário espera uma resposta imediata, e **mensageria** para todo o resto. Na SAP-C02, quase toda questão de "**desacoplar**", "**aumentar a resiliência**" ou "**absorver picos**" é, no fundo, uma questão de trocar acoplamento síncrono por assíncrono com o padrão certo.
+
+[↑ Índice](#índice)
+
+### Síncrono vs. assíncrono
+
+| | **Síncrono** (request/response) | **Assíncrono** (mensagens e eventos) |
+|---|---|---|
+| Quem chama | **Espera** a resposta | Envia e **segue** |
+| Disponibilidade | O destino precisa estar **no ar** | O canal **guarda** a mensagem até o destino voltar |
+| Picos | Repassados ao destino | **Absorvidos** pelo canal |
+| Latência percebida | A soma de todas as chamadas da cadeia | Só a do envio ao canal |
+| Consistência | Imediata | **Eventual** |
+| Depuração | Simples (uma pilha de chamadas) | Mais difícil (rastreamento distribuído, como o **X-Ray**) |
+| Na AWS | API Gateway, ALB, AppSync, Lambda `RequestResponse` | SQS, SNS, EventBridge, Kinesis, Lambda `Event` (assíncrona) com **destinations** |
+
+- **A conta da disponibilidade:** em uma cadeia **síncrona**, as disponibilidades se **multiplicam**. Três serviços com 99,9% cada, chamados em sequência, entregam 99,9% × 99,9% × 99,9% ≈ **99,7%**. Com mensageria entre eles, a falha de um serviço **atrasa** o processamento, mas não derruba a requisição.
+- **Falhas em cascata:** um serviço lento segura as conexões dos chamadores, que esgotam seus recursos e ficam lentos também. **Timeouts** curtos, **retries com backoff** e **circuit breakers** limitam o estrago.
+- **Regra prática:** use chamada síncrona quando o usuário **precisa da resposta para continuar** (consultar saldo, validar login). Use assíncrona quando a resposta pode vir **depois** (processar um pedido, gerar um relatório, notificar outros sistemas).
+
+[↑ Índice](#índice)
+
+### Canais de mensagens: fila, tópico, barramento e stream
+
+O **canal** é o intermediário por onde as mensagens passam. Os quatro tipos de canal se comportam de formas diferentes, e a escolha define o que o sistema consegue fazer:
+
+| | **Fila** | **Tópico** | **Barramento** | **Stream** |
+|---|---|---|---|---|
+| Padrão (EIP) | *Point-to-Point Channel* | *Publish-Subscribe Channel* | *Message Bus* + *Content-Based Router* | Log de eventos particionado |
+| Quem recebe cada mensagem | **Um** consumidor | **Todos** os assinantes | Os alvos das **regras que casam** | **Todos** os consumidores, cada um com sua posição |
+| Retenção | Até ser processada (máx. 14 dias) | Nenhuma | Nenhuma (salvo archive) | **Horas a dias** (ou mais), mesmo depois de lida |
+| Reler o passado | Não | Não | Com **replay** do archive | **Sim**: o consumidor volta a posição |
+| Ordem | FIFO por grupo | FIFO por grupo | Não garantida | **Por partição (shard)** |
+| Modelo | Pull | Push | Push | Pull |
+| Na AWS | **SQS**, Amazon MQ (queue) | **SNS**, Amazon MQ (topic) | **EventBridge** | **Kinesis Data Streams**, **MSK**, **DynamoDB Streams** |
+
+- **Fila:** para **distribuir trabalho** entre workers (*competing consumers*) e absorver picos.
+- **Tópico:** para **avisar** vários sistemas do mesmo fato (fan-out).
+- **Barramento:** para **rotear** eventos de muitas origens para muitos destinos, pelo conteúdo.
+- **Stream:** para **alto volume** com **ordem**, **vários consumidores independentes** e **reprocessamento** (analytics em tempo real, *event sourcing*, CDC).
+
+![Diagrama Padrões de integração - Fila, tópico, barramento e stream](./img/service-communication/service-communication-01.png)
+
+> **Obs:** os canais se **combinam**. O fan-out **SNS + SQS** é um tópico seguido de filas: cada consumidor ganha durabilidade e ritmo próprio. Já **EventBridge → SQS** é um barramento seguido de uma fila, para que o alvo processe em lote e com retries.
+
+[↑ Índice](#índice)
+
+### Orquestração vs. coreografia
+
+Quando um processo de negócio atravessa vários serviços, alguém precisa coordenar a sequência. Há duas formas:
+
+| | **Orquestração** | **Coreografia** |
+|---|---|---|
+| Quem coordena | Um **orquestrador central** que conhece o fluxo inteiro | **Ninguém**: cada serviço reage a eventos e publica os seus |
+| Acoplamento | O orquestrador conhece todos os participantes | Os serviços só conhecem os **eventos** |
+| Visibilidade | O estado de cada execução está em um lugar | Espalhada: é preciso **rastreamento distribuído** para reconstruir o fluxo |
+| Erros e compensação | Centralizados (Retry, Catch, Saga orquestrada) | Cada serviço publica eventos de falha e compensação (Saga coreografada) |
+| Mudanças no fluxo | Altera a definição do orquestrador | Novos serviços **assinam** eventos sem mexer nos outros |
+| Na AWS | **Step Functions** | **EventBridge**, **SNS**, **SQS** |
+
+- **Quando orquestrar:** fluxos com **ordem rígida**, **decisões**, **prazos**, **aprovações** e **compensações**, em que o negócio precisa saber "**em que passo está o pedido 123**". Normalmente **dentro** de um domínio, como o processamento de um pedido.
+- **Quando coreografar:** quando vários domínios independentes reagem ao **mesmo fato** e evoluem em ritmos diferentes. Normalmente **entre** domínios: o domínio de pedidos publica "PedidoCriado", e o faturamento, a logística e o marketing reagem.
+- **Na prática, os dois juntos:** cada domínio **orquestra** seu fluxo interno com Step Functions e **publica eventos** no EventBridge para os outros domínios, que **coreografam** a partir deles.
+
+![Diagrama Padrões de integração - Orquestração com Step Functions vs. coreografia com EventBridge](./img/service-communication/service-communication-02.png)
+
+[↑ Índice](#índice)
+
+### Padrões de roteamento e transformação
+
+Padrões clássicos do *Enterprise Integration Patterns* e como implementá-los na AWS **sem código** ou com pouco código:
+
+| Padrão | O que faz | Implementação na AWS |
+|---|---|---|
+| **Content-Based Router** | Escolhe o destino pelo conteúdo da mensagem | Regras do **EventBridge**; estado **Choice** do Step Functions |
+| **Message Filter** | Descarta as mensagens que não interessam ao consumidor | **Filter policy** do SNS; filtro do **EventBridge Pipes**; **filtro de eventos** no event source mapping da Lambda |
+| **Recipient List / Fan-out** | Entrega a mesma mensagem a vários destinos | **SNS** (fan-out); regra do EventBridge com vários alvos |
+| **Splitter** | Divide uma mensagem grande em várias menores | **Map** / **Distributed Map** do Step Functions |
+| **Aggregator** | Junta várias mensagens relacionadas em uma | Saída do **Map** ou **Parallel** no Step Functions; janelas da Lambda sobre Kinesis |
+| **Content Enricher** | Acrescenta dados que faltam na mensagem | **Enriquecimento** do EventBridge Pipes; uma Task do Step Functions |
+| **Message Translator** | Converte o formato da mensagem para o que o destino espera | **Input transformer** do EventBridge; **JSONata** no Step Functions; **mapping templates** do API Gateway |
+| **Normalizer** / **Canonical Data Model** | Converte vários formatos para um modelo comum | Lambda ou Pipes de tradução + **schema registry** do EventBridge |
+| **Claim Check** | Guarda o payload grande à parte e envia só a referência | Corpo no **S3** + referência no SQS/SNS (**Extended Client Library**); o mesmo para o limite de 256 KB do Step Functions |
+| **Wire Tap** | Copia as mensagens para auditoria sem afetar o fluxo | Assinatura extra de **Firehose → S3** no SNS; **archive** do EventBridge |
+| **Process Manager** | Coordena um processo de vários passos com estado | **Step Functions** |
+| **Messaging Gateway / Bridge** | Liga sistemas que usam protocolos diferentes | **Amazon MQ** + ponte (Camel/JMS); **API destinations** do EventBridge |
+
+[↑ Índice](#índice)
+
+### Padrões de confiabilidade
+
+Mensageria troca falhas visíveis (erro na hora) por falhas **silenciosas** (mensagem perdida, duplicada ou presa). Estes padrões tratam disso:
+
+| Padrão | Problema que resolve | Implementação na AWS |
+|---|---|---|
+| **Retry com backoff exponencial e jitter** | Falhas **transitórias** (timeout, throttling) | Padrão nos **SDKs da AWS**; **Retry** do Step Functions; delivery policy do SNS; retry policy do EventBridge |
+| **Dead Letter Channel** | Mensagens que **nunca** são processadas (*poison messages*) | **DLQ** do SQS (`maxReceiveCount`); DLQ por **assinatura** no SNS; DLQ por **alvo** no EventBridge; **on-failure destination** da Lambda assíncrona |
+| **Idempotent Receiver** | Entregas **at-least-once** geram duplicatas | Chave de idempotência gravada no **DynamoDB** com escrita condicional; utilitário de idempotência do **Powertools for AWS Lambda**; deduplicação do **SQS/SNS FIFO** |
+| **Competing Consumers** | Um único consumidor não dá conta | **SQS** + Auto Scaling pelo backlog ou Lambda |
+| **Queue-Based Load Leveling** | Picos sobrecarregam o destino | **SQS** como buffer + consumo com concorrência controlada |
+| **Throttling / backpressure** | Um produtor rápido derruba um consumidor lento | Throttling do **API Gateway**; **reserved concurrency** da Lambda; **maximum concurrency** no event source mapping |
+| **Circuit Breaker** | Continuar chamando uma dependência que está falhando piora tudo | Estado do circuito no **DynamoDB**, consultado por Step Functions ou Lambda; bibliotecas no código |
+| **Bulkhead** | A falha de uma parte consome os recursos de todas | **Filas** e **reserved concurrency** separadas por cliente ou prioridade; contas separadas |
+| **Guaranteed Delivery** | A mensagem não pode se perder se o destino estiver fora | Canal **durável** (SQS, Kinesis); SNS e EventBridge **sempre com DLQ** |
+
+> **Obs:** **idempotência** é o padrão mais importante da lista. Como SQS Standard, SNS, EventBridge e Kinesis entregam **at-least-once**, e os retries repetem operações, todo consumidor deve suportar receber a mesma mensagem duas vezes.
+
+[↑ Índice](#índice)
+
+### Resposta assíncrona (async request-reply)
+
+Quando o processamento demora mais do que o cliente pode esperar (o **timeout de 29 s** do API Gateway, por exemplo), a requisição vira assíncrona, mas o cliente ainda precisa do resultado:
+
+1. O cliente envia a requisição e recebe na hora **202 Accepted** com um **ID** (e, opcionalmente, a URL de status).
+2. O trabalho roda em background (**Step Functions**, ou **SQS** + workers) e grava o status e o resultado, por exemplo no **DynamoDB**.
+3. O cliente obtém o resultado de uma destas formas:
+   - **polling** em `GET /status/{id}`;
+   - **push** via **WebSocket** (API Gateway WebSocket API ou AppSync subscriptions);
+   - **webhook/callback** para uma URL do cliente;
+   - **notificação** (SNS, e-mail).
+
+- **Variações:**
+  - **filas de requisição e resposta** com *correlation ID* (ver [padrões com SQS](#padrões-de-arquitetura-com-sqs));
+  - **task token** do Step Functions, quando o sistema que responde é externo ou humano.
+- Mais detalhes sobre os limites e padrões do API Gateway em [API Gateway: padrões arquiteturais](compute-and-load-balancing.md#padrões-arquiteturais).
+
+![Diagrama Padrões de integração - Async request-reply com 202, polling e alternativas](./img/service-communication/service-communication-04.png)
+
+[↑ Índice](#índice)
+
+### Consistência entre serviços: outbox, CDC, CQRS e event sourcing
+
+Em microsserviços, cada serviço tem **o seu banco** (*database per service*), e os outros só acessam os dados pela API ou por eventos. Isso cria um problema clássico:
+
+- **Dual write:** o serviço precisa **gravar no banco** e **publicar um evento**. São duas operações em sistemas diferentes, sem transação entre elas:
+  - se a gravação dá certo e a publicação falha, os outros serviços **nunca ficam sabendo**;
+  - se a publicação acontece e a gravação falha, eles reagem a algo que **não aconteceu**.
+
+Os padrões abaixo resolvem esse problema e seus derivados:
+
+- **Transactional outbox:** o serviço grava o estado **e** o evento no **mesmo banco**, na **mesma transação**: o evento vai para uma tabela `outbox`. Um processo separado lê a outbox e publica os eventos. Ou as duas coisas acontecem, ou nenhuma.
+  - **No RDS/Aurora:** tabela outbox + **CDC** com o **DMS** (ou Debezium no MSK Connect) publicando em Kinesis ou MSK, ou uma Lambda fazendo polling da tabela.
+  - **No DynamoDB:** o próprio **DynamoDB Streams** faz o papel da outbox. Cada escrita confirmada gera um registro no stream, que o **EventBridge Pipes** (ou uma Lambda) transforma em evento de negócio. Ver [DynamoDB Streams](databases.md#dynamodb-streams-e-integrações).
+- **Change Data Capture (CDC):** capturar as mudanças do banco a partir do **log de transações**, sem alterar a aplicação. Na AWS: **DynamoDB Streams**, **DMS** com CDC, **change streams** do DocumentDB e as integrações **zero-ETL** do Aurora e do DynamoDB com o Redshift.
+- **Evento de notificação vs. evento com estado:**
+  - um **evento de notificação** (*thin*) diz só o que aconteceu e o ID ("PedidoCriado: 123"). O consumidor busca os detalhes na API do produtor, o que gera **acoplamento** e carga nessa API;
+  - um **evento com estado** (*event-carried state transfer*, *fat*) leva os dados necessários. O consumidor não precisa chamar o produtor, ao custo de eventos maiores (para payloads grandes, use o **Claim Check**).
+- **CQRS** (*Command Query Responsibility Segregation*): separar o modelo de **escrita** (comandos) do modelo de **leitura** (consultas). A escrita vai para o banco transacional, e eventos ou CDC alimentam **modelos de leitura** otimizados para cada consulta. Exemplos: **DynamoDB → Streams → OpenSearch** para busca textual; **ElastiCache** para leituras quentes; **Redshift** para analytics. O preço é a **consistência eventual** entre os modelos.
+- **Event sourcing:** em vez de guardar só o **estado atual**, guardar a **sequência de eventos** que levou a ele ("conta aberta", "depósito de 100", "saque de 30"). O estado é reconstruído reprocessando os eventos.
+  - **Ganhos:** auditoria completa e a possibilidade de recalcular modelos de leitura.
+  - **Na AWS:** o log pode ficar no **DynamoDB** (append-only), no **Kinesis/MSK** (com retenção longa) ou em arquivos no **S3**.
+
+![Diagrama Padrões de integração - Outbox com DynamoDB Streams, Pipes e EventBridge alimentando um modelo de leitura (CQRS)](./img/service-communication/service-communication-03.png)
+
+[↑ Índice](#índice)
+
+### Integração com legado e migração
+
+- **Strangler fig:** migrar um monolito **aos poucos**, sem um "big bang". Uma **fachada** (API Gateway, ALB ou CloudFront) recebe todas as requisições e roteia cada rota para o monolito ou para o serviço novo que a substituiu. A cada etapa, uma rota migra; quando nenhuma rota aponta mais para o monolito, ele é desligado. O **AWS Migration Hub Refactor Spaces** monta essa fachada e o roteamento entre contas.
+- **Anti-corruption layer (ACL):** uma camada de **tradução** entre o modelo do sistema legado e o modelo dos serviços novos, para que os conceitos e formatos antigos não "contaminem" o novo design. Na AWS: Lambda, EventBridge Pipes ou o input transformer convertendo eventos e chamadas.
+- **Messaging bridge:** quando o legado usa um broker com protocolo aberto (JMS, AMQP, MQTT), o **Amazon MQ** recebe esse tráfego sem reescrever a aplicação, e uma ponte liga o broker aos serviços nativos (SQS, Lambda). Ver [migração para o Amazon MQ](#migração-para-o-amazon-mq).
+- **Transferência de arquivos:** parceiros e sistemas legados que só trocam arquivos (SFTP, FTPS, AS2) continuam assim com o **Transfer Family**, e a chegada de cada arquivo no S3 dispara o processamento orientado a eventos (S3 → EventBridge → Step Functions).
+- **Banco compartilhado (anti-padrão):** dois serviços que escrevem nas **mesmas tabelas** ficam acoplados ao schema. Na migração para microsserviços, o caminho é dar a cada serviço **o seu banco** e sincronizar os dados por **eventos** ou **CDC**.
+- **SaaS:** para integrar dados de SaaS em lote (Salesforce, SAP, ServiceNow → S3/Redshift), existe o **Amazon AppFlow**. Para eventos em tempo real de SaaS, os **partner event buses** do EventBridge.
+
+![Diagrama Padrões de integração - Strangler fig com fachada única e anti-corruption layer](./img/service-communication/service-communication-05.png)
+
+[↑ Índice](#índice)
+
+### Escolhendo o serviço de integração
+
+| Requisito do cenário | Serviço / padrão |
+|---|---|
+| Cliente precisa da resposta **na hora** | Chamada **síncrona**: API Gateway, ALB, AppSync |
+| Trabalho em background, absorver picos, workers escaláveis | **SQS** (fila) |
+| A mesma mensagem para **vários** consumidores independentes | **SNS + SQS** (fan-out) |
+| Ordem estrita e sem duplicatas | **SQS FIFO** / **SNS FIFO** |
+| Rotear eventos por **conteúdo**, eventos da AWS ou de SaaS | **EventBridge** |
+| Alto volume, ordem por chave, **vários consumidores** e **reprocessamento** | **Kinesis Data Streams** / **MSK** |
+| Fluxo de vários passos com decisões, espera, erros e compensação | **Step Functions** |
+| Aplicação existente com **JMS, AMQP, MQTT** | **Amazon MQ** |
+| Ligar uma fila ou stream a um alvo, com filtro e enriquecimento | **EventBridge Pipes** |
+| Gravar no banco e publicar evento **sem dual write** | **Outbox** / **CDC** (DynamoDB Streams, DMS) |
+| Processamento maior que o timeout da API | **Async request-reply** (202 + polling ou WebSocket) |
+| Migrar um monolito aos poucos | **Strangler fig** (fachada no API Gateway/ALB, Refactor Spaces) |
+| Payload maior que o limite do canal | **Claim check** (S3 + referência) |
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "**Desacoplar** componentes para que a falha de um não afete o outro" → trocar a chamada síncrona por **mensageria** (SQS, SNS, EventBridge).
+- "Cadeia de chamadas síncronas com **timeouts** e falhas em cascata" → **assíncrono** com filas, ou circuit breaker e timeouts.
+- "Vários sistemas reagem ao **mesmo evento** e novos sistemas vão surgir" → **pub/sub** (SNS fan-out ou EventBridge) e **coreografia**.
+- "Processo com ordem, decisões, aprovação e **compensação**, com visibilidade de cada execução" → **orquestração** com **Step Functions** (Saga).
+- "Consumidores precisam **reler** eventos passados ou processar em **ordem por chave**" → **stream** (Kinesis/MSK), não fila nem tópico.
+- "Mensagens **duplicadas** causam cobranças em dobro" → consumidor **idempotente** (chave de idempotência no DynamoDB) ou **FIFO**.
+- "Mensagens que falham sempre travam a fila" → **dead letter channel** (DLQ) + alarme + redrive.
+- "Gravar no banco e **publicar o evento** de forma confiável" → **transactional outbox** / **CDC** (DynamoDB Streams + Pipes/EventBridge; DMS no RDS).
+- "Consultas de **busca** sobre dados do DynamoDB sem afetar a escrita" → **CQRS**: Streams → **OpenSearch**.
+- "Payload grande demais para SQS, SNS, EventBridge ou Step Functions" → **claim check** no **S3**.
+- "Requisição leva **minutos** e o API Gateway corta em 29 s" → **async request-reply** (202 + polling, WebSocket ou callback).
+- "Migrar um monolito para microsserviços **gradualmente**, sem downtime" → **strangler fig** (Refactor Spaces, API Gateway/ALB roteando por caminho).
+- "Serviços novos não podem herdar o modelo de dados confuso do legado" → **anti-corruption layer**.
+- "Vários microsserviços leem e escrevem no **mesmo banco**" → anti-padrão: **um banco por serviço** + eventos.
+
+[↑ Índice](#índice)
+
 ## Revisão: qual serviço usar
 
 Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas seções de cada serviço.
@@ -1007,5 +1238,22 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Fila/stream → alvo sem Lambda de cola, chamar API HTTP externa | [Pipes e API destinations](#pipes-e-api-destinations) |
 | Permissões dos alvos, KMS, VPC endpoint | [Segurança](#segurança-do-eventbridge) |
 | EventBridge ou SNS? | [Comparação](#eventbridge-vs-sns) |
+
+[↑ Índice](#índice)
+
+### Arquitetura (padrões de integração)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Arquivo, banco compartilhado, RPC ou mensageria? | [Estilos de integração](#contexto-estilos-de-integração-e-acoplamento) |
+| Chamada síncrona ou assíncrona? | [Síncrono vs. assíncrono](#síncrono-vs-assíncrono) |
+| Fila, tópico, barramento ou stream? | [Canais](#canais-de-mensagens-fila-tópico-barramento-e-stream) |
+| Coordenador central ou serviços reagindo a eventos? | [Orquestração vs. coreografia](#orquestração-vs-coreografia) |
+| Rotear, filtrar, dividir, enriquecer, traduzir mensagens | [Roteamento e transformação](#padrões-de-roteamento-e-transformação) |
+| Duplicatas, poison messages, picos, dependência falhando | [Confiabilidade](#padrões-de-confiabilidade) |
+| Processamento mais longo que o timeout da API | [Async request-reply](#resposta-assíncrona-async-request-reply) |
+| Dual write, CDC, modelos de leitura, histórico de eventos | [Outbox, CDC, CQRS](#consistência-entre-serviços-outbox-cdc-cqrs-e-event-sourcing) |
+| Monolito, broker legado, parceiros com arquivos | [Legado e migração](#integração-com-legado-e-migração) |
+| Qual serviço para cada requisito? | [Escolhendo o serviço](#escolhendo-o-serviço-de-integração) |
 
 [↑ Índice](#índice)
