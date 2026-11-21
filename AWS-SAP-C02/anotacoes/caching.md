@@ -399,7 +399,7 @@ O cache só ajuda se a aplicação souber **o que guardar** e **por quanto tempo
 
 - **Snapshots** (Valkey/Redis e Memcached Serverless): **automáticos** (com retenção configurável) ou **manuais**. Servem para **restaurar** um novo cluster, **migrar** entre tipos de nó ou **copiar** para outra região ou conta, exportando para o **S3**.
 - O ElastiCache é um **cache**: os dados vivem na **memória**. Réplicas Multi-AZ e snapshots reduzem a perda, mas **não garantem durabilidade total** (escritas recentes podem se perder em uma falha). O banco de dados continua sendo a **fonte da verdade**.
-- **Precisa de um banco em memória durável** (o Redis como banco **principal**, sem outro banco por trás)? → **Amazon MemoryDB**, que grava cada escrita em um **log transacional Multi-AZ**.
+- **Precisa de um banco em memória durável** (o Redis como banco **principal**, sem outro banco por trás)? → **Amazon MemoryDB**, que grava cada escrita em um **log transacional Multi-AZ**. Ver [Amazon MemoryDB](databases.md#amazon-memorydb).
 
 > **Obs:** os slides citam o **AOF** (*Append Only File*) como forma de persistência do Redis. Nas versões recentes do ElastiCache, o AOF não está disponível. A AWS recomenda **Multi-AZ com réplicas** para disponibilidade e o **MemoryDB** para durabilidade.
 

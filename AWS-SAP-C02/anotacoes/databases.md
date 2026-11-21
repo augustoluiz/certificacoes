@@ -4,26 +4,34 @@ certificacao: AWS Certified Solutions Architect - Professional (SAP-C02)
 servicos:
   - Amazon DynamoDB
   - DynamoDB Accelerator (DAX)
+  - Amazon DocumentDB
+  - Amazon Neptune
+  - Amazon Keyspaces
+  - Amazon Timestream
+  - Amazon MemoryDB
   - Amazon OpenSearch Service
   - Amazon RDS
   - Amazon RDS Proxy
+  - Amazon Aurora
 criado-em: 2026-11-20
 atualizado-em: 2026-11-20
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
-tags: [sap-c02, databases, nosql, search, relational]
+tags: [sap-c02, databases, nosql, document, graph, time-series, in-memory, search, relational]
 ---
 
 # Databases
 
-> **Escopo:** _(em uma frase, o que este arquivo cobre)_
+> **Escopo:** os bancos de dados gerenciados da AWS por tipo: NoSQL (DynamoDB, DocumentDB, Neptune, Keyspaces), séries temporais (Timestream), em memória (MemoryDB), busca e análise (OpenSearch) e relacionais (RDS e Aurora), com alta disponibilidade, DR, segurança, migração e custo.
 >
-> **Por que cai na prova:** _(o ângulo que a SAP-C02 costuma explorar)_
+> **Por que cai na prova:** a SAP-C02 cobra a escolha do **banco certo para cada padrão de acesso** (*purpose-built*), arquiteturas de **alta disponibilidade e DR entre regiões** com o RPO/RTO pedidos (Multi-AZ, read replicas, Aurora Global Database, DynamoDB global tables), **escala de leitura e de conexões** (réplicas, DAX, RDS Proxy), **migrações com parada mínima** (DMS, réplicas, blue/green) e **segurança e custo** (KMS, IAM auth, Secrets Manager, on-demand vs. provisionado, Serverless).
 
 ## Índice
 
-- **NoSQL:** [Amazon DynamoDB](#amazon-dynamodb)
+- **NoSQL:** [Amazon DynamoDB](#amazon-dynamodb) · [Amazon DocumentDB](#amazon-documentdb) · [Amazon Neptune](#amazon-neptune) · [Amazon Keyspaces](#amazon-keyspaces)
+- **Séries temporais:** [Amazon Timestream](#amazon-timestream)
+- **Em memória:** [Amazon MemoryDB](#amazon-memorydb)
 - **Busca e análise:** [Amazon OpenSearch Service](#amazon-opensearch-service)
-- **Relacional:** [Amazon RDS](#amazon-rds)
+- **Relacional:** [Amazon RDS](#amazon-rds) · [Amazon Aurora](#amazon-aurora)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## Amazon DynamoDB
@@ -293,6 +301,352 @@ Na tabela, só é possível consultar pela **chave primária**. Para consultar p
 - "Operações que precisam ser **tudo ou nada** em vários itens" → **transações** (TransactWriteItems).
 - "Tabela grande com pouco acesso, reduzir custo" → classe **Standard-IA**.
 - "Migrar **Cassandra** mantendo CQL" → **Keyspaces**. "**MongoDB**" → **DocumentDB**.
+
+[↑ Índice](#índice)
+
+## Amazon DocumentDB
+
+### Contexto: bancos de documentos e MongoDB
+
+Muitas aplicações trabalham naturalmente com **documentos JSON**: um pedido com seus itens, um perfil com preferências aninhadas, um produto com atributos que variam por categoria. Em um banco relacional, esses dados viram várias tabelas ligadas por joins, e cada atributo novo exige mudar o schema. Os **bancos de documentos** guardam o objeto **inteiro**, como JSON, com **schema flexível**, e permitem **consultar e indexar qualquer campo**, inclusive campos aninhados e arrays.
+
+O **MongoDB** é o banco de documentos mais popular. Rodá-lo em produção, porém, exige montar *replica sets*, sharding, backups e monitoramento. O **Amazon DocumentDB (with MongoDB compatibility)** é o banco de documentos **gerenciado** da AWS, **compatível com a API do MongoDB**: as aplicações usam os **mesmos drivers e ferramentas**. Por baixo, ele usa uma arquitetura parecida com a do **Aurora**, com armazenamento distribuído em 3 AZs.
+
+Na prova, o DocumentDB é a resposta para **"migrar o MongoDB para um serviço gerenciado"** e para dados em **JSON com consultas flexíveis** em vez do modelo chave-valor do DynamoDB.
+
+[↑ Índice](#índice)
+
+### O que é o DocumentDB
+
+- **Compatível com a API do MongoDB** (versões 4.0, 5.0 e 8.0 da API): drivers, ferramentas (mongosh, Compass) e a maior parte das consultas e agregações funcionam sem mudança. Não é o MongoDB em si: alguns operadores e recursos não são suportados, por isso a AWS oferece uma **ferramenta de compatibilidade** para analisar a aplicação antes da migração.
+- **Modelo:** **coleções** de **documentos** JSON (BSON), com **índices** em qualquer campo (inclusive compostos, em arrays, TTL, texto, geoespaciais e **vetoriais**).
+- **Consultas ricas:** filtros por qualquer campo, **aggregation pipeline**, projeções, ordenação. É a principal diferença para o DynamoDB, que só consulta pela chave e pelos índices definidos.
+- **Totalmente gerenciado:** patches, backups, failover, monitoramento.
+- **Na VPC:** não há endpoint público. O acesso é por **security groups**, e o **TLS** vem habilitado.
+
+[↑ Índice](#índice)
+
+### Arquitetura e escala do DocumentDB
+
+- **Cluster baseado em instâncias** (como o Aurora):
+  - **1 instância primária** (leitura e escrita) + até **15 réplicas** (leitura);
+  - **volume compartilhado** com **6 cópias em 3 AZs**, que cresce sozinho em blocos de 10 GB;
+  - réplicas com lag de **milissegundos** e **failover** normalmente em **menos de 30 segundos**;
+  - **cluster endpoint** (primária), **reader endpoint** (réplicas) e **instance endpoints**;
+  - escala **leituras** com réplicas; as **escritas** ficam limitadas à primária (escala vertical).
+- **Elastic clusters:**
+  - **sharding gerenciado**: as coleções são particionadas por uma **shard key** em vários shards, cada um com réplicas;
+  - escalam **escritas e armazenamento** horizontalmente, até **milhões de operações por segundo** e **petabytes**;
+  - a capacidade é definida em vCPUs por shard e pode ser ajustada.
+  - Use quando **uma primária não aguenta as escritas** ou o volume de dados é muito grande.
+- **DocumentDB Serverless:** capacidade ajustada automaticamente conforme a carga (como o Aurora Serverless v2), para cargas variáveis.
+- **Armazenamento Standard ou I/O-Optimized**, com a mesma lógica do Aurora: o I/O-Optimized compensa quando o I/O representa uma parte grande do custo.
+
+![Diagrama DocumentDB - Cluster baseado em instâncias e elastic cluster](./img/amazon-documentdb/amazon-documentdb-01.png)
+
+[↑ Índice](#índice)
+
+### Alta disponibilidade, backup e multi-região
+
+- **Multi-AZ:** com réplicas em outras AZs, o failover é automático. Mesmo sem réplicas, os dados ficam em 3 AZs.
+- **Backups contínuos** com **PITR** (retenção de **1 a 35 dias**) e **snapshots manuais**, copiados entre regiões e compartilhados entre contas. A restauração cria um **novo cluster**.
+- **Global clusters:** uma região **primária** e **regiões secundárias** só de leitura, com replicação no nível do armazenamento (lag normalmente **abaixo de 1 segundo**). Servem para **leituras locais** e **DR** com RTO de cerca de 1 minuto, com **switchover** (planejado, sem perda) e **failover** (desastre).
+- **Clones:** cópias rápidas com copy-on-write, para testes.
+
+[↑ Índice](#índice)
+
+### Change streams e integrações
+
+- **Change streams:** um registro ordenado das **mudanças** em uma coleção (inserções, atualizações, exclusões), com retenção configurável (horas a dias). São consumidos pela **Lambda** (event source mapping) ou por aplicações, para:
+  - indexar documentos no **OpenSearch**;
+  - publicar eventos para outros sistemas;
+  - manter caches e réplicas de dados atualizados.
+- **Zero-ETL com o OpenSearch:** replica as coleções para o **OpenSearch** sem código, via **OpenSearch Ingestion**, para busca textual e semântica.
+- **Busca vetorial** nativa (índices vetoriais), útil para RAG e recomendações sem outro serviço.
+
+![Diagrama DocumentDB - Change streams e migração](./img/amazon-documentdb/amazon-documentdb-02.png)
+
+[↑ Índice](#índice)
+
+### Segurança do DocumentDB
+
+- **Rede:** só na **VPC**, com security groups. Para acessar de fora (ex: do computador do desenvolvedor), usa-se um **bastion** ou **VPN**.
+- **Criptografia:** **TLS** em trânsito (habilitado por padrão) e **KMS** em repouso, definido **na criação** (cobre armazenamento, backups, snapshots e réplicas).
+- **Autenticação:** usuários do banco com **RBAC** (roles do MongoDB), senhas no **Secrets Manager** com rotação, ou **autenticação IAM** (sem senha, com a role da aplicação).
+- **Auditoria:** **audit logs** (logins, mudanças de schema, operações) e **profiler** de consultas lentas no **CloudWatch Logs**. O CloudTrail registra as chamadas à API de gerenciamento.
+
+[↑ Índice](#índice)
+
+### Migração do MongoDB
+
+- **Online (parada mínima):** **AWS DMS** com carga completa + **CDC** (replicação contínua) até o cutover.
+- **Offline:** `mongodump` / `mongorestore` (ou `mongoexport` / `mongoimport`), com parada durante a cópia.
+- **Híbrida:** carga inicial com `mongorestore` (mais rápido para volumes grandes) + **CDC com o DMS** para as mudanças.
+- Antes de migrar, verificar a **compatibilidade** das consultas e dos operadores com a ferramenta da AWS.
+- Origem pode ser MongoDB **on-premises**, em **EC2** ou no **MongoDB Atlas**.
+
+[↑ Índice](#índice)
+
+### Monitoramento e custo do DocumentDB
+
+- **CloudWatch:** CPU, memória, conexões, `DatabaseCursors`, lag das réplicas, IOPS. **Performance Insights** e o **profiler** ajudam a achar consultas lentas, e os índices certos resolvem a maioria dos problemas.
+- **Custo:**
+  - **instâncias** por hora (ou capacidade no Serverless; vCPU-hora de shard nos elastic clusters);
+  - **armazenamento** por GB usado;
+  - **I/O** (na configuração Standard);
+  - backups além do tamanho do banco.
+- **Reduzir custo:** Reserved Instances, instâncias Graviton, I/O-Optimized quando o I/O é alto, réplicas só onde necessário, TTL para apagar documentos antigos.
+
+[↑ Índice](#índice)
+
+### DocumentDB vs. outras opções
+
+| Necessidade | Solução |
+|---|---|
+| Aplicação **MongoDB** em um serviço **gerenciado**, mesmos drivers | **DocumentDB** |
+| JSON com **consultas flexíveis** por qualquer campo e agregações | **DocumentDB** |
+| Chave-valor ou documentos com **escala massiva**, **serverless**, padrões de acesso conhecidos | **DynamoDB** |
+| Usar o MongoDB **completo** (todos os recursos, mesma versão) | **MongoDB Atlas** (Marketplace) ou MongoDB em **EC2** |
+| Relacional com SQL e joins | **RDS / Aurora** |
+| Busca textual sobre os documentos | **OpenSearch** (via zero-ETL ou change streams) |
+| Compatibilidade com **Cassandra** | **Keyspaces** |
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Migrar um **MongoDB** on-premises para um serviço **gerenciado** com o mínimo de mudanças na aplicação" → **DocumentDB** (com **DMS** para migração online).
+- "Dados em **JSON** com consultas por **vários campos** e agregações" → **DocumentDB** (o DynamoDB exige modelar as consultas antes).
+- "Escalar **leituras**" → réplicas + **reader endpoint**. "Escalar **escritas** além de uma instância" → **elastic clusters** (sharding).
+- "**DR** ou leituras em outra região" → **global clusters**.
+- "Reagir a mudanças nas coleções" → **change streams** + **Lambda**.
+- "Busca textual sobre os documentos" → **zero-ETL** para o **OpenSearch**.
+- "Restaurar para um momento anterior" → **PITR** (novo cluster).
+- "Acessar o DocumentDB a partir da internet" → não há endpoint público: **VPN** ou **bastion** na VPC.
+- "Precisa de recursos **específicos** do MongoDB que o DocumentDB não suporta" → **MongoDB Atlas** ou **EC2**.
+
+[↑ Índice](#índice)
+
+## Amazon Neptune
+
+### Contexto: quando as relações são o dado principal
+
+Em muitos problemas, o mais importante não são os registros, mas **como eles se ligam**:
+
+- "quais **amigos dos meus amigos** compraram este produto?";
+- "estas 50 contas **compartilham** o mesmo cartão, endereço ou dispositivo?" (anel de fraude);
+- "se este servidor cair, **quais serviços dependem** dele, direta ou indiretamente?".
+
+Em um banco relacional, cada "salto" de uma relação para outra é um **JOIN**. Com três, quatro ou cinco saltos sobre milhões de linhas, a consulta fica **lenta** e **difícil de escrever**, e o custo cresce com o tamanho das tabelas.
+
+Os **bancos de grafos** guardam os dados como **nós** (vértices: pessoas, contas, produtos) e **arestas** (relações: AMIGO_DE, COMPROU, USA_CARTAO), ambos com propriedades. Cada nó aponta **diretamente** para os vizinhos, então percorrer um salto custa o mesmo, não importa o tamanho do banco. O **Amazon Neptune** é o banco de grafos **gerenciado** da AWS. Na prova, ele é a resposta quando o cenário fala em **relações complexas**: **redes sociais**, **recomendações**, **detecção de fraude**, **grafos de conhecimento** e **identidade**.
+
+![Diagrama Neptune - O que é um grafo](./img/amazon-neptune/amazon-neptune-01.png)
+
+[↑ Índice](#índice)
+
+### O que é o Neptune
+
+- **Dois modelos de grafo e três linguagens de consulta:**
+  - **property graph** (nós e arestas com propriedades): **Apache TinkerPop Gremlin** e **openCypher**;
+  - **RDF** (triplas sujeito–predicado–objeto, padrão da web semântica e de grafos de conhecimento): **SPARQL**.
+- **Neptune Database:** banco de grafos transacional, para consultas com **milissegundos** de latência sobre bilhões de relações.
+- **Neptune Analytics:** motor de **análise de grafos em memória**. Carrega o grafo do Neptune Database ou do **S3** e executa **algoritmos** (PageRank, caminho mais curto, detecção de comunidades, similaridade) em segundos, além de **busca vetorial** para **GraphRAG**.
+- **Totalmente gerenciado**, na **VPC**, acessado por **HTTPS** (endpoints REST e WebSocket).
+
+[↑ Índice](#índice)
+
+### Arquitetura e escala do Neptune
+
+- **Cluster como o Aurora:**
+  - **1 instância primária** (escritas) + até **15 réplicas de leitura**;
+  - **armazenamento compartilhado** com **6 cópias em 3 AZs**, que cresce sozinho;
+  - **failover** automático para uma réplica, normalmente em **menos de 30 segundos**;
+  - **cluster endpoint** (primária), **reader endpoint** (réplicas), **instance endpoints** e **custom endpoints**.
+- **Neptune Serverless:** capacidade em **NCUs** ajustada automaticamente, para cargas variáveis.
+- **Global Database:** uma região primária e **regiões secundárias** de leitura, com replicação no armazenamento (lag normalmente **abaixo de 1 segundo**), para leituras locais e **DR** entre regiões.
+- **Backups contínuos** com **PITR** (1 a 35 dias), **snapshots** (copiados entre regiões e compartilhados entre contas) e **clones** para testes.
+
+[↑ Índice](#índice)
+
+### Carga de dados e integrações
+
+- **Bulk loader:** carrega grandes volumes de dados do **S3** (CSV para property graph; N-Triples, Turtle e outros formatos RDF) direto no cluster. Exige um **VPC endpoint do S3** e uma **IAM role** com acesso ao bucket.
+- **Neptune Streams:** registro das **mudanças** no grafo, consumido por **Lambda** ou aplicações. O uso clássico é manter um índice de **busca textual** no **OpenSearch** (o Neptune não tem full-text search próprio).
+- **Neptune ML:** usa **Graph Neural Networks** no **SageMaker** para **prever** arestas e propriedades (ex: "este usuário provavelmente vai gostar deste produto", "esta conta provavelmente é fraudulenta").
+- **GraphRAG:** com o **Bedrock Knowledge Bases**, o Neptune Analytics guarda o grafo de entidades e os vetores, e a IA responde usando as **relações** entre os documentos, não só a similaridade.
+- **Ferramentas:** **Neptune Workbench** (notebooks Jupyter) e **graph-explorer** para visualizar o grafo.
+
+![Diagrama Neptune - Arquitetura e integrações](./img/amazon-neptune/amazon-neptune-02.png)
+
+[↑ Índice](#índice)
+
+### Segurança, monitoramento e custo do Neptune
+
+- **Rede:** só na **VPC**, com **security groups**. Não há endpoint público.
+- **Autenticação IAM:** as requisições podem ser assinadas com **SigV4**, com políticas IAM controlando o acesso (inclusive por tipo de operação: leitura, escrita, carga).
+- **Criptografia:** **TLS** obrigatório em trânsito e **KMS** em repouso (definido na criação).
+- **Auditoria:** **audit logs** e **slow query logs** no **CloudWatch Logs**; CloudTrail para a API de gerenciamento.
+- **Monitoramento:** CloudWatch (CPU, memória, requisições, lag das réplicas, erros).
+- **Custo:** horas de instância (ou NCU-hora no Serverless), armazenamento por GB, I/O (na configuração Standard; há também **I/O-Optimized**), backups. O **Neptune Analytics** é cobrado pela capacidade de memória provisionada para o grafo.
+
+[↑ Índice](#índice)
+
+### Neptune vs. outras opções
+
+| Necessidade | Solução |
+|---|---|
+| Consultas sobre **relações em vários níveis** (amigos de amigos, anéis de fraude, dependências) | **Neptune** |
+| **Algoritmos de grafo** em grandes volumes (PageRank, comunidades) ou GraphRAG | **Neptune Analytics** |
+| Grafos de conhecimento em **RDF/SPARQL** | **Neptune** |
+| Relações simples (1 ou 2 níveis) com SQL | **RDS / Aurora** |
+| Chave-valor em escala massiva | **DynamoDB** |
+| Documentos JSON / MongoDB | **DocumentDB** |
+| Busca textual | **OpenSearch** (alimentado pelo Neptune Streams) |
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "**Rede social**, recomendações baseadas em **amigos de amigos**" → **Neptune**.
+- "Detectar **anéis de fraude** (contas que compartilham cartões, endereços, dispositivos)" → **Neptune** (com **Neptune ML** para prever fraudes).
+- "**Grafo de conhecimento**", "RDF", "SPARQL" → **Neptune**. "Gremlin" ou "openCypher" → **Neptune** (property graph).
+- "Muitos **JOINs** em relações hierárquicas ou em vários níveis estão lentos no relacional" → **Neptune**.
+- "Carregar milhões de nós e arestas a partir do **S3**" → **bulk loader** (VPC endpoint do S3 + IAM role).
+- "Busca textual sobre os dados do grafo" → **Neptune Streams** → Lambda → **OpenSearch**.
+- "Leituras em outra região ou DR" → **Neptune Global Database**. "Escalar leituras" → até **15 réplicas**.
+- "Análise de grafo em memória, algoritmos ou **GraphRAG** com o Bedrock" → **Neptune Analytics**.
+
+[↑ Índice](#índice)
+
+## Amazon Keyspaces
+
+### Contexto: Apache Cassandra
+
+O **Apache Cassandra** é um banco NoSQL de **colunas largas** (*wide-column*), criado para gravar **muitos dados em alta velocidade** e escalar horizontalmente em vários data centers: mensagens, eventos, históricos, dados de IoT, catálogos. As aplicações usam a linguagem **CQL**, parecida com SQL, e modelam as tabelas a partir das consultas (como no DynamoDB).
+
+Operar um cluster Cassandra, porém, é trabalhoso: dimensionar e adicionar **nós**, rodar **repair** e acompanhar a **compaction**, fazer upgrades e backups, e ajustar replicação e consistência. O **Amazon Keyspaces (for Apache Cassandra)** é um serviço **serverless compatível com o Cassandra**: a aplicação usa os **mesmos drivers e o mesmo CQL**, e a AWS cuida da infraestrutura. Na prova, ele é a resposta para **"migrar o Cassandra para um serviço gerenciado, sem reescrever a aplicação"**.
+
+[↑ Índice](#índice)
+
+### O que é o Keyspaces
+
+- **Compatível com o Cassandra 3.11** (CQL, drivers, `cqlsh`). Alguns recursos do Cassandra não existem ou funcionam diferente, já que não há nós para configurar.
+- **Serverless:** sem nós, repair ou compaction. As tabelas escalam sozinhas.
+- **Capacidade:** **on-demand** (paga por leitura e escrita) ou **provisionada** (RCU/WCU com auto scaling), no mesmo modelo do DynamoDB.
+- **Disponibilidade:** os dados são replicados em **3 AZs**, com SLA de até **99,99%** (99,999% com replicação multi-região).
+- **Multi-Region replication:** tabelas replicadas em várias regiões, **ativo-ativo**, com replicação assíncrona.
+- **Recursos:** **PITR** (até 35 dias), **TTL**, **lightweight transactions**, criptografia com **KMS**.
+- **Acesso:** pelo endpoint do serviço com **TLS** ou por **interface VPC endpoint** (PrivateLink). A autenticação usa **IAM** (com o plugin **SigV4** no driver) ou **credenciais específicas do serviço** (usuário e senha gerados no IAM, para drivers sem o plugin).
+
+![Diagrama Keyspaces - Migrar do Cassandra autogerenciado](./img/amazon-keyspaces/amazon-keyspaces-01.png)
+
+[↑ Índice](#índice)
+
+### Migração e dicas do Keyspaces
+
+- **Migração:**
+  - **offline:** exportar e importar com **DSBulk** ou `cqlsh COPY`;
+  - **online:** **dual writes** (a aplicação grava nos dois bancos durante a transição) e carga histórica com **DSBulk** ou **Glue/Spark**.
+- **Dicas para a prova:**
+  - "Migrar **Cassandra** para um serviço gerenciado **sem mudar o código** (CQL)" → **Keyspaces**.
+  - "Cassandra sem gerenciar **nós, repair e compaction**" → **Keyspaces**.
+  - "Acessar o Keyspaces sem internet" → **interface VPC endpoint**.
+  - "Tabelas Cassandra em várias regiões" → **Keyspaces multi-Region replication**.
+  - Se o cenário aceita **reescrever** a aplicação para o modelo da AWS, o **DynamoDB** também é uma opção.
+
+[↑ Índice](#índice)
+
+## Amazon Timestream
+
+### Contexto: dados de séries temporais
+
+Uma **série temporal** é uma sequência de medições ao longo do tempo: a temperatura de um sensor a cada segundo, a CPU de um servidor a cada minuto, o preço de uma ação a cada negociação. Esses dados têm um padrão próprio:
+
+- são gravados **sem parar**, em volumes enormes, e quase nunca alterados;
+- as consultas são **por janela de tempo** ("média por 5 minutos na última hora", "picos da última semana");
+- os dados **recentes** são consultados muito; os **antigos**, raramente, e podem ser **agregados** ou guardados mais barato.
+
+Bancos relacionais e o DynamoDB conseguem guardar esses dados, mas exigem muito trabalho para particionar, agregar e mover o histórico. O **Amazon Timestream** é o banco de **séries temporais** da AWS. Na prova, ele aparece em cenários de **IoT**, **telemetria**, **monitoramento de aplicações e equipamentos** e **análise de dados ao longo do tempo**.
+
+[↑ Índice](#índice)
+
+### O que é o Timestream
+
+O Timestream tem dois engines:
+
+- **Timestream for LiveAnalytics:**
+  - **serverless**: escala ingestão e consultas automaticamente;
+  - **armazenamento em camadas**: o **memory store** guarda os dados **recentes** (para gravar e consultar rápido) e o **magnetic store** guarda o **histórico** (mais barato, para análises). Os dados passam de um para o outro pela **política de retenção** de cada tabela;
+  - **SQL** com funções de série temporal (agrupar por intervalo, interpolar, janelas, médias móveis);
+  - **scheduled queries**: agregações periódicas (*rollups*) gravadas em outra tabela, para dashboards rápidos e baratos;
+  - ingestão a partir de **IoT Core**, **Kinesis**, **MSK** (com **Managed Service for Apache Flink**), Telegraf ou SDK; visualização em **Grafana**, **QuickSight** e uso no **SageMaker**.
+- **Timestream for InfluxDB:**
+  - o **InfluxDB** open source **gerenciado**, com instâncias Multi-AZ;
+  - latência de **milissegundos** para consultas em tempo real;
+  - indicado para quem **já usa o InfluxDB** (APIs, Telegraf, dashboards) ou precisa de respostas muito rápidas sobre dados recentes.
+
+![Diagrama Timestream - Ingestão e armazenamento em camadas](./img/amazon-timestream/amazon-timestream-01.png)
+
+> **Obs:** a AWS anunciou que o **Timestream for LiveAnalytics** deixou de aceitar **novos clientes** em 2025, e passou a recomendar o **Timestream for InfluxDB** para novos projetos. Em questões, o Timestream ainda aparece como "banco de séries temporais serverless" (vale conferir o estado atual).
+
+[↑ Índice](#índice)
+
+### Dicas do Timestream
+
+- "Milhões de leituras de **sensores IoT** por segundo, consultas por **janela de tempo**" → **Timestream** (ingestão via **IoT Core** ou Kinesis).
+- "Dados recentes consultados com frequência e **histórico barato**, com movimentação automática" → **memory store + magnetic store** com retenção.
+- "Dashboards de métricas agregadas com baixo custo" → **scheduled queries** + **Grafana/QuickSight**.
+- "Já usa **InfluxDB** e quer um serviço gerenciado" → **Timestream for InfluxDB**.
+- "Métricas de **infraestrutura AWS**" → normalmente o **CloudWatch** basta; o Timestream entra para dados de **aplicação ou equipamentos** com análises próprias.
+
+[↑ Índice](#índice)
+
+## Amazon MemoryDB
+
+### Contexto: Redis como banco principal
+
+Muitas aplicações usam o **Redis/Valkey** não só como cache, mas como **banco principal**: carrinhos de compras, perfis, inventário, filas, rankings, sessões que não podem ser perdidas. O **ElastiCache** é um **cache**: ele confirma a escrita antes de replicá-la, então uma falha do primário pode **perder as últimas escritas**. Isso é aceitável quando o dado existe em outro banco, mas não quando o Redis é a **fonte da verdade**.
+
+O **Amazon MemoryDB** é um **banco de dados em memória durável**, compatível com **Valkey e Redis OSS**: mesmos comandos e clientes, com **leituras em microssegundos** e **escritas que não se perdem**. Na prova, ele é a resposta para "**banco compatível com Redis, durável, sem perda de dados**", ou quando o cenário quer eliminar a combinação "cache + banco" usando um único serviço.
+
+[↑ Índice](#índice)
+
+### O que é o MemoryDB
+
+- **Durabilidade:** cada escrita é gravada em um **log transacional distribuído em várias AZs** antes de ser confirmada. Uma escrita confirmada **não se perde**, mesmo com a falha de um nó ou de uma AZ. As réplicas e os nós substituídos se recuperam a partir do log.
+- **Desempenho:** **leituras em microssegundos** (da memória) e **escritas em poucos milissegundos** (esperam o log).
+- **Consistência:** leituras **fortemente consistentes** no primário e eventualmente consistentes nas réplicas.
+- **Cluster:** sempre com **sharding** (cluster mode), com réplicas por shard em outras AZs e **failover automático**.
+- **Recursos:**
+  - **busca vetorial** em memória, com latência muito baixa (RAG, recomendações, detecção de fraude em tempo real);
+  - **MemoryDB Multi-Region:** clusters **ativo-ativo** em várias regiões, com disponibilidade de até **99,999%**;
+  - **snapshots** (inclusive exportados para o S3) e **data tiering** (nós com SSD para dados menos acessados).
+- **Segurança:** na **VPC**, **TLS** obrigatório, **KMS** em repouso, **ACLs** com usuários e permissões por comando, e **autenticação IAM**.
+
+![Diagrama MemoryDB - Caminho da escrita: ElastiCache vs. MemoryDB](./img/amazon-memorydb/amazon-memorydb-01.png)
+
+[↑ Índice](#índice)
+
+### MemoryDB vs. ElastiCache
+
+| | **ElastiCache (Valkey/Redis)** | **MemoryDB** |
+|---|---|---|
+| Papel | **Cache** na frente de outro banco | **Banco principal** em memória |
+| Durabilidade | Pode perder escritas recentes em uma falha | **Log transacional Multi-AZ**: escrita confirmada não se perde |
+| Escrita | Microssegundos | Poucos milissegundos |
+| Leitura | Microssegundos | Microssegundos |
+| Multi-região | Global Datastore (ativo-passivo) | Multi-Region (**ativo-ativo**) |
+| Custo | Menor | Maior (inclui o volume de dados gravados) |
+
+Mais detalhes sobre o cache em [Amazon ElastiCache](caching.md#amazon-elasticache).
+
+**Dicas para a prova:**
+
+- "Banco **compatível com Redis** com **durabilidade** e **Multi-AZ**, sem perda de dados" → **MemoryDB**.
+- "Microsserviços que precisam de latência de **microssegundos na leitura** e o dado **não pode ser perdido**" → **MemoryDB**.
+- "Simplificar a arquitetura **Redis + banco relacional**" → **MemoryDB** (se o modelo de dados couber no Redis).
+- "Reduzir a carga do banco com cache, **menor custo**" → **ElastiCache**, não MemoryDB.
 
 [↑ Índice](#índice)
 
@@ -699,9 +1053,211 @@ Rodar o banco em **EC2** dá controle total, mas deixa todo esse trabalho com vo
 
 [↑ Índice](#índice)
 
+## Amazon Aurora
+
+### Contexto: um banco relacional feito para a nuvem
+
+No RDS tradicional, cada instância tem **seu próprio disco** (EBS). Isso traz limites: o standby do Multi-AZ precisa receber cada escrita pela rede, as réplicas copiam os dados de forma assíncrona e com lag, criar uma réplica nova exige copiar o banco inteiro, e o failover leva minutos. É a arquitetura de um banco tradicional, adaptada à nuvem.
+
+O **Amazon Aurora** foi construído pela AWS separando **processamento** e **armazenamento**: as instâncias (writer e réplicas) compartilham **um único volume distribuído**, replicado em **três AZs**. As réplicas leem do mesmo armazenamento que o writer, então o lag é de milissegundos, o failover leva segundos e o volume cresce sozinho. Para a aplicação, ele é **compatível com MySQL ou PostgreSQL**: mesmos drivers, mesmo SQL, mesmas ferramentas.
+
+Na prova, o Aurora é a resposta quando o cenário pede **banco relacional com alta disponibilidade, desempenho e escala de leitura** acima do RDS, **failover rápido**, **DR global com RPO de segundos** ou **capacidade que se ajusta sozinha** (Serverless v2).
+
+[↑ Índice](#índice)
+
+### O que é o Aurora
+
+- **Compatível com MySQL e PostgreSQL**, gerenciado pela família RDS (mesmo console, parameter groups, snapshots, IAM, KMS).
+- **Desempenho:** a AWS cita até **5×** o MySQL e **3×** o PostgreSQL padrão, graças ao armazenamento distribuído.
+- **DB cluster:** **1 instância writer** + até **15 réplicas Aurora**, todas sobre o **mesmo volume**.
+- **Armazenamento:**
+  - cresce **automaticamente** em blocos de 10 GB, até centenas de TiB (os slides citam 256 TB), sem provisionar;
+  - **6 cópias** dos dados em **3 AZs** (2 por AZ);
+  - a escrita é confirmada com **4 de 6** cópias e a leitura precisa de **3 de 6**: o banco continua gravando se perder uma AZ inteira, e continua lendo mesmo perdendo uma AZ e mais uma cópia;
+  - **self-healing**: segmentos com problema são reparados a partir das outras cópias;
+  - dividido em centenas de volumes, com backup contínuo no S3.
+- **Alta disponibilidade:** o **failover** para uma réplica acontece normalmente em **menos de 30 segundos**. Mesmo sem réplicas, os dados estão em 3 AZs; o failover então cria uma nova instância (mais lento).
+- **Réplicas Aurora:** lag normalmente de **milissegundos**, porque leem o mesmo armazenamento. Cada réplica tem uma **prioridade de failover** (tier 0 a 15).
+
+![Diagrama Aurora - Arquitetura do cluster](./img/amazon-aurora/amazon-aurora-01.png)
+
+[↑ Índice](#índice)
+
+### Endpoints e escala de leitura
+
+- **Cluster endpoint (writer):** aponta sempre para o **writer atual**. Depois de um failover, passa a apontar para o novo writer **sem mudar o endereço**. Usado para escritas (e leituras que precisam do dado mais recente).
+- **Reader endpoint:** **balanceia as conexões** entre as réplicas. Usado para leituras.
+- **Custom endpoint:** um **subconjunto** de instâncias escolhido por você. Exemplo: réplicas **maiores** só para **consultas analíticas**, sem disputar recursos com as leituras da aplicação.
+- **Instance endpoint:** uma instância específica, para diagnóstico ou ajuste fino.
+- **Aurora Auto Scaling:** adiciona e remove **réplicas** automaticamente por CPU ou número de conexões.
+- **RDS Proxy:** também funciona com o Aurora, com **endpoint somente leitura** para as réplicas.
+
+![Diagrama Aurora - Endpoints e custom endpoints](./img/amazon-aurora/amazon-aurora-02.png)
+
+> **Obs:** o balanceamento do reader endpoint é **por conexão**, não por consulta. Uma aplicação com poucas conexões longas pode concentrar a carga em uma réplica. Pools de conexão que reabrem conexões periodicamente ajudam a distribuir.
+
+[↑ Índice](#índice)
+
+### Aurora Serverless v2
+
+- A capacidade de cada instância é medida em **ACUs** (Aurora Capacity Units, cerca de 2 GiB de memória cada) e se ajusta **automaticamente e em frações**, em segundos, entre um **mínimo** e um **máximo** que você define.
+- Pode **pausar em 0 ACU** quando o banco fica ocioso, pagando só o armazenamento.
+- Instâncias **Serverless v2** e **provisionadas** podem conviver **no mesmo cluster** (ex: writer provisionado e réplicas serverless para picos de leitura).
+- Mantém os recursos do Aurora: Multi-AZ, réplicas, Global Database, RDS Proxy.
+- **Quando usar:**
+  - carga **variável**, **intermitente** ou **imprevisível**;
+  - ambientes de **dev/test**;
+  - **SaaS** com muitos bancos pequenos;
+  - quando não se quer planejar capacidade.
+- A **v1** do Aurora Serverless foi descontinuada. Em questões antigas, ela aparece com escala mais lenta e sem réplicas.
+
+**RDS Data API:**
+
+- A aplicação executa SQL por uma **API HTTPS** (`ExecuteStatement`), **sem driver, sem conexão persistente e sem senha no código**.
+- O acesso é controlado por **IAM**, e o serviço busca as credenciais do banco no **Secrets Manager**.
+- Funciona com o **Aurora PostgreSQL e MySQL** (Serverless v2 e provisionado). É útil para **Lambda** e integrações (AppSync, Step Functions) que não querem gerenciar conexões.
+
+![Diagrama Aurora - Serverless v2 e Data API](./img/amazon-aurora/amazon-aurora-04.png)
+
+[↑ Índice](#índice)
+
+### Aurora Global Database
+
+- **Uma região primária** (leitura e escrita) e **até 10 regiões secundárias** (só leitura), cada uma com até **16 réplicas**.
+- A replicação é feita **no nível do armazenamento**, com lag normalmente **abaixo de 1 segundo**, sem consumir recursos das instâncias.
+- **Casos de uso:**
+  - **leituras locais** com baixa latência para usuários em outras regiões;
+  - **DR entre regiões** com RPO de cerca de 1 segundo e **RTO normalmente abaixo de 1 minuto**.
+- **Troca de região:**
+  - **switchover** (planejado): troca a primária **sem perda de dados** (RPO 0), para manutenção ou testes de DR;
+  - **failover** (desastre): promove uma secundária quando a primária está indisponível, aceitando perder as escritas ainda não replicadas;
+  - o **global endpoint** de escrita acompanha a troca, sem a aplicação mudar de endereço.
+- **Write forwarding:** a aplicação em uma região secundária envia **escritas** para o próprio cluster local, que as **encaminha** para a primária. Simplifica aplicações globais, sem gerenciar dois endpoints.
+- **Gerenciar o RPO** (Aurora PostgreSQL): é possível definir um **RPO máximo**. Se a replicação atrasar além dele, a primária **bloqueia as escritas** até as secundárias alcançarem.
+- **Cross-region read replica** (sem Global Database): ainda existe para Aurora MySQL, com replicação por binlog, mais simples e com mais lag. A AWS recomenda o **Global Database**.
+
+![Diagrama Aurora - Global Database](./img/amazon-aurora/amazon-aurora-03.png)
+
+[↑ Índice](#índice)
+
+### Backup, clonagem e backtrack
+
+- **Backups contínuos e PITR:** como no RDS, com retenção de **1 a 35 dias** e restauração para qualquer segundo, **criando um novo cluster**. Os backups não afetam o desempenho.
+- **Snapshots manuais:** copiados entre regiões e **compartilhados** com outras contas (com CMK se criptografados). Ver [Backup, snapshots e recuperação do RDS](#backup-snapshots-e-recuperação).
+- **Database cloning:** cria um **clone** do cluster em minutos usando **copy-on-write**: o clone compartilha as páginas do original e só grava as que mudam. É mais rápido e barato que restaurar um snapshot. Uso: **testes com dados de produção**, análises pontuais, ensaios de migração.
+- **Backtrack** (Aurora MySQL): **"rebobina"** o cluster **no lugar** para um momento anterior (até **72 horas**), em minutos, **sem restaurar** um novo cluster. Uso: desfazer um `DELETE` ou `UPDATE` errado rapidamente. Precisa ser habilitado na criação.
+- **Exportar para o S3:** snapshots ou o próprio cluster podem ser exportados em **Parquet** para análise com Athena, EMR ou SageMaker.
+
+| Necessidade | Use |
+|---|---|
+| Voltar o banco para antes de um erro, **no mesmo cluster**, em minutos (MySQL) | **Backtrack** |
+| Voltar para um momento anterior criando **outro cluster** | **PITR** |
+| Cópia rápida e barata para **testes** | **Clone** |
+| Cópia em outra região ou conta | **Snapshot** copiado ou compartilhado |
+
+[↑ Índice](#índice)
+
+### Recursos específicos do Aurora
+
+- **Integração com o S3:**
+  - **Aurora MySQL:** `LOAD DATA FROM S3` e `SELECT INTO OUTFILE S3`;
+  - **Aurora PostgreSQL:** extensão `aws_s3` para importar e exportar.
+- **Integração com Lambda:** o banco pode **invocar funções Lambda** (procedures e triggers), por exemplo para notificar sistemas externos quando um registro muda.
+- **Aurora ML:** consultas SQL chamam modelos do **SageMaker**, do **Bedrock** ou do **Comprehend** (ex: análise de sentimento em uma coluna de comentários).
+- **Babelfish** (Aurora PostgreSQL): entende o protocolo e o **T-SQL do SQL Server**, permitindo migrar aplicações SQL Server com poucas mudanças.
+- **Zero-ETL com o Redshift:** replica os dados para o **Redshift** em segundos, para análise sem pipelines.
+- **Database Activity Streams:** envia a atividade do banco (consultas, logins) ao **Kinesis** em tempo quase real, para auditoria fora do controle dos DBAs.
+- **Parallel query** (Aurora MySQL): distribui consultas analíticas pela camada de armazenamento.
+- **Aurora Limitless Database** (PostgreSQL): **sharding gerenciado** que escala **escritas** horizontalmente para além de um writer.
+- **Aurora DSQL:** banco **serverless distribuído**, compatível com PostgreSQL, **ativo-ativo em várias regiões**, com consistência forte. É uma opção para aplicações relacionais multi-região que precisam escrever em todas as regiões.
+
+[↑ Índice](#índice)
+
+### Migração para o Aurora
+
+- **A partir do RDS (MySQL ou PostgreSQL):**
+  - **snapshot do RDS → restaurar como Aurora**: simples, com parada durante a migração;
+  - **réplica Aurora de uma instância RDS → promover**: a réplica sincroniza com o RDS em uso; quando o lag zera, as escritas param, a réplica é **promovida** e a aplicação aponta para o Aurora. **Parada mínima**.
+- **A partir de MySQL ou PostgreSQL externos:** backup do **Percona XtraBackup** no S3 (MySQL), `mysqldump` / `pg_dump`, ou replicação nativa.
+- **A partir de outros engines** (Oracle, SQL Server): **DMS** com **Schema Conversion** (ou **Babelfish** para SQL Server).
+
+![Diagrama Aurora - Migrar do RDS para o Aurora](./img/amazon-aurora/amazon-aurora-05.png)
+
+[↑ Índice](#índice)
+
+### Segurança, monitoramento e custo do Aurora
+
+- **Segurança:** igual ao RDS: VPC, security groups, **KMS** (definido na criação), TLS, **autenticação IAM**, Secrets Manager, Kerberos. Ver [Segurança do RDS](#segurança-do-rds).
+- **Monitoramento:**
+  - **CloudWatch:** CPU, conexões, `AuroraReplicaLag`, IOPS, uso de armazenamento;
+  - **logs** (error, slow query, general, audit) publicados no **CloudWatch Logs**;
+  - **Performance Insights / Database Insights** e **Enhanced Monitoring**.
+- **Custo:**
+  - **instâncias** (provisionadas por hora, ou ACU-hora no Serverless v2), com **Reserved Instances** para as provisionadas;
+  - **armazenamento** por GB usado (não provisionado);
+  - **I/O**: na configuração **Aurora Standard**, cada operação de I/O é cobrada. Na **Aurora I/O-Optimized**, o I/O é **incluído** e as instâncias e o armazenamento custam mais. A AWS recomenda o **I/O-Optimized** quando o I/O passa de cerca de **25%** do custo do banco;
+  - backups além do tamanho do banco, Global Database (escritas replicadas e transferência), clones (só as páginas alteradas).
+- **Comparado ao RDS**, a instância do Aurora é mais cara, mas o armazenamento é pago **pelo uso**, as réplicas não exigem cópia dos dados e um standby dedicado não é necessário (qualquer réplica serve de failover).
+
+[↑ Índice](#índice)
+
+### Aurora vs. RDS
+
+| | **RDS (MySQL/PostgreSQL)** | **Aurora** |
+|---|---|---|
+| Armazenamento | EBS por instância, provisionado | **Volume compartilhado**, 6 cópias em 3 AZs, cresce sozinho |
+| Réplicas de leitura | Até 15, assíncronas, cada uma com seu disco | Até **15**, lag de **milissegundos**, **reader endpoint** |
+| Failover | 1–2 min (Multi-AZ instance) ou < 35 s (Multi-AZ cluster) | Normalmente **< 30 s** |
+| Multi-região | Read replica cross-region | **Global Database** (lag < 1 s, RTO < 1 min, até 10 regiões) |
+| Escala de capacidade | Trocar a classe da instância | **Serverless v2** (ACUs automáticas) |
+| Recursos exclusivos | — | Clones, backtrack, custom endpoints, write forwarding, Data API |
+| Custo | Menor para cargas pequenas | Melhor custo-benefício em cargas grandes e críticas |
+| Engines | MySQL, PostgreSQL, MariaDB, Oracle, SQL Server, Db2 | **Só MySQL e PostgreSQL** |
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Banco relacional compatível com MySQL/PostgreSQL com **alta disponibilidade e desempenho**, failover em segundos" → **Aurora**.
+- "Até **15 réplicas** com lag mínimo e **um endpoint** para todas" → réplicas Aurora + **reader endpoint**. "Escalar réplicas automaticamente" → **Aurora Auto Scaling**.
+- "Consultas **analíticas** sem afetar as leituras da aplicação" → **custom endpoint** com réplicas dedicadas (ou **zero-ETL** para o Redshift, ou um **clone**).
+- "Carga **imprevisível** ou intermitente, pagar pelo uso, **sem planejar capacidade**" → **Aurora Serverless v2**.
+- "Executar SQL a partir de Lambda **sem gerenciar conexões** nem senhas" → **Data API** (ou **RDS Proxy**).
+- "**DR entre regiões** com RPO de ~1 s e RTO < 1 min" ou "leituras locais em várias regiões" → **Aurora Global Database**. "Escrever a partir da região secundária" → **write forwarding**.
+- "Testar uma troca de região **sem perder dados**" → **switchover** do Global Database.
+- "Desfazer rapidamente um `DELETE` errado **sem restaurar**" → **Backtrack** (Aurora MySQL). "Restaurar para um momento anterior" → **PITR** (novo cluster).
+- "Ambiente de **testes com dados de produção**, rápido e barato" → **database cloning**.
+- "Migrar do RDS MySQL/PostgreSQL para o Aurora com **parada mínima**" → **réplica Aurora** do RDS + **promover**. "Com parada aceitável" → **snapshot → restore**.
+- "Migrar do **SQL Server** com poucas mudanças no código" → **Babelfish** (Aurora PostgreSQL).
+- "Custo de **I/O** alto no Aurora" → configuração **Aurora I/O-Optimized**.
+- "Carregar dados do **S3** direto para o banco" → `LOAD DATA FROM S3` (MySQL) / `aws_s3` (PostgreSQL).
+- "Aplicação relacional **ativo-ativo em várias regiões**, escrevendo em todas" → **Aurora DSQL** (ou DynamoDB global tables, se não precisar de SQL).
+
+[↑ Índice](#índice)
+
 ## Revisão: qual serviço usar
 
 Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas seções de cada serviço.
+
+### Visão geral: qual banco usar
+
+| Padrão de dados e de acesso | Banco |
+|---|---|
+| Relacional, SQL e joins, engine comercial ou comum | [RDS](#amazon-rds) |
+| Relacional MySQL/PostgreSQL com alta disponibilidade, desempenho e multi-região | [Aurora](#amazon-aurora) |
+| Chave-valor/documentos em escala massiva, serverless, latência de ms | [DynamoDB](#amazon-dynamodb) |
+| Documentos JSON com consultas flexíveis, compatível com MongoDB | [DocumentDB](#amazon-documentdb) |
+| Relações em vários níveis (grafos) | [Neptune](#amazon-neptune) |
+| Compatível com Cassandra (wide-column) | [Keyspaces](#amazon-keyspaces) |
+| Séries temporais (IoT, telemetria) | [Timestream](#amazon-timestream) |
+| Em memória durável, compatível com Redis/Valkey | [MemoryDB](#amazon-memorydb) |
+| Cache em memória na frente de outro banco | [ElastiCache](caching.md#amazon-elasticache) |
+| Busca textual, logs, busca vetorial | [OpenSearch](#amazon-opensearch-service) |
+| Data warehouse e BI (SQL analítico em grandes volumes) | **Redshift** (analytics) |
+
+> **Obs:** o **Amazon QLDB** (banco *ledger*, com histórico imutável e verificável criptograficamente) foi **descontinuado** em julho de 2025. A AWS recomenda o **Aurora PostgreSQL** com auditoria (ex: pgAudit e tabelas de histórico). Em questões antigas, "registro imutável e verificável de transações" apontava para o QLDB.
+
+[↑ Índice](#índice)
 
 ### NoSQL (DynamoDB)
 
@@ -719,6 +1275,41 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Leituras em microssegundos sem mudar o código | [DAX](#dynamodb-accelerator-dax) |
 | Cada usuário só acessa seus itens / acesso privado | [LeadingKeys / VPC endpoints](#segurança-do-dynamodb) |
 | DynamoDB, RDS, DocumentDB, Keyspaces ou OpenSearch? | [Comparação](#dynamodb-vs-outras-opções) |
+
+[↑ Índice](#índice)
+
+### NoSQL (DocumentDB)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| MongoDB gerenciado / JSON com consultas flexíveis | [DocumentDB](#o-que-é-o-documentdb) |
+| Escalar leituras vs. escritas | [Réplicas vs. elastic clusters](#arquitetura-e-escala-do-documentdb) |
+| DR ou leituras em outra região / voltar no tempo | [Global clusters / PITR](#alta-disponibilidade-backup-e-multi-região) |
+| Reagir a mudanças / busca textual | [Change streams / zero-ETL OpenSearch](#change-streams-e-integrações) |
+| Migrar do MongoDB com parada mínima | [DMS com CDC](#migração-do-mongodb) |
+| DocumentDB, DynamoDB ou MongoDB Atlas? | [Comparação](#documentdb-vs-outras-opções) |
+
+[↑ Índice](#índice)
+
+### NoSQL (Neptune)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Relações em vários níveis, redes sociais, fraude, grafos de conhecimento | [Neptune](#o-que-é-o-neptune) |
+| Escalar leituras / DR entre regiões | [Réplicas / Global Database](#arquitetura-e-escala-do-neptune) |
+| Carga do S3 / busca textual / previsões com ML / GraphRAG | [Bulk loader / Streams + OpenSearch / Neptune ML / Analytics](#carga-de-dados-e-integrações) |
+| Neptune ou outro banco? | [Comparação](#neptune-vs-outras-opções) |
+
+[↑ Índice](#índice)
+
+### NoSQL (Keyspaces), séries temporais e em memória
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Migrar Cassandra sem reescrever / sem gerenciar nós | [Keyspaces](#o-que-é-o-keyspaces) |
+| Sensores IoT, telemetria, consultas por janela de tempo | [Timestream](#o-que-é-o-timestream) |
+| Redis como banco principal, durável | [MemoryDB](#o-que-é-o-memorydb) |
+| MemoryDB ou ElastiCache? | [Comparação](#memorydb-vs-elasticache) |
 
 [↑ Índice](#índice)
 
@@ -750,5 +1341,21 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | RDS, Aurora, RDS Custom, EC2 ou DynamoDB? | [Comparação](#rds-vs-outras-opções) |
 
 [↑ Índice](#índice)
+
+[↑ Índice](#índice)
+
+### Relacional (Aurora)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Relacional com alta disponibilidade, desempenho e failover em segundos | [Aurora](#o-que-é-o-aurora) |
+| Um endpoint para todas as réplicas / réplicas dedicadas a analytics | [Reader endpoint / custom endpoint](#endpoints-e-escala-de-leitura) |
+| Carga imprevisível sem planejar capacidade / SQL sem conexões | [Serverless v2 / Data API](#aurora-serverless-v2) |
+| DR entre regiões com RPO ~1 s / escrever na secundária | [Global Database / write forwarding](#aurora-global-database) |
+| Desfazer erro sem restaurar / ambiente de testes com dados reais | [Backtrack / clone](#backup-clonagem-e-backtrack) |
+| SQL Server com poucas mudanças / dados do S3 / ML no SQL | [Babelfish / integração S3 / Aurora ML](#recursos-específicos-do-aurora) |
+| Migrar do RDS com parada mínima | [Réplica Aurora + promover](#migração-para-o-aurora) |
+| I/O caro | [Aurora I/O-Optimized](#segurança-monitoramento-e-custo-do-aurora) |
+| RDS ou Aurora? | [Comparação](#aurora-vs-rds) |
 
 [↑ Índice](#índice)
