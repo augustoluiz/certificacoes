@@ -15,9 +15,9 @@ tags: [sap-c02, service-communication, orchestration, workflow, serverless, mess
 
 # Service Communication
 
-> **Escopo:** _(em uma frase, o que este arquivo cobre)_
+> **Escopo:** como serviços e sistemas se comunicam na AWS: orquestração de workflows (Step Functions), filas (SQS), message brokers com protocolos abertos (Amazon MQ), pub/sub e notificações (SNS) e barramento de eventos (EventBridge), mais os padrões de integração (canais, orquestração vs. coreografia, confiabilidade, outbox/CDC, CQRS, strangler fig) que ligam esses serviços às decisões de arquitetura.
 >
-> **Por que cai na prova:** _(o ângulo que a SAP-C02 costuma explorar)_
+> **Por que cai na prova:** a SAP-C02 cobra **desacoplamento e resiliência**: trocar chamadas síncronas por **filas e eventos**, absorver **picos** (SQS como buffer), entregar **a mesma mensagem a vários consumidores** (SNS + SQS), garantir **ordem e não duplicação** (FIFO, idempotência), tratar **falhas** (retries, DLQ, Saga), **orquestrar processos longos** com aprovação humana (Step Functions), **reagir a eventos da conta** e centralizá-los entre contas (EventBridge + CloudTrail) e **migrar** aplicações com JMS/AMQP/MQTT **sem reescrever** (Amazon MQ).
 
 ## Índice
 
@@ -25,7 +25,10 @@ tags: [sap-c02, service-communication, orchestration, workflow, serverless, mess
 - **Mensageria:** [Amazon SQS](#amazon-sqs) · [Amazon MQ](#amazon-mq) · [Amazon SNS](#amazon-sns)
 - **Eventos:** [Amazon EventBridge](#amazon-eventbridge)
 - **Arquitetura:** [Padrões de integração](#padrões-de-integração)
+- **Ver também:** [Amazon API Gateway](compute-and-load-balancing.md#amazon-api-gateway) · [AWS AppSync](compute-and-load-balancing.md#aws-appsync) (APIs síncronas, WebSocket e integração direta com SQS, Step Functions e EventBridge)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
+
+> **Mapa mental:** [visão geral dos temas no NotebookLM](https://notebooklm.link.google/yWXsWiPoA8Ge) (requer login no Google).
 
 ## AWS Step Functions
 
@@ -154,7 +157,7 @@ Para cada chamada, existem três **padrões de espera**, definidos por um sufixo
 
 - **Console**, **AWS SDK** (`StartExecution`) e **CLI** (`aws stepfunctions start-execution`).
 - **Lambda**, chamando `StartExecution` pelo SDK.
-- **API Gateway**, como **service proxy**: a API inicia a execução diretamente, sem uma Lambda no meio.
+- **API Gateway**, como **service proxy**: a API inicia a execução diretamente, sem uma Lambda no meio. Ver [integrações do API Gateway](compute-and-load-balancing.md#amazon-api-gateway).
 - **EventBridge**: uma **regra** dispara o workflow a partir de um evento (ex: objeto criado no S3, mudança de estado de uma instância EC2), e o **EventBridge Scheduler** o dispara em horários (cron).
 - **CodePipeline**, como uma ação do pipeline.
 - **Outro Step Functions**, como workflow aninhado (`StartExecution.sync` espera a execução filha terminar). Workflows aninhados ajudam a **modularizar** e a contornar o limite de eventos por execução.
@@ -1165,6 +1168,23 @@ Os padrões abaixo resolvem esse problema e seus derivados:
 ## Revisão: qual serviço usar
 
 Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas seções de cada serviço.
+
+### Visão geral: qual serviço de comunicação usar
+
+| Necessidade | Serviço |
+|---|---|
+| Coordenar um fluxo de vários passos com decisões, espera, retries e compensação | [Step Functions](#aws-step-functions) |
+| Desacoplar produtor e consumidor, absorver picos, distribuir trabalho entre workers | [SQS](#amazon-sqs) |
+| Migrar aplicação que usa JMS, AMQP, MQTT, STOMP ou OpenWire sem reescrever | [Amazon MQ](#amazon-mq) |
+| Mesma mensagem para vários consumidores, alertas, notificações a pessoas (e-mail, SMS, push) | [SNS](#amazon-sns) |
+| Reagir a eventos da AWS, de SaaS ou das apps, com roteamento por conteúdo; cron serverless | [EventBridge](#amazon-eventbridge) |
+| Alto volume, ordem por chave, vários consumidores e reprocessamento | **Kinesis Data Streams** / **MSK** (streaming) |
+| Resposta síncrona para o cliente (REST, WebSocket, GraphQL) | [API Gateway](compute-and-load-balancing.md#amazon-api-gateway) / [AppSync](compute-and-load-balancing.md#aws-appsync) |
+| Escolher o padrão de arquitetura (canal, orquestração, outbox, strangler fig...) | [Padrões de integração](#padrões-de-integração) |
+
+> **Obs:** as combinações aparecem mais que os serviços isolados: **SNS + SQS** (fan-out durável), **EventBridge → SQS** (roteamento + buffer), **API Gateway → SQS ou Step Functions** (storage-first e async request-reply), **DynamoDB Streams → Pipes → EventBridge** (outbox) e **Step Functions + EventBridge** (orquestração dentro do domínio, coreografia entre domínios).
+
+[↑ Índice](#índice)
 
 ### Orquestração (Step Functions)
 
