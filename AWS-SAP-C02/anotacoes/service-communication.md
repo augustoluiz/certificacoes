@@ -3,10 +3,11 @@ titulo: Service Communication
 certificacao: AWS Certified Solutions Architect - Professional (SAP-C02)
 servicos:
   - AWS Step Functions
+  - Amazon SQS
 criado-em: 2026-11-21
 atualizado-em: 2026-11-21
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
-tags: [sap-c02, service-communication, orchestration, workflow, serverless]
+tags: [sap-c02, service-communication, orchestration, workflow, serverless, messaging, queue, decoupling]
 ---
 
 # Service Communication
@@ -18,6 +19,7 @@ tags: [sap-c02, service-communication, orchestration, workflow, serverless]
 ## Índice
 
 - **Orquestração:** [AWS Step Functions](#aws-step-functions)
+- **Mensageria:** [Amazon SQS](#amazon-sqs)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## AWS Step Functions
@@ -236,6 +238,186 @@ O estado **Map** tem dois modos:
 
 [↑ Índice](#índice)
 
+## Amazon SQS
+
+### Contexto: comunicação assíncrona e filas de mensagens
+
+Quando um serviço chama outro **diretamente** (uma chamada HTTP, por exemplo), a comunicação é **síncrona**: quem chama fica esperando a resposta. Isso cria um **acoplamento** forte entre os dois:
+
+- **acoplamento temporal:** os dois precisam estar no ar **ao mesmo tempo**. Se o destino cair, a chamada falha;
+- **acoplamento de capacidade:** se o chamador recebe um pico de 10x, o destino recebe o mesmo pico, quer aguente ou não;
+- **falhas em cascata:** um serviço lento deixa os chamadores esperando, que deixam os seus chamadores esperando, até derrubar a cadeia inteira.
+
+A **comunicação assíncrona** quebra esse acoplamento com um intermediário: o produtor **deixa uma mensagem** e segue a vida, e o consumidor a **processa quando puder**. Alguns conceitos por trás disso:
+
+- **Fila de mensagens (*message queue*):** uma estrutura **FIFO** (*first in, first out*), como uma fila de banco: as mensagens entram por um lado e saem pelo outro. Uma fila de mensagens é **durável** (guarda as mensagens até alguém processá-las) e fica entre o **produtor** e o **consumidor**.
+- **Ponto a ponto vs. publish/subscribe:**
+  - em uma **fila** (ponto a ponto), cada mensagem é processada por **um único consumidor**, mesmo que existam vários lendo a fila;
+  - em um **tópico** (pub/sub), cada mensagem é entregue a **todos os assinantes**. É o modelo do **SNS**.
+- **Competing consumers:** vários consumidores leem a mesma fila e **dividem o trabalho** entre si. Para processar mais rápido, basta adicionar consumidores (escala horizontal).
+- **Queue-based load leveling:** a fila funciona como um **amortecedor**. Picos de produção viram **fila acumulada** (*backlog*), e o consumidor processa em ritmo constante, sem precisar ser dimensionado para o pico.
+- **Semântica de entrega:** em sistemas distribuídos, há três garantias possíveis:
+  - **at-most-once:** a mensagem chega no máximo uma vez, e pode se perder;
+  - **at-least-once:** a mensagem nunca se perde, mas pode chegar **duplicada**;
+  - **exactly-once:** chega exatamente uma vez, o que é caro de garantir.
+
+  Como a maioria das filas entrega **at-least-once**, o consumidor precisa ser **idempotente**: processar a mesma mensagem duas vezes não pode duplicar o efeito (ex: um *upsert* em vez de um *insert*).
+- **Poison message:** uma mensagem que **sempre falha** no processamento (formato inválido, bug). Sem tratamento, ela volta para a fila infinitamente e consome recursos.
+
+O **Amazon SQS** (*Simple Queue Service*) é o serviço de filas **serverless** da AWS, e um dos mais antigos (2004). Na prova, ele aparece sempre que o cenário pede para **desacoplar** componentes, **absorver picos**, **não perder requisições** quando o backend cai, **processar em background** ou **escalar workers** pela quantidade de trabalho pendente.
+
+[↑ Índice](#índice)
+
+### O que é o SQS
+
+- **Totalmente gerenciado e serverless:** não há broker para dimensionar. Você cria uma fila e ela escala automaticamente, com **vazão praticamente ilimitada** na fila Standard.
+- **Durabilidade:** as mensagens ficam armazenadas de forma redundante em **várias AZs**.
+- **Retenção:** de **1 minuto a 14 dias** (padrão: **4 dias**). Depois disso, as mensagens não processadas são apagadas.
+- **Tamanho da mensagem:** até **1 MiB** (1.024 KB). Para payloads maiores, use a **SQS Extended Client Library**: o corpo vai para o **S3** e a mensagem leva só a **referência**, com objetos de até 2 GB.
+- **Modelo pull:** o consumidor **busca** as mensagens (polling). O SQS não "empurra" mensagens. O event source mapping da Lambda faz esse polling por você.
+- **Consumidores:** EC2 (com Auto Scaling), containers no ECS/EKS, Lambda ou servidores on-premises, qualquer coisa que chame a API.
+- **Delay queues:** atrasam a entrega das mensagens novas por **0 a 15 minutos** (na fila inteira ou por mensagem, com *message timers*, só na Standard).
+- **Atributos:** cada mensagem pode carregar até 10 **message attributes** (metadados) além do corpo.
+- **Custo:** por requisição à API (cada bloco de 64 KB conta como uma requisição). Operações em **lote** (até 10 mensagens) e **long polling** reduzem o custo.
+
+[↑ Índice](#índice)
+
+### Ciclo de vida de uma mensagem
+
+1. O **produtor** envia a mensagem com `SendMessage` (ou `SendMessageBatch`, até 10 por chamada).
+2. O **consumidor** chama `ReceiveMessage` e recebe **até 10 mensagens** por vez.
+3. As mensagens recebidas ficam **invisíveis** para os outros consumidores durante o **visibility timeout** (padrão **30 s**, de 0 s a **12 h**). Assim, duas instâncias não processam a mesma mensagem ao mesmo tempo.
+4. O consumidor processa a mensagem e a **apaga** com `DeleteMessage`. O SQS **não apaga** a mensagem sozinho ao entregá-la.
+5. Se o consumidor **não apagar** a mensagem dentro do visibility timeout (porque travou, caiu ou demorou), ela **volta a ficar visível** e outro consumidor a recebe. Essa é a base da tolerância a falhas da fila.
+
+- **Visibility timeout:** ajuste ao tempo de processamento. **Curto demais** gera processamento duplicado (a mensagem reaparece enquanto ainda está sendo tratada). **Longo demais** atrasa o reprocessamento quando o consumidor falha. Um consumidor que precisa de mais tempo pode estender o prazo com `ChangeMessageVisibility`.
+- **Short polling vs. long polling:**
+  - no **short polling**, `ReceiveMessage` responde na hora, mesmo **vazio**. Isso gera muitas chamadas vazias, que custam e consomem CPU;
+  - no **long polling**, a chamada **espera até 20 s** por mensagens (`WaitTimeSeconds` na chamada ou `ReceiveMessageWaitTimeSeconds` na fila). Reduz chamadas vazias, **custo** e **latência**, e é a configuração recomendada.
+
+![Diagrama SQS - Ciclo de vida de uma mensagem e visibility timeout](./img/amazon-sqs/amazon-sqs-01.png)
+
+[↑ Índice](#índice)
+
+### Standard vs. FIFO
+
+| | **Standard** | **FIFO** |
+|---|---|---|
+| Vazão | **Praticamente ilimitada** | **300 msg/s** por ação de API (**3.000** com lotes de 10). No **modo de alta vazão**, dezenas de milhares por segundo, conforme a região |
+| Ordem | **Best-effort**: pode chegar fora de ordem | **Garantida** dentro de cada **message group** |
+| Entrega | **At-least-once**: pode duplicar | **Exactly-once processing**: sem duplicatas na janela de **5 min** |
+| Nome | Qualquer | Termina em **`.fifo`** |
+| Delay por mensagem | Sim (message timers) | Não (só delay na fila inteira) |
+| Uso típico | Desacoplar, buffer, processamento em background | Pedidos, transações financeiras, comandos que **não podem** trocar de ordem nem duplicar |
+
+- **MessageGroupId (FIFO):** a ordem é garantida **por grupo**. Mensagens do mesmo grupo (ex: o mesmo cliente ou pedido) são entregues em ordem, **uma de cada vez**; grupos diferentes são processados **em paralelo** por consumidores diferentes. Mais grupos significam mais paralelismo.
+- **Deduplicação (FIFO):** o SQS descarta mensagens repetidas enviadas em uma janela de **5 minutos**, identificadas por um **MessageDeduplicationId** informado pelo produtor ou por **deduplicação por conteúdo** (hash SHA-256 do corpo).
+- **Fair queues (Standard):** a fila Standard também aceita **MessageGroupId**, para reduzir o efeito de um "vizinho barulhento" (um cliente que gera muitas mensagens e atrasa os outros em uma fila compartilhada).
+- **Converter:** não é possível transformar uma fila Standard em FIFO. É preciso **criar uma nova fila** e migrar produtores e consumidores.
+
+![Diagrama SQS - Standard vs. FIFO com message groups](./img/amazon-sqs/amazon-sqs-02.png)
+
+[↑ Índice](#índice)
+
+### Dead-letter queue e redrive
+
+- **Dead-letter queue (DLQ):** uma fila comum que recebe as mensagens que **falharam repetidamente**. Na **redrive policy** da fila de origem, o **`maxReceiveCount`** define quantas vezes uma mensagem pode ser recebida sem ser apagada. Ao passar desse limite, ela vai para a DLQ, em vez de voltar à fila para sempre. É a solução para as **poison messages**.
+- **Regras:**
+  - a DLQ de uma fila **FIFO** precisa ser **FIFO**, e a de uma fila **Standard** precisa ser **Standard**;
+  - a DLQ fica na **mesma conta e região** da fila de origem;
+  - configure uma **retenção maior** na DLQ (ex: 14 dias). Na fila Standard, a contagem da retenção usa a data **original** de envio, e a mensagem pode expirar logo depois de chegar à DLQ.
+- **Monitoramento:** um **alarme no CloudWatch** com `ApproximateNumberOfMessagesVisible > 0` na DLQ avisa que há mensagens falhando.
+- **Redrive to source:** depois de investigar e **corrigir o bug**, você devolve as mensagens da DLQ para a fila de origem (ou outra fila) **em lote**, pelo console ou pela API, **sem escrever código**.
+
+![Diagrama SQS - Dead-letter queue, alarme e redrive](./img/amazon-sqs/amazon-sqs-03.png)
+
+> **Obs:** um `maxReceiveCount` **baixo demais** (ex: 1) manda para a DLQ mensagens que falharam só por um problema transitório. Deixe espaço para alguns retries. Em filas FIFO, a DLQ **quebra a ordem** do grupo: as mensagens seguintes do grupo continuam sendo processadas enquanto a que falhou está na DLQ.
+
+[↑ Índice](#índice)
+
+### Consumidores: EC2, Auto Scaling e Lambda
+
+**EC2 com Auto Scaling:**
+
+- Escale os consumidores pela **quantidade de trabalho pendente**, não pela CPU.
+- A métrica recomendada é o **backlog por instância**: `ApproximateNumberOfMessagesVisible` dividido pelo número de instâncias, comparado com um alvo (quantas mensagens cada instância processa no tempo aceitável), em uma política de **target tracking** com **métrica customizada**.
+- Com a fila vazia, o grupo pode reduzir até o mínimo, inclusive **zero** instâncias.
+
+**Lambda com event source mapping:**
+
+- O **event source mapping** faz o **long polling** na fila, monta **lotes** e invoca a função.
+  - O lote pode ter até **10 mensagens** em filas FIFO, ou até **10.000** em filas Standard, com uma **janela de espera** (*batching window*).
+  - O event source mapping escala as invocações conforme o backlog.
+- **Visibility timeout:** configure na fila um valor de pelo menos **6x o timeout da função**. Isso dá tempo para os retries e evita que a mensagem reapareça enquanto ainda está sendo processada.
+- **Falhas parciais:** por padrão, se uma mensagem do lote falha, **o lote inteiro** volta para a fila. Com **`ReportBatchItemFailures`**, a função informa só as mensagens que falharam, e as demais são apagadas.
+- **DLQ:** configure na **fila SQS**, não na Lambda. A DLQ da Lambda vale só para invocações **assíncronas**, e o event source mapping é uma invocação **síncrona**. Também é possível usar uma **Lambda destination** para as falhas.
+- **Maximum concurrency:** limita quantas invocações simultâneas o event source mapping cria. Isso protege o destino (ex: um banco relacional com poucas conexões).
+- **FIFO:** a Lambda processa cada message group **em ordem**, e grupos diferentes em paralelo.
+
+**Idempotência no consumidor:** como a fila Standard é at-least-once, e um timeout pode fazer a mesma mensagem ser processada duas vezes, o consumidor deve ser **idempotente**. Exemplos:
+
+- usar um **upsert** (`PutItem` com a mesma chave) em vez de um *insert* que gera duplicatas;
+- registrar os IDs já processados em uma tabela com **escrita condicional**;
+- usar a **FIFO** com deduplicação.
+
+![Diagrama SQS - Escalando consumidores: EC2 Auto Scaling pelo backlog e Lambda event source mapping](./img/amazon-sqs/amazon-sqs-04.png)
+
+[↑ Índice](#índice)
+
+### Padrões de arquitetura com SQS
+
+- **Desacoplar camadas:**
+  - **Cenário:** um frontend que recebe pedidos e um backend que os processa.
+  - **Solução:** o frontend grava na fila e responde ao usuário na hora; o backend processa no seu ritmo. Se o backend cair, os pedidos **esperam na fila**, em vez de se perderem.
+- **Buffer de escrita para o banco** (*queue-based load leveling*):
+  - **Cenário:** um pico de escritas que provocaria **throttling** no DynamoDB ou esgotaria as conexões do RDS.
+  - **Solução:** as escritas passam pela fila, e um consumidor com concorrência controlada grava em ritmo estável. Assim, não é preciso dimensionar o banco para o pico.
+- **Request/response assíncrono:**
+  - **Como funciona:** o cliente envia a requisição em uma **fila de requisições** com um **correlation ID** e um endereço de resposta; os workers processam e respondem em uma **fila de respostas**; o cliente usa o ID para casar a resposta com o pedido.
+  - **Fila temporária:** a **Temporary Queue Client** cria **filas virtuais** sobre uma fila real, para não criar uma fila por cliente.
+- **Fan-out com SNS + SQS:** um tópico SNS entrega a mesma mensagem a **várias filas**, uma por consumidor, cada uma processando no seu ritmo e com retries independentes. Detalhes na seção do SNS.
+- **Eventos do S3 para a fila:** o **S3 Event Notifications** grava na fila a cada objeto criado, e os workers processam os arquivos (thumbnails, ingestão).
+- **Prioridade:** o SQS **não tem prioridade** entre mensagens. A solução é criar **duas filas** (alta e baixa prioridade), com os consumidores lendo primeiro a de alta.
+
+![Diagrama SQS - Buffer de escrita e request/response com filas](./img/amazon-sqs/amazon-sqs-05.png)
+
+[↑ Índice](#índice)
+
+### Segurança do SQS
+
+- **Em trânsito:** endpoints **HTTPS** (TLS). É possível **forçar** o TLS na access policy, negando requisições com `aws:SecureTransport = false`.
+- **Em repouso:**
+  - **SSE-SQS** (chaves gerenciadas pelo SQS, ativado por padrão em filas novas);
+  - **SSE-KMS**: com chave do KMS, para controlar a chave e auditar o uso. O produtor precisa de `kms:GenerateDataKey` e `kms:Decrypt`, e o consumidor de `kms:Decrypt`. Serviços que publicam na fila (SNS, S3, EventBridge) precisam de permissão na **key policy**, e a chave precisa ser **gerenciada pelo cliente**: a chave padrão gerenciada pela AWS (`aws/sqs`) não permite isso.
+- **IAM:** políticas de identidade para controlar quem envia, recebe e apaga mensagens.
+- **SQS access policy** (*resource-based*, como uma bucket policy):
+  - **acesso cross-account:** permite que outra conta envie ou leia mensagens da fila;
+  - **outros serviços publicarem na fila:** o **S3** (event notifications) e o **SNS** (fan-out), com a condição **`aws:SourceArn`** (ou `aws:SourceAccount`) restringindo a origem.
+- **Rede:** **interface VPC endpoint** (PrivateLink) para acessar o SQS a partir de subnets privadas sem internet, com uma **endpoint policy** opcional para limitar as filas acessíveis.
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "**Desacoplar** componentes e **não perder** requisições quando o backend cai" → **SQS**.
+- "Picos de escrita causam **throttling** no DynamoDB" ou "esgotam as conexões do RDS" → **SQS como buffer** de escrita.
+- "Mensagens precisam ser processadas **em ordem** e **sem duplicatas**" → **SQS FIFO** (com **MessageGroupId** para paralelizar).
+- "Alta vazão, ordem não importa" → **SQS Standard** + consumidor **idempotente**.
+- "A mesma mensagem é **processada duas vezes**" → **visibility timeout** curto demais (aumente-o ou use `ChangeMessageVisibility`) e torne o consumidor **idempotente**.
+- "Muitas respostas **vazias**, custo alto de API" → **long polling** (até 20 s).
+- "Mensagens que **sempre falham** travam o processamento" → **DLQ** com `maxReceiveCount`, alarme e **redrive** após a correção.
+- "Escalar os workers EC2 conforme o trabalho pendente" → Auto Scaling pela métrica **backlog por instância** (`ApproximateNumberOfMessagesVisible`).
+- "Lambda reprocessa o lote inteiro quando uma mensagem falha" → **`ReportBatchItemFailures`**.
+- "Lambda consumindo SQS sobrecarrega o banco" → **maximum concurrency** no event source mapping.
+- "Mensagens maiores que **1 MiB**" → **S3** + **SQS Extended Client Library**.
+- "Atrasar o processamento das mensagens por alguns minutos" → **delay queue** (até 15 min).
+- "Bucket S3 de outra conta ou tópico SNS precisa gravar na fila" → **SQS access policy** com `aws:SourceArn`.
+- "Fila criptografada com KMS e o SNS ou o S3 não conseguem publicar" → **chave gerenciada pelo cliente** com permissão na **key policy** para o serviço.
+- "Consumidores em subnets privadas sem NAT" → **interface VPC endpoint** do SQS.
+- "Mensagens com **prioridade**" → **duas filas**.
+
+[↑ Índice](#índice)
+
 ## Revisão: qual serviço usar
 
 Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas seções de cada serviço.
@@ -255,5 +437,19 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Milhões de objetos do S3 em paralelo | [Distributed Map](#distributed-map-processamento-em-larga-escala) |
 | Payload grande, conta cruzada, acesso privado | [Segurança e limites](#segurança-limites-e-operação) |
 | Step Functions, SQS, EventBridge, MWAA ou SWF? | [Alternativas](#step-functions-vs-alternativas) |
+
+[↑ Índice](#índice)
+
+### Filas (SQS)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Desacoplar, absorver picos, não perder requisições | [SQS](#o-que-é-o-sqs) |
+| Mensagem processada duas vezes, chamadas vazias | [Visibility timeout e long polling](#ciclo-de-vida-de-uma-mensagem) |
+| Ordem e sem duplicatas, ou vazão máxima? | [Standard vs. FIFO](#standard-vs-fifo) |
+| Mensagens que sempre falham | [DLQ e redrive](#dead-letter-queue-e-redrive) |
+| Escalar workers EC2 ou Lambda pela fila | [Consumidores](#consumidores-ec2-auto-scaling-e-lambda) |
+| Buffer de escrita, request/response, prioridade | [Padrões](#padrões-de-arquitetura-com-sqs) |
+| Cross-account, S3/SNS publicando, KMS, VPC endpoint | [Segurança](#segurança-do-sqs) |
 
 [↑ Índice](#índice)
