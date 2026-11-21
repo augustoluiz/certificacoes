@@ -5,10 +5,11 @@ servicos:
   - AWS Step Functions
   - Amazon SQS
   - Amazon MQ
+  - Amazon SNS
 criado-em: 2026-11-21
 atualizado-em: 2026-11-21
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
-tags: [sap-c02, service-communication, orchestration, workflow, serverless, messaging, queue, decoupling, message-broker]
+tags: [sap-c02, service-communication, orchestration, workflow, serverless, messaging, queue, decoupling, message-broker, pub-sub, notifications]
 ---
 
 # Service Communication
@@ -20,7 +21,7 @@ tags: [sap-c02, service-communication, orchestration, workflow, serverless, mess
 ## Índice
 
 - **Orquestração:** [AWS Step Functions](#aws-step-functions)
-- **Mensageria:** [Amazon SQS](#amazon-sqs) · [Amazon MQ](#amazon-mq)
+- **Mensageria:** [Amazon SQS](#amazon-sqs) · [Amazon MQ](#amazon-mq) · [Amazon SNS](#amazon-sns)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## AWS Step Functions
@@ -376,7 +377,7 @@ O **Amazon SQS** (*Simple Queue Service*) é o serviço de filas **serverless** 
 - **Request/response assíncrono:**
   - **Como funciona:** o cliente envia a requisição em uma **fila de requisições** com um **correlation ID** e um endereço de resposta; os workers processam e respondem em uma **fila de respostas**; o cliente usa o ID para casar a resposta com o pedido.
   - **Fila temporária:** a **Temporary Queue Client** cria **filas virtuais** sobre uma fila real, para não criar uma fila por cliente.
-- **Fan-out com SNS + SQS:** um tópico SNS entrega a mesma mensagem a **várias filas**, uma por consumidor, cada uma processando no seu ritmo e com retries independentes. Detalhes na seção do SNS.
+- **Fan-out com SNS + SQS:** um tópico SNS entrega a mesma mensagem a **várias filas**, uma por consumidor, cada uma processando no seu ritmo e com retries independentes. Detalhes em [Fan-out: SNS + SQS](#fan-out-sns--sqs).
 - **Eventos do S3 para a fila:** o **S3 Event Notifications** grava na fila a cada objeto criado, e os workers processam os arquivos (thumbnails, ingestão).
 - **Prioridade:** o SQS **não tem prioridade** entre mensagens. A solução é criar **duas filas** (alta e baixa prioridade), com os consumidores lendo primeiro a de alta.
 
@@ -546,6 +547,185 @@ O **Amazon MQ** é o serviço de **message broker gerenciado** da AWS para **Apa
 
 [↑ Índice](#índice)
 
+## Amazon SNS
+
+### Contexto: publish/subscribe e arquitetura orientada a eventos
+
+Uma fila resolve a comunicação entre **um produtor e um consumidor**: cada mensagem é processada por **um** consumidor. Muitas vezes, porém, um mesmo acontecimento interessa a **vários** sistemas. Quando um pedido é criado, o antifraude precisa analisá-lo, o estoque precisa reservá-lo, o envio precisa prepará-lo e o cliente precisa receber um e-mail. Se o serviço de pedidos chamar cada um diretamente, ele passa a **conhecer todos os interessados**. Cada novo sistema exige uma mudança no código do produtor, e a falha de um destino afeta os demais.
+
+Alguns conceitos de engenharia de software estão por trás da solução:
+
+- **Publish/subscribe (pub/sub):** o produtor (**publisher**) publica a mensagem em um **tópico**, sem saber quem vai recebê-la. Os interessados (**subscribers**) **assinam** o tópico, e cada um recebe **uma cópia** de cada mensagem. Produtor e consumidores ficam **desacoplados**: novos consumidores entram sem mudar o produtor.
+- **Padrão Observer:** a mesma ideia em escala de objetos, em que um "sujeito" notifica todos os "observadores" registrados quando seu estado muda. O pub/sub é o Observer **distribuído** e mediado por um intermediário.
+- **Fan-out:** espalhar **uma** mensagem para **muitos** destinos em paralelo. É o contrário do *fan-in*, que junta várias fontes em um destino.
+- **Push vs. pull:**
+  - no **pull**, o consumidor busca as mensagens. É o caso do SQS;
+  - no **push**, o intermediário **entrega** a mensagem ativamente ao consumidor (chama a Lambda, faz um POST HTTP, envia o e-mail). É o caso do SNS.
+- **Arquitetura orientada a eventos (*event-driven*):** os sistemas reagem a **eventos** ("pedido criado", "arquivo enviado", "alarme disparado") em vez de serem chamados diretamente. Isso favorece a **coreografia** entre serviços (ver [Step Functions](#contexto-workflows-máquinas-de-estados-e-orquestração)).
+- **A2A vs. A2P:**
+  - **application-to-application (A2A):** mensagens entre sistemas (filas, funções, webhooks);
+  - **application-to-person (A2P):** notificações para **pessoas** (SMS, e-mail, push no celular).
+
+O **Amazon SNS** (*Simple Notification Service*) é o serviço **serverless** de **pub/sub** da AWS. Ele atende os dois mundos: integra sistemas (A2A) e envia notificações a pessoas (A2P). Na prova, ele aparece em cenários de **fan-out** (uma mensagem para vários consumidores), **notificações de alarmes e eventos** da AWS, **SNS + SQS** para desacoplar com durabilidade e **filtragem** de mensagens por assinante.
+
+[↑ Índice](#índice)
+
+### O que é o SNS
+
+- **Tópico:** o ponto onde os publicadores enviam as mensagens. Um tópico **Standard** aceita até **12,5 milhões de assinaturas**, e uma conta pode ter até **100.000 tópicos** (limite ajustável).
+- **Assinaturas (*subscriptions*):** cada assinatura liga o tópico a um destino:
+  - **A2A:** **SQS**, **Lambda**, **Data Firehose** e **HTTP/HTTPS** (webhooks);
+  - **A2P:** **e-mail** (ou e-mail-JSON), **SMS** e **mobile push** (Apple APNs, Google FCM, Amazon ADM, Baidu).
+- **Confirmação:** assinaturas de e-mail e HTTP/S precisam ser **confirmadas** pelo destino (link no e-mail, ou chamada à `SubscribeURL`). Isso evita que alguém inscreva endereços de terceiros.
+- **Sem persistência:** o SNS **não guarda** as mensagens para leitura posterior. Ele as entrega imediatamente; se a entrega falhar depois de todos os retries, a mensagem é **descartada**, salvo se houver uma **DLQ**. Para durabilidade, combine com o **SQS** (fan-out).
+- **Tamanho da mensagem:** até **256 KB**. Para payloads maiores, a **Extended Client Library** guarda o corpo no **S3** e publica só a referência.
+- **Como publicar:**
+  - **Topic publish:** crie o tópico e as assinaturas e publique com `Publish` (SDK).
+  - **Direct publish (mobile):** crie uma **platform application** e um **platform endpoint** por dispositivo, e publique direto no endpoint (uma notificação para um celular específico).
+- **Serviços que publicam no SNS:** muitos serviços da AWS enviam notificações direto para um tópico:
+  - **CloudWatch Alarms**, **AWS Budgets** e **Auto Scaling** (eventos de scale in/out);
+  - **S3 Event Notifications**, **eventos do RDS**, **CloudFormation** (mudanças de estado da stack) e **DMS**;
+  - **Health**, **Config**, **CodePipeline**, entre outros.
+- **Raw message delivery:** para SQS, HTTP/S e Firehose, entrega o **corpo original** da mensagem, sem o envelope JSON do SNS.
+- **Message attributes:** metadados enviados junto com a mensagem, usados principalmente na **filtragem**.
+
+![Diagrama SNS - Publicadores, tópico e tipos de assinantes](./img/amazon-sns/amazon-sns-01.png)
+
+> **Obs:** para **SMS** e e-mails em massa de marketing, a AWS oferece serviços dedicados: o **AWS End User Messaging** (SMS, voz e push, com números de origem e controle de entrega) e o **Amazon SES** (e-mail transacional e de marketing). O SNS serve bem para notificações operacionais e alertas.
+
+[↑ Índice](#índice)
+
+### Fan-out: SNS + SQS
+
+O padrão mais cobrado do SNS é combiná-lo com o SQS: o produtor publica **uma vez** no tópico, e **várias filas** assinadas recebem cada uma a sua cópia.
+
+- **Por que não publicar direto em várias filas:** o produtor teria que conhecer todas as filas, e uma falha no meio do envio deixaria algumas filas com a mensagem e outras sem.
+- **Por que não só SNS:** o SNS faz push e não guarda mensagens. Com uma fila por consumidor, cada um ganha **persistência**, **processamento no próprio ritmo**, **retries** e **DLQ** independentes. Um consumidor lento ou fora do ar não afeta os outros.
+- **Evolução:** para adicionar um consumidor, basta **assinar** uma nova fila no tópico, sem mexer no produtor.
+- **Requisitos:**
+  - a **access policy da fila** precisa permitir `sqs:SendMessage` para o SNS, com a condição `aws:SourceArn` igual ao ARN do tópico;
+  - se a fila usa **SSE-KMS**, a chave precisa ser **gerenciada pelo cliente**, com permissão para o SNS na key policy.
+- **Cross-Region e cross-account:** um tópico pode entregar para filas SQS e funções Lambda em **outras regiões** e em **outras contas**, desde que as policies permitam.
+- **Ordem e sem duplicatas:** **SNS FIFO + SQS FIFO**.
+
+**Aplicação: o mesmo evento do S3 para vários consumidores.**
+
+- O S3 não permite duas regras de notificação com **o mesmo tipo de evento** e **prefixos que se sobrepõem** (ex: duas regras para `ObjectCreated` em `images/`).
+- Para enviar o mesmo evento a vários destinos, a regra aponta para um **tópico SNS**, que faz o fan-out para as filas e funções. Outra opção é enviar os eventos do S3 para o **EventBridge**, que aceita várias regras sobre o mesmo evento.
+
+**Aplicação: SNS para o S3 via Data Firehose.**
+
+- O **Data Firehose** pode assinar o tópico e entregar as mensagens no **S3**, no **Redshift**, no **OpenSearch** ou em outros destinos suportados.
+- Serve para **arquivar** todas as notificações ou analisá-las depois.
+
+![Diagrama SNS - Fan-out com SNS + SQS, S3 Event Notifications, Firehose e entrega cross-Region](./img/amazon-sns/amazon-sns-02.png)
+
+[↑ Índice](#índice)
+
+### Filtragem de mensagens
+
+- **Filter policy:** uma política em JSON, definida **em cada assinatura**, que diz quais mensagens ela quer receber. Sem filter policy, a assinatura recebe **todas** as mensagens do tópico.
+- **Escopo:** a filtragem pode olhar os **message attributes** (padrão) ou o **corpo** da mensagem em JSON (`FilterPolicyScope = MessageBody`).
+- **Operadores:** valor exato, **prefixo**, **sufixo**, **anything-but** (qualquer valor exceto), **numérico** (`>`, `<=`, intervalos), **exists**, igualdade sem diferenciar maiúsculas e endereço IP. Condições em **chaves diferentes** se combinam com **E**; valores na **mesma lista**, com **OU**.
+- **Por que usar:**
+  - em vez de cada consumidor receber tudo e descartar o que não interessa, o SNS só entrega o que **casa com o filtro**. Isso reduz **custo** e **código** nos consumidores;
+  - permite usar **um tópico** para vários tipos de evento (ex: pedidos criados, cancelados e recusados), em vez de um tópico por tipo.
+
+Exemplo de filter policy que recebe só pedidos **criados** acima de **1.000**:
+
+```json
+{
+  "status": ["criado"],
+  "valor": [{ "numeric": [">", 1000] }]
+}
+```
+
+![Diagrama SNS - Filter policies por assinatura](./img/amazon-sns/amazon-sns-03.png)
+
+[↑ Índice](#índice)
+
+### SNS FIFO
+
+- **Tópico FIFO:** garante a **ordem** das mensagens e elimina **duplicatas**, com os mesmos mecanismos do SQS FIFO:
+  - **ordem por MessageGroupId:** mensagens do mesmo grupo chegam na ordem em que foram publicadas;
+  - **deduplicação** por **MessageDeduplicationId** ou por **conteúdo**, em uma janela de 5 minutos.
+- **Assinantes:** filas **SQS FIFO** e também filas **SQS Standard** (que recebem as mensagens, mas sem garantia de ordem).
+- **Nome:** termina em **`.fifo`**.
+- **Vazão limitada**, na mesma ordem de grandeza do SQS FIFO, e **menos assinaturas** por tópico que um tópico Standard.
+- **Arquivamento e replay:** um tópico FIFO pode **arquivar** as mensagens por até **365 dias** e **reenviá-las** (*replay*) a uma assinatura. Serve para recuperar um consumidor que perdeu dados ou para alimentar um consumidor novo com o histórico.
+- **Uso típico:** **fan-out com ordem e sem duplicatas**, como atualizações de preço, mudanças de saldo ou eventos de um pedido que precisam chegar em ordem a vários sistemas. O padrão é **SNS FIFO + SQS FIFO**.
+
+[↑ Índice](#índice)
+
+### Entrega, retries e DLQ do SNS
+
+- **Delivery policy:** quando uma entrega falha por erro do lado do destino (ex: HTTP 5xx, serviço indisponível), o SNS tenta de novo em **quatro fases**: tentativas imediatas, pré-backoff, **backoff exponencial** e pós-backoff.
+
+| Tipo de destino | Exemplos | Total de tentativas |
+|---|---|---|
+| **Gerenciados pela AWS** | SQS, Lambda, Data Firehose | **100.015** tentativas, ao longo de **~23 dias** |
+| **Gerenciados pelo cliente** | HTTP/S, e-mail, SMS, mobile push | **50** tentativas, ao longo de **~6 horas** |
+
+- **Política customizada:** só **HTTP/S** aceita uma delivery policy **customizada** (número de tentativas, intervalos e limite de vazão de entrega, para não sobrecarregar o endpoint).
+- **Erros do cliente** (ex: a fila foi apagada, ou o SNS não tem permissão) **não** passam pelos retries: a mensagem vai direto para a DLQ, se houver.
+- **DLQ do SNS:**
+  - é uma **fila SQS** (ou SQS FIFO, para tópicos FIFO) ligada **à assinatura**, não ao tópico. Cada assinatura pode ter sua própria DLQ;
+  - recebe as mensagens que **não foram entregues** depois de esgotar a delivery policy. **Sem DLQ, a mensagem é descartada.**
+- **Delivery status logging:** registra no **CloudWatch Logs** o sucesso ou a falha de cada entrega para SQS, Lambda, HTTP/S, Firehose, mobile push e SMS. Ajuda a depurar assinaturas com problema.
+
+![Diagrama SNS - Delivery policy, DLQ por assinatura e delivery status logs](./img/amazon-sns/amazon-sns-04.png)
+
+[↑ Índice](#índice)
+
+### Segurança do SNS
+
+- **Em trânsito:** API com **HTTPS**. É possível exigir TLS na access policy com `aws:SecureTransport`.
+- **Em repouso:** **SSE com KMS**.
+  - Os publicadores precisam de `kms:GenerateDataKey` e `kms:Decrypt` na chave.
+  - Para que **serviços da AWS** publiquem em um tópico criptografado (CloudWatch Alarms, S3, EventBridge), use uma **chave gerenciada pelo cliente**, com permissão para o serviço na key policy. A chave padrão gerenciada pela AWS (`aws/sns`) não permite isso.
+- **Criptografia no cliente:** se o cliente quiser criptografar e descriptografar por conta própria antes de publicar.
+- **IAM:** políticas de identidade controlam quem pode criar tópicos, publicar e assinar.
+- **SNS access policy** (*resource-based*, como uma bucket policy):
+  - **acesso cross-account:** permite que outra conta **publique** no tópico ou **assine** filas e funções dela;
+  - **serviços publicando no tópico:** permite que o **S3**, o **CloudWatch** e outros serviços publiquem, com as condições `aws:SourceArn` e `aws:SourceAccount`.
+- **Rede:** **interface VPC endpoint** (PrivateLink) para **publicar** a partir de subnets privadas, sem internet. As assinaturas **HTTP/S** precisam de um endpoint **acessível publicamente**: o SNS não entrega em IPs privados da VPC.
+- **Message data protection:** políticas que **detectam dados sensíveis** (PII, como CPF, cartão de crédito e e-mail) nas mensagens, para **auditar**, **mascarar** ou **bloquear** a publicação e a entrega.
+
+[↑ Índice](#índice)
+
+### SNS vs. SQS vs. EventBridge
+
+| | **SNS** | **SQS** | **EventBridge** |
+|---|---|---|---|
+| Modelo | **Pub/sub** (push) | **Fila** (pull) | **Barramento de eventos** (push com regras) |
+| Destinatários por mensagem | **Todos** os assinantes | **Um** consumidor | Todos os **alvos** das regras que casam |
+| Persistência | Não (salvo DLQ e arquivo do FIFO) | **Sim**, até 14 dias | Não (salvo **archive** e replay) |
+| Filtragem | Filter policy por assinatura | Não (o consumidor lê tudo) | **Regras** com padrões ricos sobre o evento |
+| Destinos | SQS, Lambda, Firehose, HTTP/S, e-mail, SMS, push | Quem fizer polling | **Mais de 20 serviços** da AWS, APIs externas, outras contas e regiões |
+| Escala | Milhões de assinaturas, alta vazão | Praticamente ilimitada | Alta, com cotas por região |
+| Uso típico | **Fan-out**, alertas, notificações a pessoas | **Desacoplar**, buffer, trabalho em background | **Integração orientada a eventos**, eventos de SaaS e da AWS, roteamento por conteúdo |
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Enviar **a mesma mensagem** para vários sistemas, cada um processando de forma independente" → **SNS + SQS (fan-out)**.
+- "Fan-out com **ordem** e **sem duplicatas**" → **SNS FIFO + SQS FIFO**.
+- "O mesmo **evento do S3** precisa chegar a várias filas ou funções" → evento do S3 → **SNS** → várias assinaturas (ou **EventBridge**).
+- "Cada consumidor quer só **parte** das mensagens do tópico" → **filter policy** na assinatura.
+- "Notificar a equipe por **e-mail ou SMS** quando um alarme dispara" → **CloudWatch Alarm** → **SNS**.
+- "**Arquivar** todas as notificações no S3" → assinatura do **Data Firehose** → S3.
+- "Mensagens do SNS **se perdem** quando o endpoint fica fora do ar por muito tempo" → **DLQ** na **assinatura** (+ delivery status logging).
+- "Endpoint HTTP do cliente sobrecarregado pelas entregas" → **delivery policy customizada** (só HTTP/S).
+- "Fila SQS de outra conta ou região precisa receber as mensagens do tópico" → **assinatura cross-account/cross-Region** + **access policy da fila** permitindo o tópico.
+- "Tópico criptografado com KMS e o **CloudWatch** não consegue publicar" → **chave gerenciada pelo cliente** com permissão na key policy.
+- "Publicar no SNS a partir de **subnet privada sem NAT**" → **interface VPC endpoint**.
+- "Notificação push para **um dispositivo móvel** específico" → **direct publish** em um **platform endpoint**.
+- "Detectar ou mascarar **PII** nas mensagens" → **message data protection**.
+- "Recuperar mensagens já entregues para um consumidor novo" → **arquivamento e replay** do **SNS FIFO** (ou archive do EventBridge).
+
+[↑ Índice](#índice)
+
 ## Revisão: qual serviço usar
 
 Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas seções de cada serviço.
@@ -592,5 +772,19 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Migrar aos poucos de um broker legado | [Migração](#migração-para-o-amazon-mq) |
 | Broker privado, TLS, KMS, LDAP | [Segurança](#segurança-do-amazon-mq) |
 | Amazon MQ ou SQS/SNS? | [Comparação](#amazon-mq-vs-sqs-e-sns) |
+
+[↑ Índice](#índice)
+
+### Pub/sub e notificações (SNS)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Uma mensagem para vários consumidores, alertas, notificações a pessoas | [SNS](#o-que-é-o-sns) |
+| Fan-out durável, mesmo evento do S3 para várias filas | [SNS + SQS](#fan-out-sns--sqs) |
+| Cada assinante quer só parte das mensagens | [Filter policy](#filtragem-de-mensagens) |
+| Fan-out com ordem e sem duplicatas, replay | [SNS FIFO](#sns-fifo) |
+| Entregas falhando, endpoint fora do ar | [Retries e DLQ](#entrega-retries-e-dlq-do-sns) |
+| Cross-account, KMS, VPC endpoint, PII | [Segurança](#segurança-do-sns) |
+| SNS, SQS ou EventBridge? | [Comparação](#sns-vs-sqs-vs-eventbridge) |
 
 [↑ Índice](#índice)
