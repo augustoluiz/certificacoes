@@ -4,10 +4,11 @@ certificacao: AWS Certified Solutions Architect - Professional (SAP-C02)
 servicos:
   - AWS Step Functions
   - Amazon SQS
+  - Amazon MQ
 criado-em: 2026-11-21
 atualizado-em: 2026-11-21
 revisoes: []           # ex.: [2026-08-30, 2026-09-13]
-tags: [sap-c02, service-communication, orchestration, workflow, serverless, messaging, queue, decoupling]
+tags: [sap-c02, service-communication, orchestration, workflow, serverless, messaging, queue, decoupling, message-broker]
 ---
 
 # Service Communication
@@ -19,7 +20,7 @@ tags: [sap-c02, service-communication, orchestration, workflow, serverless, mess
 ## Índice
 
 - **Orquestração:** [AWS Step Functions](#aws-step-functions)
-- **Mensageria:** [Amazon SQS](#amazon-sqs)
+- **Mensageria:** [Amazon SQS](#amazon-sqs) · [Amazon MQ](#amazon-mq)
 - **Revisão:** [Qual serviço usar](#revisão-qual-serviço-usar)
 
 ## AWS Step Functions
@@ -418,6 +419,133 @@ O **Amazon SQS** (*Simple Queue Service*) é o serviço de filas **serverless** 
 
 [↑ Índice](#índice)
 
+## Amazon MQ
+
+### Contexto: message brokers e protocolos abertos
+
+Muito antes da nuvem, as empresas já usavam **mensageria** para integrar sistemas: o ERP avisava o sistema de faturamento, a loja avisava o estoque, o mainframe trocava dados com aplicações Java. O componente central dessas integrações é o **message broker**, um servidor que recebe, guarda e roteia mensagens entre aplicações. Essa categoria de software é chamada de **MOM** (*Message-Oriented Middleware*), e alguns produtos dominaram esse mercado: **IBM MQ**, **TIBCO EMS**, **Apache ActiveMQ** e **RabbitMQ**.
+
+Alguns conceitos ajudam a entender o serviço:
+
+- **Message broker:** além de guardar mensagens em **filas** (ponto a ponto) e **tópicos** (pub/sub), ele **roteia** mensagens por regras, confirma a entrega (*acknowledgment*), faz **transações** (enviar várias mensagens de forma atômica) e mantém conexões persistentes com os clientes.
+- **Protocolos abertos de mensageria:** padrões que definem como clientes e brokers conversam pela rede, independentemente do fornecedor:
+  - **AMQP** (*Advanced Message Queuing Protocol*): protocolo binário e robusto, padrão em integrações corporativas. O RabbitMQ usa a versão 0-9-1; o ActiveMQ, a 1.0;
+  - **MQTT:** protocolo **leve** de pub/sub, feito para **IoT** e redes instáveis;
+  - **STOMP:** protocolo **textual** e simples, fácil de implementar em qualquer linguagem;
+  - **OpenWire:** o protocolo nativo do ActiveMQ;
+  - **WebSocket (WSS):** permite que navegadores falem com o broker.
+- **JMS** (*Java Message Service*): não é um protocolo, mas uma **API padrão do Java** para mensageria. Uma aplicação escrita com JMS pode trocar de broker (de IBM MQ para ActiveMQ, por exemplo) mudando a biblioteca e a configuração, sem reescrever a lógica.
+- **Roteamento no RabbitMQ:** o produtor publica em uma **exchange**, que encaminha a mensagem para as filas conforme regras (*bindings*):
+  - **direct**: pela chave exata;
+  - **fanout**: para todas as filas;
+  - **topic**: por padrão da chave, ex: `pedidos.*.br`;
+  - **headers**: pelos cabeçalhos da mensagem.
+- **APIs proprietárias vs. padrões abertos:** **SQS** e **SNS** são serviços *cloud-native* com **API própria da AWS** (HTTP + SDK). Uma aplicação que fala AMQP, MQTT ou JMS **não conversa** com o SQS sem ser **reescrita**.
+
+O **Amazon MQ** é o serviço de **message broker gerenciado** da AWS para **Apache ActiveMQ** e **RabbitMQ**. Ele existe para o cenário em que reescrever a aplicação para SQS/SNS não compensa: você **migra o broker para a AWS** (*re-platform*), e as aplicações continuam usando os **mesmos protocolos e APIs**, trocando só o endpoint. Na prova, ele aparece em **migrações** de aplicações on-premises que usam **JMS, AMQP, MQTT, STOMP ou OpenWire**, ou que dependem de IBM MQ, TIBCO EMS, ActiveMQ ou RabbitMQ.
+
+![Diagrama Amazon MQ - Reescrever para SQS/SNS vs. migrar para o Amazon MQ](./img/amazon-mq/amazon-mq-01.png)
+
+[↑ Índice](#índice)
+
+### O que é o Amazon MQ
+
+- **Broker gerenciado:** a AWS provisiona as instâncias, aplica **patches** e upgrades de versão em uma **janela de manutenção**, detecta falhas e faz o failover. Você continua escolhendo o **tipo de instância** e o **modo de implantação**.
+- **Engines:** **Apache ActiveMQ** (Classic) e **RabbitMQ**.
+- **Filas e tópicos:** oferece tanto o modelo de **fila** (como o SQS) quanto o de **tópico** (como o SNS), no mesmo broker.
+- **Não é serverless:** roda em **instâncias** (de `mq.t3.micro`, para testes, a famílias `mq.m5` e `mq.m7g`). Por isso:
+  - **não escala** como o SQS e o SNS: a capacidade é limitada pela instância;
+  - escalar significa trocar o **tipo de instância** (escala vertical), o que exige reinicialização. No ActiveMQ, uma **network of brokers** distribui a carga entre vários brokers;
+  - o **custo** é por **hora de instância** + armazenamento, mesmo sem tráfego.
+- **Na VPC:** o broker fica em subnets da sua VPC, com acesso **privado** ou **público**.
+- **Monitoramento:** métricas no **CloudWatch** (ex: tamanho das filas, conexões, uso de memória), logs no **CloudWatch Logs** e chamadas de API no **CloudTrail**.
+
+[↑ Índice](#índice)
+
+### ActiveMQ vs. RabbitMQ
+
+| | **ActiveMQ** | **RabbitMQ** |
+|---|---|---|
+| Protocolos | **OpenWire**, **AMQP 1.0**, **STOMP**, **MQTT**, **WSS**, e a API **JMS** | **AMQP 0-9-1** |
+| Modos de implantação | Single-instance, **active/standby** (2 AZs) e **network of brokers** | Single-instance e **cluster** de 3 nós (3 AZs) |
+| Armazenamento | **EFS** (durável, Multi-AZ, necessário para active/standby) ou **EBS** (maior vazão, só single-instance) | **EBS** em cada nó |
+| Autenticação | Usuários do broker ou **LDAP** (ex: Active Directory) | Usuários internos e outros mecanismos de identidade |
+| Perfil típico | Aplicações **Java/JMS** e integrações corporativas; migração de **IBM MQ** e **TIBCO EMS** | Aplicações que já usam **RabbitMQ**, roteamento flexível com exchanges |
+
+> **Obs:** o Amazon MQ **não roda IBM MQ nem TIBCO EMS**. A migração desses brokers é feita para o **ActiveMQ**, que implementa **JMS**: as aplicações JMS trocam o provedor e a configuração de conexão.
+
+[↑ Índice](#índice)
+
+### Alta disponibilidade do Amazon MQ
+
+- **ActiveMQ active/standby:**
+  - **Como funciona:** dois brokers em **AZs diferentes**, compartilhando o armazenamento no **EFS**. Só o **ativo** atende os clientes; se ele falhar (ou durante a manutenção), o **standby** assume com os mesmos dados.
+  - **Clientes:** usam a **failover URL** com os dois endpoints (`failover:(ssl://b-1...:61617,ssl://b-2...:61617)`), e a biblioteca reconecta sozinha ao broker que estiver ativo.
+- **RabbitMQ cluster:**
+  - **Como funciona:** **três nós** em **três AZs**, atrás de um **Network Load Balancer** que expõe um endpoint único. As filas são **replicadas** entre os nós (**quorum queues**, baseadas no algoritmo de consenso Raft).
+  - **Resiliência:** a perda de um nó ou de uma AZ não interrompe o broker.
+- **Single-instance:** um broker em **uma AZ**. Serve para desenvolvimento e testes: uma falha ou uma janela de manutenção causa **indisponibilidade**.
+- **DR entre regiões:** o ActiveMQ oferece **replicação de dados entre regiões** (*cross-Region data replication*), com um broker primário e uma réplica em outra região, promovida em caso de desastre.
+
+![Diagrama Amazon MQ - Alta disponibilidade: ActiveMQ active/standby com EFS e RabbitMQ cluster com NLB](./img/amazon-mq/amazon-mq-02.png)
+
+[↑ Índice](#índice)
+
+### Migração para o Amazon MQ
+
+- **Re-platform:** a estratégia típica é levar o broker para o Amazon MQ **sem mudar o código** das aplicações. Elas passam a apontar para o novo endpoint (via **Direct Connect** ou **VPN**, se continuarem on-premises).
+- **Origens possíveis:** **IBM MQ**, **TIBCO EMS**, **ActiveMQ** e **RabbitMQ** on-premises ou em EC2.
+- **Migração em fases:** em ambientes grandes, não dá para migrar todas as aplicações de uma vez. Uma **ponte** (ex: **Apache Camel** ou uma ponte JMS) copia as mensagens entre o broker legado e o Amazon MQ. As aplicações migram **uma a uma**, e o broker legado é desligado quando não houver mais clientes.
+- **Consumidores na AWS:** depois da migração, as mensagens podem ser consumidas por EC2, containers ou **Lambda**. O Amazon MQ (ActiveMQ e RabbitMQ) pode ser **event source da Lambda**, com as credenciais do broker no **Secrets Manager**.
+- **Quando refatorar em vez de migrar:** para aplicações **novas** ou em reescrita, prefira **SQS/SNS/EventBridge**: são serverless, escalam sem limite prático e não exigem gerenciar instâncias.
+
+![Diagrama Amazon MQ - Migração em fases de um broker legado com ponte e Direct Connect](./img/amazon-mq/amazon-mq-03.png)
+
+[↑ Índice](#índice)
+
+### Segurança do Amazon MQ
+
+- **Rede:**
+  - **broker privado:** acessível só de dentro da VPC (ou de redes conectadas por Direct Connect, VPN ou peering), com **security groups**;
+  - **broker público:** acessível pela internet, com autenticação. Evite em produção.
+- **Em trânsito:** conexões com **TLS**.
+- **Em repouso:** dados criptografados com o **KMS** (chave da AWS ou, no ActiveMQ, chave gerenciada pelo cliente).
+- **Autenticação dos clientes:**
+  - **usuários do broker**, criados no Amazon MQ;
+  - no ActiveMQ, integração com **LDAP**.
+- **Autorização:** permissões por fila e tópico (ActiveMQ) ou por *virtual host* (RabbitMQ).
+- **IAM:** controla quem pode **gerenciar** o broker (criar, reiniciar, alterar a configuração), mas **não** autentica as conexões de mensageria, que usam os protocolos padrão.
+
+[↑ Índice](#índice)
+
+### Amazon MQ vs. SQS e SNS
+
+| | **Amazon MQ** | **SQS / SNS** |
+|---|---|---|
+| Protocolos | **Abertos**: AMQP, MQTT, STOMP, OpenWire, WSS, JMS | **API proprietária** da AWS (HTTP + SDK) |
+| Infraestrutura | **Instâncias** (escolher tipo e modo) | **Serverless** |
+| Escala | Limitada à instância (vertical) ou à network of brokers | **Praticamente ilimitada**, automática |
+| Alta disponibilidade | Configurar **active/standby** ou **cluster** | Nativa, Multi-AZ |
+| Recursos de broker | Roteamento avançado, transações, seletores de mensagem, filas e tópicos juntos | Filas (SQS) e tópicos (SNS) separados, com filtros |
+| Custo | Por hora de instância, mesmo ocioso | Por uso (requisições) |
+| Melhor uso | **Migrar** aplicações que já usam um broker | Aplicações **novas** ou **reescritas** para a nuvem |
+
+[↑ Índice](#índice)
+
+### Dicas para a prova
+
+- "Migrar para a AWS uma aplicação que usa **JMS, AMQP, MQTT, STOMP ou OpenWire**, **sem reescrever o código**" → **Amazon MQ**.
+- "Aplicação on-premises usa **IBM MQ** ou **TIBCO EMS**" → **Amazon MQ (ActiveMQ)**, com migração em fases se necessário.
+- "Aplicação usa **RabbitMQ** e precisa de alta disponibilidade gerenciada" → **Amazon MQ for RabbitMQ** em **cluster** (3 AZs).
+- "Broker ActiveMQ **altamente disponível**" → **active/standby** em 2 AZs com armazenamento no **EFS** e **failover URL** nos clientes.
+- "Aplicação **nova**, escala ilimitada, sem gerenciar servidores" → **SQS/SNS**, não Amazon MQ.
+- "Mensageria para **IoT com MQTT**" → avalie o **IoT Core** (serverless, milhões de dispositivos); o Amazon MQ serve quando a aplicação já depende de um broker MQTT.
+- "Consumir mensagens do Amazon MQ com **Lambda**" → **event source mapping**, com as credenciais no **Secrets Manager**.
+- "Broker com **maior vazão** e sem necessidade de Multi-AZ" → ActiveMQ **single-instance** com **EBS**.
+- "Broker sem indisponibilidade durante a **janela de manutenção**" → **active/standby** ou **cluster**, nunca single-instance.
+
+[↑ Índice](#índice)
+
 ## Revisão: qual serviço usar
 
 Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas seções de cada serviço.
@@ -451,5 +579,18 @@ Resumo das comparações que mais aparecem nas questões. Os detalhes estão nas
 | Escalar workers EC2 ou Lambda pela fila | [Consumidores](#consumidores-ec2-auto-scaling-e-lambda) |
 | Buffer de escrita, request/response, prioridade | [Padrões](#padrões-de-arquitetura-com-sqs) |
 | Cross-account, S3/SNS publicando, KMS, VPC endpoint | [Segurança](#segurança-do-sqs) |
+
+[↑ Índice](#índice)
+
+### Message broker (Amazon MQ)
+
+| Pergunta do cenário | Solução |
+|---|---|
+| Migrar app com JMS/AMQP/MQTT/STOMP sem reescrever | [Amazon MQ](#contexto-message-brokers-e-protocolos-abertos) |
+| ActiveMQ ou RabbitMQ? IBM MQ e TIBCO? | [ActiveMQ vs. RabbitMQ](#activemq-vs-rabbitmq) |
+| Broker Multi-AZ, failover, DR entre regiões | [Alta disponibilidade](#alta-disponibilidade-do-amazon-mq) |
+| Migrar aos poucos de um broker legado | [Migração](#migração-para-o-amazon-mq) |
+| Broker privado, TLS, KMS, LDAP | [Segurança](#segurança-do-amazon-mq) |
+| Amazon MQ ou SQS/SNS? | [Comparação](#amazon-mq-vs-sqs-e-sns) |
 
 [↑ Índice](#índice)
